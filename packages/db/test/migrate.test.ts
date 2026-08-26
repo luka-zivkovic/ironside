@@ -1,0 +1,78 @@
+import { Pool } from "pg";
+import { afterAll, describe, expect, it } from "vitest";
+import { ulid } from "ulid";
+import { runMigrations } from "../src/migrate.js";
+import { createProject } from "../src/projects.js";
+
+const connectionString =
+  process.env.DATABASE_URL ??
+  "postgres://ironside:ironside@localhost:5433/ironside";
+
+describe("runMigrations (postgres)", () => {
+  const pool = new Pool({ connectionString });
+  afterAll(() => pool.end());
+
+  it("applies migrations once across concurrent starts and is idempotent on re-run", async () => {
+    await Promise.all(Array.from({ length: 4 }, () => runMigrations(pool)));
+    await runMigrations(pool);
+
+    const tables = await pool.query<{ table_name: string }>(
+      `select table_name from information_schema.tables
+       where table_schema = current_schema() and table_name in
+       ('organizations', 'projects', 'ironside_migrations', 'raw_retention_intents',
+        'owner_principals', 'owner_auth_challenges', 'owner_sessions', 'auth_audit_events',
+        'machine_credentials', 'project_environments', 'project_environment_registry_state')`
+    );
+    const names = tables.rows.map((r) => r.table_name).sort();
+    expect(names).toEqual([
+      "auth_audit_events",
+      "ironside_migrations",
+      "machine_credentials",
+      "organizations",
+      "owner_auth_challenges",
+      "owner_principals",
+      "owner_sessions",
+      "project_environment_registry_state",
+      "project_environments",
+      "projects",
+      "raw_retention_intents"
+    ]);
+
+    const applied = await pool.query("select id from ironside_migrations order by id");
+    expect(applied.rows).toEqual([{ id: "0001_baseline" }]);
+    expect((await pool.query("select to_regclass('api_keys') as table_name")).rows).toEqual([
+      { table_name: null }
+    ]);
+  });
+
+  it("enforces referential integrity project -> organization", async () => {
+    await runMigrations(pool);
+    await expect(
+      pool.query(
+        "insert into projects (id, organization_id, name) values ('proj_x', 'org_missing', 'x')"
+      )
+    ).rejects.toThrow();
+  });
+
+  it("initializes environment discovery when current code creates a project", async () => {
+    await runMigrations(pool);
+    const organizationId = `org_migrate_env_${ulid()}`;
+    const projectId = `proj_migrate_env_${ulid()}`;
+    try {
+      await pool.query("insert into organizations (id, name) values ($1, $2)", [
+        organizationId,
+        organizationId
+      ]);
+      await createProject(pool, { id: projectId, organizationId, name: projectId });
+      const state = await pool.query<{ due: boolean }>(
+        `select next_rebuild_at <= now() as due
+           from project_environment_registry_state
+          where project_id = $1`,
+        [projectId]
+      );
+      expect(state.rows).toEqual([{ due: true }]);
+    } finally {
+      await pool.query("delete from organizations where id = $1", [organizationId]);
+    }
+  });
+});

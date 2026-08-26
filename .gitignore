@@ -1,0 +1,12 @@
+node_modules/
+dist/
+dist-ts/
+*.tsbuildinfo
+coverage/
+out/
+.env
+.env.local
+.DS_Store
+test-results/
+.turbo/
+.ai/

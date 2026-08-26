@@ -1,0 +1,35 @@
+{
+  "name": "@ironside/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Ironside worker: ingest pipeline consumers, exports, importers.",
+  "scripts": {
+    "predev": "pnpm --filter @ironside/shared --filter @ironside/db --filter @ironside/clickhouse --filter @ironside/queue --filter @ironside/storage --filter @ironside/mappers build",
+    "dev": "tsx watch src/index.ts",
+    "lifecycle:plan": "node dist/src/scripts/lifecycle-plan.js",
+    "retention:intents": "node dist/src/scripts/raw-retention-intents.js",
+    "retention:execute": "node dist/src/scripts/raw-retention-execute.js --execute",
+    "environments:rebuild": "node dist/src/scripts/environment-registry-rebuild.js",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@duckdb/node-api": "^1.5.4-r.1",
+    "@ironside/clickhouse": "workspace:*",
+    "@ironside/db": "workspace:*",
+    "@ironside/mappers": "workspace:*",
+    "@ironside/queue": "workspace:*",
+    "@ironside/shared": "workspace:*",
+    "@ironside/storage": "workspace:*",
+    "bullmq": "^5.80.2",
+    "pg": "^8.20.0",
+    "prom-client": "^15.1.3",
+    "ulid": "^3.0.2",
+    "zod": "^4.4.1"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-s3": "^3.1085.0",
+    "@types/pg": "^8.20.0"
+  }
+}

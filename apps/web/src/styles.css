@@ -1,0 +1,519 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ============================================================
+ * Ironside ecosystem tokens
+ *
+ * Coeval and Ironside share paper, ink, geometry, typography, and
+ * component rhythm. Ironside's steel-blue signal distinguishes the data
+ * plane from Coeval's oxblood/orange judgment layer.
+ * ========================================================= */
+
+:root {
+  --paper:        #F1EBDE;
+  --paper-2:      #ECE4D1;
+  --paper-3:      #E5DCC4;
+  --card-raw:     #FAF6EC;
+  --card-2:       #F6F0E0;
+  --rule:         #D4C9AE;
+  --rule-soft:    #DFD5BC;
+  --rule-strong:  #B8AC8E;
+
+  --ink:          #1A1614;
+  --ink-2:        #3D362E;
+  --ink-3:        #6B6354;
+  --ink-4:        #706858;
+  --ink-mute:     #B0A88F;
+
+  --signal:       #315B78;
+  --signal-2:     #3B6D8E;
+  --signal-tint:  #D3E0E6;
+  --signal-wash:  #E6EDF0;
+
+  --ok:           #35613F;
+  --ok-tint:      #DCE7D9;
+
+  --warn:         #8C6A18;
+  --warn-tint:    #EFE3BE;
+
+  --error:        #8B2A1C;
+  --error-tint:   #ECD7CF;
+
+  --shadow-card:  0 1px 0 rgba(26,22,20,0.04), 0 0 0 1px var(--rule-soft);
+  --shadow-elev:  0 6px 24px -10px rgba(26,22,20,0.18), 0 0 0 1px var(--rule);
+
+  --background:           var(--paper);
+  --foreground:           var(--ink);
+  --card:                 var(--card-raw);
+  --card-foreground:      var(--ink);
+  --popover:              var(--card-raw);
+  --popover-foreground:   var(--ink);
+  --primary:              var(--ink);
+  --primary-foreground:   var(--paper);
+  --secondary:            var(--paper-2);
+  --secondary-foreground: var(--ink);
+  --muted:                var(--paper-2);
+  --muted-foreground:     var(--ink-3);
+  --accent:               var(--paper-3);
+  --accent-foreground:    var(--ink);
+  --destructive:          var(--error);
+  --destructive-foreground: #FFF5F5;
+  --border:               var(--rule-soft);
+  --input:                var(--rule);
+  --ring:                 var(--signal);
+
+  --radius: 2px;
+
+  --font-serif: "Geist", "Söhne", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Geist", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono", "JetBrains Mono", ui-monospace, "SF Mono", monospace;
+}
+
+.dark {
+  --paper:        #09090B;
+  --paper-2:      #18181B;
+  --paper-3:      #27272A;
+  --card-raw:     #18181B;
+  --card-2:       #1F1F23;
+  --rule:         rgba(255, 255, 255, 0.12);
+  --rule-soft:    rgba(255, 255, 255, 0.08);
+  --rule-strong:  rgba(255, 255, 255, 0.18);
+
+  --ink:          #FAFAFA;
+  --ink-2:        #E4E4E7;
+  --ink-3:        #A1A1AA;
+  --ink-4:        #888892;
+  --ink-mute:     #52525B;
+
+  --signal:       #7CB7D8;
+  --signal-2:     #9BC9E2;
+  --signal-tint:  rgba(124, 183, 216, 0.20);
+  --signal-wash:  rgba(124, 183, 216, 0.08);
+
+  --ok:           #86C995;
+  --ok-tint:      rgba(134, 201, 149, 0.16);
+
+  --warn:         #FDE68A;
+  --warn-tint:    rgba(253, 230, 138, 0.16);
+
+  --error:        #FB923C;
+  --error-tint:   rgba(251, 146, 60, 0.16);
+
+  --shadow-card:  0 1px 0 rgba(0,0,0,0.4), 0 0 0 1px var(--rule-soft);
+  --shadow-elev:  0 20px 80px rgba(0,0,0,0.5), 0 0 0 1px var(--rule);
+
+  --background:           var(--paper);
+  --foreground:           var(--ink);
+  --card:                 var(--card-raw);
+  --card-foreground:      var(--ink);
+  --popover:              var(--card-raw);
+  --popover-foreground:   var(--ink);
+  --primary:              var(--ink);
+  --primary-foreground:   #18181B;
+  --secondary:            var(--paper-2);
+  --secondary-foreground: var(--ink);
+  --muted:                var(--paper-2);
+  --muted-foreground:     var(--ink-3);
+  --accent:               var(--paper-3);
+  --accent-foreground:    var(--ink);
+  --destructive:          var(--error);
+  --destructive-foreground: #2A0A0A;
+  --border:               var(--rule-soft);
+  --input:                var(--rule);
+  --ring:                 var(--signal);
+}
+
+/* Map design tokens into Tailwind's @theme so utilities like
+ * bg-paper, text-ink, border-rule, text-signal all work. */
+@theme inline {
+  --color-background:   var(--background);
+  --color-foreground:   var(--foreground);
+  --color-card:         var(--card);
+  --color-card-foreground:   var(--card-foreground);
+  --color-popover:      var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary:      var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary:    var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted:        var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent:       var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive:  var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border:       var(--border);
+  --color-input:        var(--input);
+  --color-ring:         var(--ring);
+
+  /* Ironside-specific colors */
+  --color-paper:        var(--paper);
+  --color-paper-2:      var(--paper-2);
+  --color-paper-3:      var(--paper-3);
+  --color-card-2:       var(--card-2);
+  --color-rule:         var(--rule);
+  --color-rule-soft:    var(--rule-soft);
+  --color-rule-strong:  var(--rule-strong);
+  --color-ink:          var(--ink);
+  --color-ink-2:        var(--ink-2);
+  --color-ink-3:        var(--ink-3);
+  --color-ink-4:        var(--ink-4);
+  --color-ink-mute:     var(--ink-mute);
+  --color-signal:       var(--signal);
+  --color-signal-2:     var(--signal-2);
+  --color-signal-tint:  var(--signal-tint);
+  --color-signal-wash:  var(--signal-wash);
+  --color-ok:           var(--ok);
+  --color-ok-tint:      var(--ok-tint);
+  --color-warn:         var(--warn);
+  --color-warn-tint:    var(--warn-tint);
+  --color-error:        var(--error);
+  --color-error-tint:   var(--error-tint);
+
+  --radius-sm: 2px;
+  --radius-md: 2px;
+  --radius-lg: 4px;
+  --radius-xl: 6px;
+
+  --font-serif: var(--font-serif);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+}
+
+@layer components {
+  .trace-record-split {
+    display: grid;
+    grid-template-columns: minmax(280px, var(--trace-tree-share, 42%)) 12px minmax(360px, 1fr);
+  }
+
+  .trace-record-resizer {
+    align-self: stretch;
+    display: flex;
+    min-height: 160px;
+    cursor: col-resize;
+    touch-action: none;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .trace-record-resizer > span {
+    width: 3px;
+    height: 52px;
+    border-radius: 999px;
+    background: var(--rule-strong);
+    transition: height 120ms ease, background-color 120ms ease;
+  }
+
+  .trace-record-resizer:hover > span,
+  .trace-record-resizer:focus-visible > span,
+  .trace-record-split--dragging .trace-record-resizer > span {
+    height: 76px;
+    background: var(--signal);
+  }
+
+  .trace-record-split--dragging {
+    cursor: col-resize;
+    user-select: none;
+  }
+
+  .trace-record-inspector {
+    position: sticky;
+    top: 68px;
+  }
+
+  .trace-tree-item:focus-visible > .trace-tree-row {
+    outline: 2px solid color-mix(in srgb, var(--signal) 65%, transparent);
+    outline-offset: -2px;
+  }
+
+  .payload-viewer {
+    width: 100%;
+  }
+
+  /* Payload height follows content naturally until this viewport-aware cap.
+   * Long unbroken values wrap only when needed; overflow remains available
+   * as the last resort for content that cannot be wrapped safely. */
+  .payload-scroll {
+    width: 100%;
+    max-height: min(70vh, 760px);
+    overflow: auto;
+  }
+
+  .payload-json {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: normal;
+  }
+
+  .payload-markdown > :first-child,
+  .payload-markdown-paragraph:first-child {
+    margin-top: 0;
+  }
+
+  .payload-markdown > :last-child,
+  .payload-markdown-paragraph:last-child {
+    margin-bottom: 0;
+  }
+
+  .payload-markdown-paragraph {
+    margin: 0.55rem 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .payload-markdown-h1,
+  .payload-markdown-h2,
+  .payload-markdown-h3,
+  .payload-markdown-h4,
+  .payload-markdown-h5,
+  .payload-markdown-h6 {
+    margin: 0.9rem 0 0.4rem;
+    color: var(--ink);
+    font-family: var(--font-serif);
+    font-weight: 600;
+    line-height: 1.25;
+  }
+
+  .payload-markdown-h1 { font-size: 1.25rem; }
+  .payload-markdown-h2 { font-size: 1.12rem; }
+  .payload-markdown-h3 { font-size: 1rem; }
+  .payload-markdown-h4,
+  .payload-markdown-h5,
+  .payload-markdown-h6 { font-size: 0.9rem; }
+
+  .payload-markdown-list {
+    margin: 0.5rem 0;
+    padding-left: 1.35rem;
+  }
+
+  .payload-markdown-list .payload-markdown-list {
+    margin: 0.2rem 0;
+  }
+
+  .payload-markdown-unordered { list-style: disc; }
+  .payload-markdown-ordered { list-style: decimal; }
+  .payload-markdown-list li { margin: 0.16rem 0; }
+
+  .payload-markdown-quote {
+    margin: 0.65rem 0;
+    border-left: 3px solid var(--rule-strong);
+    padding-left: 0.75rem;
+    color: var(--ink-3);
+  }
+
+  .payload-markdown-code {
+    border: 1px solid var(--rule-soft);
+    border-radius: 2px;
+    background: var(--paper-2);
+    padding: 0.08rem 0.25rem;
+    font-family: var(--font-mono);
+    font-size: 0.88em;
+    white-space: break-spaces;
+    overflow-wrap: anywhere;
+  }
+
+  .payload-markdown-code-block {
+    max-width: 100%;
+    margin: 0.65rem 0;
+    overflow-x: auto;
+    border: 1px solid var(--rule-soft);
+    border-radius: 2px;
+    background: var(--paper-2);
+    padding: 0.75rem;
+  }
+
+  .payload-markdown-code-block .payload-markdown-code {
+    border: 0;
+    background: transparent;
+    padding: 0;
+    white-space: pre;
+    overflow-wrap: normal;
+  }
+
+  .payload-markdown-link {
+    color: var(--signal);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  .payload-markdown-inert-link {
+    color: var(--ink-3);
+    text-decoration: underline dotted;
+    text-underline-offset: 2px;
+  }
+
+  .payload-markdown-image-placeholder {
+    color: var(--ink-4);
+    font-family: var(--font-mono);
+    font-size: 0.85em;
+    font-style: italic;
+    overflow-wrap: anywhere;
+  }
+
+  .payload-markdown-table-scroll {
+    max-width: 100%;
+    margin: 0.65rem 0;
+    overflow-x: auto;
+    border: 1px solid var(--rule-soft);
+  }
+
+  .payload-markdown-table-scroll table {
+    min-width: max-content;
+    border-collapse: collapse;
+  }
+
+  .payload-markdown-table-scroll th,
+  .payload-markdown-table-scroll td {
+    border-right: 1px solid var(--rule-soft);
+    border-bottom: 1px solid var(--rule-soft);
+    padding: 0.35rem 0.55rem;
+    text-align: left;
+    white-space: nowrap;
+  }
+
+  .payload-markdown-table-scroll th {
+    background: var(--paper-2);
+    color: var(--ink);
+    font-family: var(--font-mono);
+    font-size: 0.82em;
+    text-transform: uppercase;
+  }
+
+  .payload-markdown input[type="checkbox"] {
+    margin-right: 0.35rem;
+    pointer-events: none;
+  }
+
+  .payload-markdown-rule {
+    margin: 0.8rem 0;
+    border: 0;
+    border-top: 1px solid var(--rule);
+  }
+
+  .font-serif {
+    font-family: var(--font-serif);
+    font-weight: 500;
+    letter-spacing: -0.015em;
+  }
+
+  .font-mono {
+    font-family: var(--font-mono);
+    font-feature-settings: "ss01";
+  }
+
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    font-weight: 500;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+
+  .type-h1 {
+    font-family: var(--font-serif);
+    font-size: 28px;
+    font-weight: 500;
+    line-height: 1.1;
+    letter-spacing: -0.02em;
+  }
+
+  .type-h2 {
+    font-family: var(--font-serif);
+    font-size: 20px;
+    font-weight: 500;
+    line-height: 1.18;
+    letter-spacing: -0.015em;
+  }
+
+  .ledger {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  .ledger th,
+  .ledger td {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--rule-soft);
+    text-align: left;
+    vertical-align: top;
+    font-size: 12.5px;
+  }
+
+  .ledger th {
+    padding-top: 8px;
+    padding-bottom: 8px;
+    border-bottom-color: var(--rule);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+
+  .ledger tbody tr:hover td {
+    background: var(--card-2);
+  }
+
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: none; }
+  }
+
+  .fadeUp { animation: fadeUp 280ms ease-out both; }
+}
+
+@media (max-width: 1099px) {
+  .trace-record-split {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 20px;
+  }
+
+  .trace-record-resizer {
+    display: none;
+  }
+
+  .trace-record-inspector {
+    position: static;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fadeUp {
+    animation: none;
+  }
+}
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  html, body, #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    line-height: 1.5;
+    font-feature-settings: "ss01", "cv11";
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background: var(--signal-tint);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+}

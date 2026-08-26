@@ -1,0 +1,60 @@
+{
+  "name": "record-feedback-score-in-ironside",
+  "active": false,
+  "settings": {},
+  "nodes": [
+    {
+      "id": "c1000000-0000-4000-8000-000000000001",
+      "name": "Feedback Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "path": "ironside-score",
+        "httpMethod": "POST",
+        "responseMode": "onReceived"
+      },
+      "webhookId": "c2000000-0000-4000-8000-000000000009"
+    },
+    {
+      "id": "c1000000-0000-4000-8000-000000000002",
+      "name": "Record Score",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR-IRONSIDE-HOST/api/public/scores",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ traceId: $json.body.traceId, name: $json.body.name || 'user-feedback', value: $json.body.value, comment: $json.body.comment }) }}"
+      },
+      "credentials": {
+        "httpBasicAuth": {
+          "name": "ironside-score-auth"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Feedback Webhook": {
+      "main": [
+        [
+          {
+            "node": "Record Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

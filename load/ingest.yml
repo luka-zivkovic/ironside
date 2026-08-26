@@ -1,0 +1,21 @@
+config:
+  target: "http://localhost:8788"
+  phases:
+    - duration: 20
+      arrivalRate: 20
+      name: "ingest burst"
+  processor: "./ingest.processor.cjs"
+  variables:
+    apiKey: ""
+
+scenarios:
+  - name: "POST /api/v1/ingest"
+    flow:
+      - post:
+          url: "/api/v1/ingest"
+          headers:
+            authorization: "Bearer {{ apiKey }}"
+            content-type: "application/json"
+          beforeRequest: "setBody"
+          expect:
+            - statusCode: 202

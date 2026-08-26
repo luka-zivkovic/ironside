@@ -1,0 +1,39 @@
+{
+  "name": "@ironside/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Ironside API: ingest, query, scores, and compat routes.",
+  "scripts": {
+    "predev": "pnpm --filter @ironside/shared --filter @ironside/db --filter @ironside/clickhouse --filter @ironside/queue --filter @ironside/storage build",
+    "dev": "tsx watch src/index.ts",
+    "seed": "tsx src/scripts/seed.ts",
+    "owner:setup": "tsx src/scripts/owner-setup.ts",
+    "owner:recover": "tsx src/scripts/owner-recovery.ts",
+    "build": "tsc -p tsconfig.json && rm -rf dist/proto && cp -r proto dist/proto",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.0.10",
+    "@ironside/clickhouse": "workspace:*",
+    "@ironside/db": "workspace:*",
+    "@ironside/mappers": "workspace:*",
+    "@ironside/queue": "workspace:*",
+    "@ironside/shared": "workspace:*",
+    "@ironside/storage": "workspace:*",
+    "bullmq": "^5.80.2",
+    "hono": "^4.12.34",
+    "ioredis": "^5.4.1",
+    "pg": "^8.20.0",
+    "prom-client": "^15.1.3",
+    "protobufjs": "^8.7.1",
+    "ulid": "^3.0.2",
+    "zod": "^4.4.1"
+  },
+  "devDependencies": {
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/exporter-trace-otlp-proto": "^0.220.0",
+    "@opentelemetry/sdk-trace-base": "^2.9.0",
+    "@types/pg": "^8.20.0"
+  }
+}

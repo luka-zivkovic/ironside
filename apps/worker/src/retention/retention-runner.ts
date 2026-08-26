@@ -1,0 +1,102 @@
+import {
+  dropPartitionsOlderThan,
+  markProjectDataDeletedOlderThan,
+  type ClickHouseClient,
+  type RetainedTable
+} from "@ironside/clickhouse";
+import { listAllProjects, purgeIngestFailuresOlderThan } from "@ironside/db";
+import type { Pool } from "pg";
+
+const RETAINED_TABLES: readonly RetainedTable[] = ["traces", "observations", "scores"];
+
+export interface RunRetentionOptions {
+  pool: Pool;
+  clickhouse: ClickHouseClient;
+  /** Platform-default retention window in days, used for projects with no `retentionDays` override. */
+  defaultRetentionDays: number;
+  /** Fixed clock for one pass; callers normally omit it, tests can make cutoffs deterministic. */
+  now?: Date;
+}
+
+export interface RetentionRunResult {
+  /** Global partition drops — the primary "drop CH partitions" mechanism the DoD names, applied at the OLDEST (most conservative) retention floor across every project, since a partition holds every project's rows for that month. */
+  droppedPartitions: Record<RetainedTable, string[]>;
+  /** Per-project row-level deletes, only for projects whose retentionDays override is SHORTER than the global floor a partition drop already enforced. */
+  projectDeletes: { projectId: string; retentionDays: number }[];
+  /** Dead-letter diagnostics rows purged from ingest_event_failures (M9-03) — fixed 30-day window, so the table can't grow unbounded. */
+  purgedIngestFailures: number;
+}
+
+/**
+ * Runs one retention pass: drops whole ClickHouse partitions older than
+ * the LOOSEST retention window in effect (the platform default, or any
+ * project's override if longer — see below for why), then applies
+ * row-level per-project deletion for any project whose own retention is
+ * SHORTER than that floor.
+ *
+ * Partitions are calendar-month and NOT project-scoped (packages/clickhouse
+ * partitions by toYYYYMM(timestamp) across every project sharing that
+ * month) — see packages/clickhouse/src/retention.ts's docstring. This
+ * means the partition-drop mechanism can only enforce a single GLOBAL
+ * cutoff: it must use the LONGEST retention any project needs (the
+ * platform default, or a project override that's longer than default),
+ * because dropping a partition that still holds a project's
+ * still-in-window data would violate that project's retention promise.
+ * Projects wanting SHORTER retention than that floor get the extra
+ * precision via row-level markProjectDataDeletedOlderThan instead.
+ */
+export async function runRetention(options: RunRetentionOptions): Promise<RetentionRunResult> {
+  const { pool, clickhouse } = options;
+
+  const projects = await listAllProjects(pool);
+  const globalFloorDays = Math.max(
+    options.defaultRetentionDays,
+    ...projects.map((p) => p.retentionDays ?? 0)
+  );
+  const now = options.now ?? new Date();
+  const globalCutoff = daysAgo(globalFloorDays, now);
+
+  const droppedPartitions: Record<RetainedTable, string[]> = { traces: [], observations: [], scores: [] };
+  for (const table of RETAINED_TABLES) {
+    droppedPartitions[table] = await dropPartitionsOlderThan(clickhouse, table, globalCutoff);
+  }
+
+  // Row-level deletion only runs for projects with an EXPLICIT override
+  // shorter than the global floor — not for every project sitting at the
+  // platform default, even though those are also, strictly, "below the
+  // floor" once some other project's long override raises it. Extending
+  // this to every default-retention project would make one project's
+  // long-retention override force a full per-project ClickHouse
+  // INSERT...SELECT mutation for every OTHER project on the platform on
+  // every retention run — a real hang was observed in testing with just
+  // ~35 projects. Default-retention projects' old data still eventually
+  // gets removed once the floor itself comes back down (the long
+  // override expires/changes) via a normal partition drop; there is no
+  // retention-promise violation in the meantime, since the platform
+  // default was never violated — only projects that asked for something
+  // SHORTER than default need the extra row-level precision.
+  const projectDeletes: RetentionRunResult["projectDeletes"] = [];
+  for (const project of projects) {
+    if (project.retentionDays === null) continue;
+    if (project.retentionDays >= globalFloorDays) continue;
+
+    const projectCutoff = daysAgo(project.retentionDays, now);
+    for (const table of RETAINED_TABLES) {
+      await markProjectDataDeletedOlderThan(clickhouse, table, project.id, projectCutoff);
+    }
+    projectDeletes.push({ projectId: project.id, retentionDays: project.retentionDays });
+  }
+
+  // Dead-letter rows are diagnostics, not trace data — a fixed 30-day
+  // window (not the per-project retention settings) keeps the table
+  // bounded without inventing a separate config knob for it.
+  const purgedIngestFailures = await purgeIngestFailuresOlderThan(pool, 30);
+
+  return { droppedPartitions, projectDeletes, purgedIngestFailures };
+}
+
+function daysAgo(days: number, now: Date): Date {
+  const date = new Date(now);
+  date.setUTCDate(date.getUTCDate() - days);
+  return date;
+}

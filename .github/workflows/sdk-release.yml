@@ -1,0 +1,76 @@
+name: SDK release
+
+on:
+  push:
+    tags: ["sdk-v*.*.*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: sdk-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: pnpm
+
+      # npm Trusted Publishing requires npm >=11.5.1. Pinning the CLI keeps
+      # the release independent of whichever npm version ships with Node.
+      - name: Install trusted-publishing capable npm
+        run: npm install --global npm@11.6.2
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify tag and select npm dist-tag
+        id: release
+        run: |
+          node <<'NODE'
+          const { appendFileSync } = require("node:fs");
+          const pkg = require("./packages/sdk/package.json");
+          const expected = `sdk-v${pkg.version}`;
+          if (process.env.GITHUB_REF_NAME !== expected) {
+            console.error(`Tag ${process.env.GITHUB_REF_NAME} does not match ${expected}`);
+            process.exit(1);
+          }
+          const distTag = pkg.version.includes("-") ? "next" : "latest";
+          appendFileSync(process.env.GITHUB_OUTPUT, `dist_tag=${distTag}\n`);
+          console.log(`Publishing ${pkg.name}@${pkg.version} under npm dist-tag ${distTag}`);
+          NODE
+
+      - name: Test SDK
+        run: pnpm exec vitest run packages/sdk/test
+
+      - name: Build SDK
+        run: pnpm --filter ironside build
+
+      - name: Verify packed package
+        run: pnpm --filter ironside test:package
+
+      - name: Publish package
+        run: npm publish --access public --tag "${{ steps.release.outputs.dist_tag }}"
+        working-directory: packages/sdk
+        env:
+          # Bootstrap only. During the OIDC cutover, remove this env block
+          # and setup-node's registry-url before deleting/revoking the
+          # secret (docs/sdk-release.md).
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

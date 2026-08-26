@@ -1,0 +1,13 @@
+<!-- Enables ClickHouse's native BACKUP/RESTORE statements to write under
+     /var/lib/clickhouse/backups (inside the clickhouse-owned data volume —
+     a separate named volume would be root-owned and fail with Permission
+     denied, verified empirically). Copy backups OFF-HOST after creating
+     them; a backup living only next to the data it protects is not a
+     disaster-recovery plan. Without backups.allowed_path configured,
+     `BACKUP ... TO File(...)` fails with INVALID_CONFIG_PARAMETER — see
+     docs/self-hosting.md's Backups section for the tested commands. -->
+<clickhouse>
+    <backups>
+        <allowed_path>/var/lib/clickhouse/backups/</allowed_path>
+    </backups>
+</clickhouse>

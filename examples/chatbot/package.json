@@ -1,0 +1,13 @@
+{
+  "name": "ironside-example-chatbot",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Minimal chatbot backend instrumented with the ironside SDK in 3 lines.",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ironside": "workspace:*"
+  }
+}

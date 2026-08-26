@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sdk-package:
+    name: SDK package (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck SDK
+        run: pnpm --filter ironside typecheck
+
+      - name: Test SDK
+        run: pnpm exec vitest run packages/sdk/test
+
+      - name: Verify packed package
+        run: pnpm --filter ironside test:package
+
+  build-typecheck-test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ironside
+          POSTGRES_PASSWORD: ironside
+          POSTGRES_DB: ironside
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U ironside -d ironside"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.3
+        env:
+          CLICKHOUSE_USER: ironside
+          CLICKHOUSE_PASSWORD: ironside
+          CLICKHOUSE_DB: ironside
+        ports:
+          - 8123:8123
+          - 9000:9000
+        options: >-
+          --health-cmd "clickhouse-client --user ironside --password ironside --query 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://ironside:ironside@localhost:5433/ironside
+      CLICKHOUSE_URL: http://localhost:8123
+      CLICKHOUSE_USER: ironside
+      CLICKHOUSE_PASSWORD: ironside
+      CLICKHOUSE_DB: ironside
+      REDIS_URL: redis://localhost:6380
+      S3_ENDPOINT: http://localhost:9010
+      S3_ACCESS_KEY: ironside
+      S3_SECRET_KEY: ironside123
+      S3_BUCKET: ironside-raw
+      S3_REGION: us-east-1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # GitHub Actions `services:` cannot override a container's command, and
+      # minio/minio requires `server /data` — so MinIO starts as a step.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9010:9000 \
+            -e MINIO_ROOT_USER=ironside -e MINIO_ROOT_PASSWORD=ironside123 \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:9010/minio/health/live > /dev/null; then
+              echo "MinIO is up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO failed to start" >&2
+          docker logs minio >&2
+          exit 1
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test

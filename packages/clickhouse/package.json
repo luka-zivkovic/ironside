@@ -1,0 +1,23 @@
+{
+  "name": "@ironside/clickhouse",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Ironside ClickHouse migrations and client (traces, observations, scores).",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && rm -rf dist/migrations && cp -r migrations dist/migrations",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@clickhouse/client": "^1.23.1",
+    "@ironside/shared": "workspace:*"
+  }
+}

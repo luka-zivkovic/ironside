@@ -1,0 +1,25 @@
+{
+  "name": "@ironside/mappers",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Maps source-shaped ingest event bodies (native, otlp, langfuse, ...) to the Ironside domain model, and back (tree reconstruction, OTLP forwarding).",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@ironside/clickhouse": "workspace:*",
+    "@ironside/shared": "workspace:*",
+    "ulid": "^3.0.2",
+    "zod": "^4.4.1"
+  }
+}
