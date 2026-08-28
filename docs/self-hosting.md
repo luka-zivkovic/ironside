@@ -14,13 +14,13 @@ This builds the `api`/`worker`/`web` images locally and starts the whole stack. 
 
 `api` and `worker` each verify the same Postgres/ClickHouse baseline on boot and ensure the `ironside-raw` object storage bucket exists, so there's no separate schema step to run by hand. Ironside is still pre-production: schema changes edit the baseline in place, and a changed checksum or historical migration ledger requires a clean data reset. See [Pre-production schema policy](pre-production-schema.md).
 
-Once every container reports healthy (`docker compose ps`), issue a short-lived owner setup capability from the host:
+Once every container reports healthy (`docker compose ps`), generate a short-lived, one-time owner setup code from the host:
 
 ```sh
 docker compose exec api node apps/api/dist/src/scripts/owner-setup.js
 ```
 
-Open `http://localhost:8080/setup`, paste the printed `ironside_setup_...` capability, and create the one deployment owner and organization. The capability is stored only as a SHA-256 hash, expires after 15 minutes by default, and is consumed atomically.
+Open `http://localhost:8080/setup`, paste the printed `ironside_setup_...` code, and create the one deployment owner and organization. Only a SHA-256 hash of the code is stored; it expires after 15 minutes by default and is consumed atomically.
 
 After owner setup, create the first project in the UI. The project and its initial Ingest credential are committed atomically, and the plaintext `ironside_sc_...` token is shown once. Copy it into the SDK/exporter that will ingest data; the browser uses only the HttpOnly owner session and project-explicit URLs. Point a client at `http://localhost:8788` directly, or through the web container's nginx proxy on the same origin as the UI (`http://localhost:8080/api/...` for native ingest and LangFuse compatibility, `http://localhost:8080/v1/...` for OTLP — see `apps/web/nginx.conf`).
 

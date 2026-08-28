@@ -146,7 +146,7 @@ export function ownerAuthRoutes(deps: OwnerAuthRouteDeps): Hono {
     if (!parsed.success) return c.json({ error: "invalid request", issues: parsed.error.issues }, 400);
 
     const matched = await matchChallenge(deps.pool, "setup", parsed.data.token);
-    if (!matched) return c.json({ error: "invalid or expired setup capability" }, 401);
+    if (!matched) return c.json({ error: "invalid or expired setup code" }, 401);
 
     try {
       const passwordHash = await hashOwnerPassword(parsed.data.password);
@@ -164,7 +164,7 @@ export function ownerAuthRoutes(deps: OwnerAuthRouteDeps): Hono {
       if (error instanceof OwnerAuthError) {
         if (error.code === "setup_closed") return c.json({ error: "owner setup is already complete" }, 409);
         if (error.code === "challenge_invalid") {
-          return c.json({ error: "invalid or expired setup capability" }, 401);
+          return c.json({ error: "invalid or expired setup code" }, 401);
         }
       }
       throw error;

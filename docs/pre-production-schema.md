@@ -28,7 +28,7 @@ docker compose down -v
 docker compose up -d --build
 ```
 
-Then generate a fresh owner setup capability and create the first project as
+Then generate a fresh one-time owner setup code and create the first project as
 described in `docs/self-hosting.md`. External Postgres, ClickHouse, or object
 storage must be cleared with that provider's own tooling; do not point a newer
 pre-production build at an older database.

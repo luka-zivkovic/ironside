@@ -19,13 +19,13 @@ cd ironside
 docker compose up -d --build
 ```
 
-This starts the full stack — Postgres, ClickHouse, Redis, MinIO, plus the `api`, `worker`, and `web` containers — with migrations and object storage setup handled automatically on boot. Once `docker compose ps` shows everything healthy, issue the one-time owner setup capability:
+This starts the full stack — Postgres, ClickHouse, Redis, MinIO, plus the `api`, `worker`, and `web` containers — with migrations and object storage setup handled automatically on boot. Once `docker compose ps` shows everything healthy, generate the one-time owner setup code:
 
 ```sh
 docker compose exec api node apps/api/dist/src/scripts/owner-setup.js
 ```
 
-Open `http://localhost:8080/setup`, paste the capability, and create the deployment owner. Owner access uses an HttpOnly browser session and is separate from machine credentials.
+Open `http://localhost:8080/setup`, paste the code, and create your owner account. The code proves that you control this installation, expires quickly, and works once. Owner access uses an HttpOnly browser session and is separate from machine credentials.
 
 After signing in, create the first project in the UI. Ironside commits the
 project and its initial scoped `ironside_sc_...` Ingest credential atomically
