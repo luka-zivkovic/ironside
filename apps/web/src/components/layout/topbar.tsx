@@ -2,6 +2,7 @@ import * as React from "react";
 import { useTheme } from "next-themes";
 import { NavLink, useLocation, useSearchParams } from "react-router-dom";
 import { cn } from "@/lib/utils";
+import { IronsideBrand } from "@/components/ironside-brand";
 import { useActiveProject } from "@/lib/projects";
 import { getApiBaseUrl } from "@/lib/api";
 import { useEnvironmentRegistry } from "@/lib/environment-registry";
@@ -23,9 +24,11 @@ export function Topbar({ crumbs, right }: TopbarProps) {
 
   return (
     <header className="sticky top-0 z-10 flex min-h-12 items-center gap-3.5 border-b border-rule bg-paper/95 px-5 backdrop-blur-sm sm:px-8 lg:px-7">
-      <div className="mr-1 font-serif text-[15px] text-ink lg:hidden">
-        <span className="text-signal">i</span>ronside
-      </div>
+      <IronsideBrand
+        className="mr-1 lg:hidden"
+        markClassName="size-4"
+        nameClassName="sr-only font-serif text-[15px] text-ink sm:not-sr-only"
+      />
       <nav className="flex items-center gap-1 lg:hidden" aria-label="Primary navigation">
         <MobileNavLink to={pathWithEnvironment(`${projectBase}/traces`, searchParams)} end>Traces</MobileNavLink>
         <MobileNavLink to={pathWithEnvironment(`${projectBase}/connections`, searchParams)}>Connect</MobileNavLink>

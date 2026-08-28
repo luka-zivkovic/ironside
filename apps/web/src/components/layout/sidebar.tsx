@@ -2,6 +2,7 @@ import { Cable, Database, ListTree, Settings as SettingsIcon, ShieldCheck } from
 import { NavLink, useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { useTheme } from "next-themes";
 import { cn } from "@/lib/utils";
+import { IronsideBrand } from "@/components/ironside-brand";
 import { useActiveProject } from "@/lib/projects";
 import { getApiBaseUrl } from "@/lib/api";
 import { pathWithEnvironment } from "@/lib/environment-filter";
@@ -20,10 +21,11 @@ export function Sidebar() {
 
   return (
     <aside className="sticky top-0 hidden h-screen flex-col border-r border-rule bg-paper-2 pt-[18px] pb-3.5 lg:flex">
-      <div className="flex items-baseline gap-2.5 border-b border-rule-soft px-[22px] pt-1 pb-[18px] mb-3.5">
-        <div className="font-serif text-[17px] font-medium tracking-[-0.02em] text-ink">
-          <span className="text-signal">i</span>ronside
-        </div>
+      <div className="flex items-center gap-2.5 border-b border-rule-soft px-[22px] pt-1 pb-[18px] mb-3.5">
+        <IronsideBrand
+          markClassName="size-5"
+          nameClassName="font-serif text-[17px] font-medium tracking-[-0.02em] text-ink"
+        />
         <div className="font-mono text-[9px] uppercase tracking-[0.13em] text-ink-4">Recorder</div>
       </div>
 
