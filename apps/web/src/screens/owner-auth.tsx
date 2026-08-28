@@ -12,10 +12,11 @@ import { Input } from "@/components/ui/input";
 const SETUP_COMMAND = "docker compose exec api node apps/api/dist/src/scripts/owner-setup.js";
 const RECOVERY_COMMAND = "docker compose exec api node apps/api/dist/src/scripts/owner-recovery.js";
 
-function AuthShell({ eyebrow, title, description, children }: {
+function AuthShell({ eyebrow, title, description, introduction, children }: {
   eyebrow: string;
   title: string;
   description: string;
+  introduction?: ReactNode;
   children: ReactNode;
 }) {
   return (
@@ -23,15 +24,7 @@ function AuthShell({ eyebrow, title, description, children }: {
       <div className="grid w-full max-w-[920px] gap-10 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)] lg:items-center lg:gap-16">
         <section>
           <div className="font-serif text-[18px] font-medium text-ink"><span className="text-signal">i</span>ronside</div>
-          <div className="eyebrow mt-12">Owner control plane</div>
-          <h1 className="mt-2 max-w-[420px] font-serif text-[38px] leading-[1.04] tracking-[-0.035em] text-ink sm:text-[46px]">
-            Human access, separate from machine traffic.
-          </h1>
-          <div className="mt-7 flex flex-col gap-3 text-[12.5px] text-ink-3">
-            <Promise icon={<ShieldCheck />} text="One deployment owner in v1" />
-            <Promise icon={<LockKeyhole />} text="HttpOnly, expiring browser sessions" />
-            <Promise icon={<KeyRound />} text="Project keys remain machine credentials" />
-          </div>
+          {introduction ?? <OwnerAccessIntroduction />}
         </section>
         <Card className="shadow-[var(--shadow-elev)]">
           <CardHeader className="flex-col items-start gap-1 border-b border-rule-soft">
@@ -43,6 +36,61 @@ function AuthShell({ eyebrow, title, description, children }: {
         </Card>
       </div>
     </div>
+  );
+}
+
+function OwnerAccessIntroduction() {
+  return (
+    <>
+      <div className="eyebrow mt-12">Owner control plane</div>
+      <h1 className="mt-2 max-w-[420px] font-serif text-[38px] leading-[1.04] tracking-[-0.035em] text-ink sm:text-[46px]">
+        Human access, separate from machine traffic.
+      </h1>
+      <div className="mt-7 flex flex-col gap-3 text-[12.5px] text-ink-3">
+        <Promise icon={<ShieldCheck />} text="One deployment owner in v1" />
+        <Promise icon={<LockKeyhole />} text="HttpOnly, expiring browser sessions" />
+        <Promise icon={<KeyRound />} text="Project keys remain machine credentials" />
+      </div>
+    </>
+  );
+}
+
+function OwnerSetupIntroduction() {
+  return (
+    <>
+      <div className="eyebrow mt-12">First-time setup</div>
+      <h1 className="mt-2 max-w-[420px] font-serif text-[38px] leading-[1.04] tracking-[-0.035em] text-ink sm:text-[46px]">
+        Set up Ironside
+      </h1>
+      <p className="mt-5 max-w-[460px] text-[13px] leading-6 text-ink-3">
+        Ironside keeps a searchable record of what your AI received, what it returned, which model ran, how long it took, and how many tokens it used.
+      </p>
+      <ol aria-label="Setup progress" className="mt-7 flex flex-col gap-4">
+        <SetupStep number={1} title="Create your owner account" description="Secure this Ironside installation" current />
+        <SetupStep number={2} title="Create a project" description="Choose where this app's traces belong" />
+        <SetupStep number={3} title="Connect your AI app" description="Pick an integration and follow its instructions" />
+        <SetupStep number={4} title="Open your first trace" description="See a recorded AI run in Ironside" />
+      </ol>
+    </>
+  );
+}
+
+function SetupStep({ number, title, description, current = false }: {
+  number: number;
+  title: string;
+  description: string;
+  current?: boolean;
+}) {
+  return (
+    <li className="flex items-start gap-3" aria-current={current ? "step" : undefined}>
+      <span className={`grid size-6 shrink-0 place-items-center rounded-full border font-mono text-[10px] ${current ? "border-signal bg-signal-wash text-signal" : "border-rule text-ink-4"}`}>
+        {number}
+      </span>
+      <span>
+        <span className={`block text-[12.5px] font-medium ${current ? "text-ink" : "text-ink-3"}`}>{title}</span>
+        <span className="mt-0.5 block text-[11.5px] leading-5 text-ink-4">{description}</span>
+      </span>
+    </li>
   );
 }
 
@@ -91,7 +139,7 @@ export function OwnerSetupScreen({ onAuthenticated }: {
   async function submit(event: FormEvent) {
     event.preventDefault();
     const token = extractOwnerCapability(tokenInput, "setup");
-    if (!token) return setError("Paste a complete ironside_setup_… capability.");
+    if (!token) return setError("Paste the complete one-time setup code.");
     if (password !== confirmation) return setError("The passwords do not match.");
     setSubmitting(true);
     setError(null);
@@ -105,15 +153,24 @@ export function OwnerSetupScreen({ onAuthenticated }: {
   }
 
   return (
-    <AuthShell eyebrow="Initial setup" title="Create the deployment owner" description="Create the first owner for this deployment.">
+    <AuthShell
+      eyebrow="Step 1 of 4"
+      title="Create your owner account"
+      description="Use the one-time code from the Ironside host, then choose the username and password you will use to sign in."
+      introduction={<OwnerSetupIntroduction />}
+    >
       <form onSubmit={submit} className="flex flex-col gap-3">
-        <Field label="Setup capability"><Input type="password" autoFocus value={tokenInput} onChange={(e) => setTokenInput(e.target.value)} disabled={submitting} placeholder="ironside_setup_..." /></Field>
+        <Field label="One-time setup code"><Input type="password" autoFocus value={tokenInput} onChange={(e) => setTokenInput(e.target.value)} disabled={submitting} placeholder="ironside_setup_..." /></Field>
         <Field label="Username"><Input autoComplete="username" value={username} onChange={(e) => setUsername(e.target.value)} disabled={submitting} /></Field>
         <PasswordFields password={password} confirmation={confirmation} onPassword={setPassword} onConfirmation={setConfirmation} disabled={submitting} />
         {error ? <div className="text-[12px] text-error">{error}</div> : null}
         <Button type="submit" variant="primary" className="mt-1 h-10" disabled={submitting}>{submitting ? "Creating owner…" : "Create owner"}<ArrowRight /></Button>
       </form>
-      <CommandHelp title="Generate the setup capability on the host" command={SETUP_COMMAND} />
+      <CommandHelp
+        title="Get your one-time setup code"
+        command={SETUP_COMMAND}
+        description="Run this command on the machine where Ironside is installed. Paste the code it prints above. The code proves that you control this installation, expires quickly, and works once."
+      />
     </AuthShell>
   );
 }
@@ -187,6 +244,10 @@ export function OwnerRecoveryScreen({ onRecovered }: { onRecovered: () => void }
   );
 }
 
-function CommandHelp({ title, command }: { title: string; command: string }) {
-  return <div className="mt-7 border-t border-rule pt-5"><div className="font-serif text-[14.5px] font-medium text-ink-2">{title}</div><pre className="mt-3 overflow-x-auto rounded-sm border border-rule-soft bg-paper-2 p-3 font-mono text-[10.5px] leading-5 text-ink-2"><code>{command}</code></pre><p className="mt-2 text-[11.5px] leading-5 text-ink-3">The capability expires quickly, is stored only as a hash, and can be used once.</p></div>;
+function CommandHelp({ title, command, description = "The capability expires quickly, is stored only as a hash, and can be used once." }: {
+  title: string;
+  command: string;
+  description?: string;
+}) {
+  return <div className="mt-7 border-t border-rule pt-5"><div className="font-serif text-[14.5px] font-medium text-ink-2">{title}</div><pre className="mt-3 overflow-x-auto rounded-sm border border-rule-soft bg-paper-2 p-3 font-mono text-[10.5px] leading-5 text-ink-2"><code>{command}</code></pre><p className="mt-2 text-[11.5px] leading-5 text-ink-3">{description}</p></div>;
 }

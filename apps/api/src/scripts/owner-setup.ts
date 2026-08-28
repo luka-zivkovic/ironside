@@ -15,7 +15,7 @@ try {
   const expiresAt = new Date(Date.now() + config.authChallengeTtlSeconds * 1000);
   await issueSetupChallenge(pool, issued.tokenHash, expiresAt);
 
-  console.log("Owner setup capability (shown once):");
+  console.log("One-time owner setup code (shown once):");
   console.log(issued.token);
   console.log(`Expires: ${expiresAt.toISOString()}`);
   console.log(`Open: ${config.webOrigins[0] ?? "the Ironside web URL"}/setup`);

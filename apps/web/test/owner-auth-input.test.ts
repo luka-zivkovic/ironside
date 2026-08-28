@@ -5,7 +5,7 @@ describe("owner auth browser input", () => {
   it("extracts only the requested complete capability from pasted command output", () => {
     const setup = `ironside_setup_${"a".repeat(43)}`;
     const recovery = `ironside_recovery_${"b".repeat(43)}`;
-    expect(extractOwnerCapability(`Owner setup capability:\n${setup}\nExpires soon`, "setup")).toBe(setup);
+    expect(extractOwnerCapability(`One-time owner setup code:\n${setup}\nExpires soon`, "setup")).toBe(setup);
     expect(extractOwnerCapability(recovery, "setup")).toBeNull();
     expect(extractOwnerCapability(`token=${recovery}`, "recovery")).toBe(recovery);
     expect(extractOwnerCapability(`ironside_setup_${"a".repeat(42)}`, "setup")).toBeNull();
