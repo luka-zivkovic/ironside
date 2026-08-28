@@ -6,6 +6,7 @@ import { setLastProjectId } from "@/lib/project-storage";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { IronsideBrand } from "@/components/ironside-brand";
 
 export function ProjectBootstrapScreen() {
   const [name, setName] = useState("");
@@ -36,6 +37,11 @@ export function ProjectBootstrapScreen() {
     <div className="min-h-screen grid place-items-center px-5 py-12">
       <Card className="w-full max-w-[620px] shadow-[var(--shadow-elev)]">
         <CardHeader className="flex-col items-start gap-1 border-b border-rule-soft">
+          <IronsideBrand
+            className="mb-2"
+            markClassName="size-6"
+            nameClassName="font-serif text-[17px] font-medium tracking-[-0.02em] text-ink"
+          />
           <div className="eyebrow">First project</div>
           <CardTitle>Create the first data boundary</CardTitle>
           <CardDescription>

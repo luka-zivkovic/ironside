@@ -11,6 +11,7 @@ import {
   useSearchParams
 } from "react-router-dom";
 import { ThemeProvider } from "@/components/theme-provider";
+import { IronsideBrand } from "@/components/ironside-brand";
 import { RootLayout } from "@/components/layout/root-layout";
 import { TracesScreen } from "@/screens/traces";
 import { SettingsScreen } from "@/screens/settings";
@@ -293,7 +294,11 @@ function FullScreen({ title, description, children }: { title: string; descripti
   return (
     <div className="min-h-screen grid place-items-center px-6">
       <div className="text-center">
-        <div className="font-mono text-[10.5px] uppercase tracking-[0.12em] text-ink-3">Ironside</div>
+        <IronsideBrand
+          className="justify-center"
+          markClassName="size-5"
+          nameClassName="font-mono text-[10.5px] uppercase tracking-[0.12em] text-ink-3"
+        />
         <div className="type-h2 mt-2">{title}</div>
         <div className="mt-2 text-[13px] text-ink-3 max-w-md">{description}</div>
         {children}

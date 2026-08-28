@@ -7,6 +7,7 @@ import { extractOwnerCapability } from "@/lib/owner-auth-input";
 import type { OwnerSessionResponse } from "@ironside/shared/browser";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { IronsideBrand } from "@/components/ironside-brand";
 import { Input } from "@/components/ui/input";
 
 const SETUP_COMMAND = "docker compose exec api node apps/api/dist/src/scripts/owner-setup.js";
@@ -23,7 +24,10 @@ function AuthShell({ eyebrow, title, description, introduction, children }: {
     <div className="min-h-screen px-5 py-12 sm:px-8 lg:grid lg:place-items-center lg:py-16">
       <div className="grid w-full max-w-[920px] gap-10 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)] lg:items-center lg:gap-16">
         <section>
-          <div className="font-serif text-[18px] font-medium text-ink"><span className="text-signal">i</span>ronside</div>
+          <IronsideBrand
+            markClassName="size-6"
+            nameClassName="font-serif text-[18px] font-medium text-ink"
+          />
           {introduction ?? <OwnerAccessIntroduction />}
         </section>
         <Card className="shadow-[var(--shadow-elev)]">

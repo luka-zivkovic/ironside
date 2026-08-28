@@ -1,4 +1,5 @@
 import { Button } from "@/components/ui/button";
+import { IronsideBrand } from "@/components/ironside-brand";
 
 export function NotFoundScreen() {
   return (
@@ -12,7 +13,11 @@ export function NotFoundScreen() {
 export function ApiUnavailableScreen({ retry }: { retry: () => void }) {
   return (
     <div className="text-center">
-      <div className="font-mono text-[13px] uppercase tracking-[0.12em] text-ink-3">Ironside</div>
+      <IronsideBrand
+        className="justify-center"
+        markClassName="size-6"
+        nameClassName="font-mono text-[13px] uppercase tracking-[0.12em] text-ink-3"
+      />
       <div className="type-h2 mt-2">API unreachable</div>
       <div className="mt-2 text-[13px] text-ink-3 max-w-md">
         Could not reach the Ironside API. Make sure it's running and reachable from this browser.
