@@ -78,7 +78,9 @@ services:
     image: ghcr.io/luka-zivkovic/ironside-web:0.2.0
 ```
 
-Only after every image publishes does the workflow create a **draft** GitHub
+After every image publishes, the workflow pulls those exact tags into the
+generic Compose bundle, boots a disposable stack, verifies the public health
+route and owner-setup command, and only then creates a **draft** GitHub
 release. After the first workflow run, an owner must make all three GHCR
 packages public; package visibility persists for later versions. Verify
 anonymous pulls, document whether the release has no data migration or a
