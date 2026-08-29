@@ -41,11 +41,16 @@ A second, much smaller bug surfaced while writing that test suite: the initial b
 
 ## CI release workflow
 
-`.github/workflows/release.yml`, triggered on `v*.*.*` tag pushes (not on every push/PR — that's `ci.yml`'s job, which already runs build/typecheck/test on every commit). Builds all three images via a matrix job and pushes to `ghcr.io/<owner>/ironside-{api,worker,web}:<version>` plus a rolling `:latest` tag. Uses `docker/build-push-action`'s GitHub Actions cache (`type=gha`) so incremental releases don't rebuild every layer from scratch. No test re-run in this workflow — a tag is only pushed after `ci.yml` has already gone green on that commit, so re-testing here would be redundant, not additional safety.
+`.github/workflows/release.yml` is triggered by an exact `vX.Y.Z` tag matching
+the root package version. It reruns build, typecheck, and the complete test
+suite against the four infrastructure stores before publishing. A matrix job
+then creates amd64 and arm64 API/worker/web images at the immutable semantic
+version and `sha-<full commit>` tags, with OCI metadata, provenance, an SBOM,
+and GitHub Actions build cache. It deliberately does not publish `latest`.
 
 ## Verified against real Docker, twice, not simulated
 
-The paragraph below records the release milestone's historical smoke flow. The current pre-production baseline replaces that bootstrap key path with owner setup plus scoped machine credentials; use `docs/self-hosting.md` for current commands.
+The paragraph below records the release milestone's historical smoke flow. The frozen baseline replaces that bootstrap key path with owner setup plus scoped machine credentials; use `docs/self-hosting.md` for current commands.
 
 Beyond the bug-catching first run: a second full run, from a clean `--no-cache` image rebuild (to also validate the newly-added `.dockerignore`), brought all 7 containers (4 infra + api/worker/web) to healthy/running in well under a minute from `docker compose up`. Then, live: ran the compiled `apps/api/dist/src/scripts/seed.js` inside the running `api` container (the documented bootstrap step) to get a real project + API key, ingested a real trace via `POST /api/v1/ingest`, confirmed the worker processed it into ClickHouse, and confirmed it's queryable through `web`'s nginx proxy on port 8080 exactly as a browser would reach it (`GET http://localhost:8080/api/v1/traces`) — not just directly against the api container. This is the literal DoD text ("first trace in UI") verified end-to-end against real infrastructure, well inside the 10-minute budget.
 

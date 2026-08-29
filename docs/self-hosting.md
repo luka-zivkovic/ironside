@@ -12,7 +12,7 @@ docker compose up -d --build
 
 This builds the `api`/`worker`/`web` images locally and starts the whole stack. First boot takes a few minutes (image builds + Postgres/ClickHouse initialization); subsequent `docker compose up` runs are fast, since Docker caches the image layers and the infra containers keep their data in named volumes (`pgdata`, `chdata`, `miniodata`).
 
-`api` and `worker` each verify the same Postgres/ClickHouse baseline on boot and ensure the `ironside-raw` object storage bucket exists, so there's no separate schema step to run by hand. Ironside is still pre-production: schema changes edit the baseline in place, and a changed checksum or historical migration ledger requires a clean data reset. See [Pre-production schema policy](pre-production-schema.md).
+`api` and `worker` each verify the same Postgres/ClickHouse migration history on boot and ensure the `ironside-raw` object storage bucket exists, so there's no separate schema step to run by hand. The first persistent external deployment froze both baselines on 2026-08-28; later releases use append-only forward migrations. See [Database schema lifecycle](pre-production-schema.md).
 
 Once every container reports healthy (`docker compose ps`), generate a short-lived, one-time owner setup code from the host:
 
@@ -28,7 +28,7 @@ Native ingest, OTLP, media upload, and `/api/public/*` remain key-implicit; nati
 
 The credential presets are **Ingest** (`ingest`, `media:write`) and **Integration** (`traces:read`, `scores:write`). Optional expiry, creation/revocation actors, status, and last use are visible in Connections. Plaintext is returned only by the create response and must be placed in your secret manager. To rotate, create the replacement preset, update the client, verify its last-use timestamp, and revoke the old credential.
 
-Machine credentials use the `ironside_sc_...` token class. There is no older Ironside credential class in the pre-production baseline.
+Machine credentials use the `ironside_sc_...` token class. There is no older Ironside credential class in the frozen baseline.
 
 If the owner password is lost, issue a recovery capability from the host and open `/recover`:
 
@@ -38,17 +38,53 @@ docker compose exec api node apps/api/dist/src/scripts/owner-recovery.js
 
 Recovery replaces the existing owner's password, revokes every active owner session, and never creates another owner.
 
+## Generic single-host release bundle
+
+`deploy/self-host/compose.yaml` is the platform-neutral bundle for a Linux
+host with Docker Engine and Compose v2. It uses exact application and
+infrastructure images, exposes only the web service on loopback by default,
+and persists Postgres, ClickHouse, Redis, and MinIO in named volumes.
+`compose.yaml.sha256` is checked by the release workflow.
+
+The separate pre-release `trustctl` CLI installs this bundle, generates the
+required secrets, preserves operator additions in `compose.override.yaml`,
+and provides `status`, `doctor`, update checking, and explicit updates. It is
+not an Ironside runtime component and receives no Docker or hosting-platform
+credentials. Do not advertise its one-line bootstrap until trustctl, this
+tagged bundle, and the GHCR images are all public.
+
+Coolify remains an independent deployment method whose saved Compose and
+environment state define each Service. A trustctl installation is not adopted
+by Coolify, and trustctl does not update a Coolify Service.
+
 ## Using published images instead of building locally
 
-Every tagged release (`vX.Y.Z`) publishes `ghcr.io/luka-zivkovic/ironside-{api,worker,web}:X.Y.Z` (and a rolling `:latest`) via CI. To use a published release instead of building from source, set the `image:` field for `api`, `worker`, and `web` in `docker-compose.yml` to the corresponding `ghcr.io/...` tag and drop the `build:` block, or override at the CLI:
+Every tagged release (`vX.Y.Z`) runs the build, typecheck, and test suite,
+validates the generic Compose checksum and render, and then publishes
+multi-architecture `ghcr.io/luka-zivkovic/ironside-{api,worker,web}:X.Y.Z`
+images. The release tag is immutable; a `sha-<full commit>` tag is published
+for traceability. To use published images instead of building from source,
+use the [generic single-host bundle](../deploy/self-host/compose.yaml), the
+[Coolify stack](../deploy/coolify.yaml), or replace each `build:` block with
+its matching exact `image:` reference.
 
-```sh
-docker compose up -d \
-  --scale api=0 --scale worker=0 --scale web=0  # stop locally-built containers if already running
-IRONSIDE_IMAGE_TAG=0.1.0 docker compose -f docker-compose.yml -f docker-compose.release.yml up -d
+```yaml
+services:
+  api:
+    image: ghcr.io/luka-zivkovic/ironside-api:0.2.0
+  worker:
+    image: ghcr.io/luka-zivkovic/ironside-worker:0.2.0
+  web:
+    image: ghcr.io/luka-zivkovic/ironside-web:0.2.0
 ```
 
-(A `docker-compose.release.yml` override pinning image tags is a natural follow-up once a first tagged release exists — not included yet, since there is no `v0.1.0` tag to point at until this release is cut.)
+Only after every image publishes does the workflow create a **draft** GitHub
+release. After the first workflow run, an owner must make all three GHCR
+packages public; package visibility persists for later versions. Verify
+anonymous pulls, document whether the release has no data migration or a
+forward migration with its restore expectations, and then publish the draft.
+Default trustctl installs and update checks see only the published release.
+Do not use `latest`, `main`, or another floating tag for a persistent instance.
 
 ## Configuration
 
@@ -177,16 +213,32 @@ The three backups are not a single consistent snapshot — a trace ingested betw
 
 ## Upgrading
 
-Until the production schema policy is adopted, upgrading means resetting the
-local data stores whenever either baseline checksum changes:
+Treat an upgrade as a coordinated change to three application images and up to
+four stateful services:
 
-```sh
-git pull
-docker compose down -v
-docker compose up -d --build
-```
+1. Read every intervening release note and identify Postgres, ClickHouse,
+   object-storage, Redis, Compose, and secret changes.
+2. Restore representative backups into a separate trial stack and deploy the
+   exact target version there.
+3. Before production, stop or pause writes when the release notes require it,
+   take fresh off-host Postgres, ClickHouse, and object-storage backups, and
+   record the current exact app and infrastructure image versions.
+4. Change API, worker, and web to the same target version. Never run mixed app
+   versions unless that release explicitly documents rolling compatibility.
+5. Deploy, inspect both migration runners, verify `/health`, owner sign-in,
+   ingest, query, queue recovery, scheduled work, and the worker metrics health
+   check.
+6. Retain the backups and old Compose definition for the recovery window.
 
-- **The reset deletes local Postgres, ClickHouse, and MinIO data.** This is the deliberate pre-production contract; see [Pre-production schema policy](pre-production-schema.md).
-- **Backups are commit-specific during pre-production.** Restore a backup only with the exact build/baseline checksum that created it. A newer build will refuse that restored schema rather than upgrading it.
-- Both `api` and `worker` verify the baseline on boot. Concurrent first starts are safe (Postgres uses an advisory lock; ClickHouse uses idempotent create DDL).
-- `api` and `worker` are stateless: no draining ceremony needed at self-host scale. In-flight queue jobs survive a worker restart (BullMQ re-delivers), and a killed batch retries idempotently (fixed `event_ts` upserts).
+An image downgrade is valid only when release notes declare that no data
+migration ran. After a forward migration, recover by a tested forward fix or
+restore every affected store before starting the old images. Never use
+`docker compose down -v` as an upgrade step.
+
+Both `api` and `worker` verify the frozen baselines and every later migration
+checksum on boot. Concurrent first starts are safe (Postgres uses an advisory
+lock; ClickHouse uses idempotent DDL). In-flight queue jobs survive a worker
+restart, and durable pending-ingest intents reconstruct lost Redis jobs.
+
+Coolify-specific installation, backup coverage, and version-change steps are
+in [the Coolify runbook](coolify.md).

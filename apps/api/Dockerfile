@@ -43,4 +43,6 @@ COPY --from=build /repo/packages/mappers/dist ./packages/mappers/dist
 COPY --from=build /repo/apps/api/dist ./apps/api/dist
 
 EXPOSE 8788
+HEALTHCHECK --interval=30s --timeout=5s --retries=5 \
+  CMD ["node", "-e", "fetch('http://127.0.0.1:8788/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
 CMD ["node", "apps/api/dist/src/index.js"]
