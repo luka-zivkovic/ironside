@@ -146,6 +146,12 @@ export {
   type ProjectQuotas
 } from "./projects.js";
 export {
+  publishEvaluatorTraceActivities,
+  listEvaluatorTraceActivities,
+  type EvaluatorTraceActivity,
+  type EvaluatorTraceFeedCursor
+} from "./evaluator-trace-feed.js";
+export {
   createMediaAsset,
   getMediaAsset,
   getMediaAssetBySha,

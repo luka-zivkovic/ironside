@@ -25,6 +25,7 @@ import { mediaReadRoutes, mediaUploadRoutes } from "./routes/media.js";
 import { ingestRoutes } from "./routes/ingest.js";
 import { credentialsRoutes } from "./routes/credentials.js";
 import { environmentsRoutes } from "./routes/environments.js";
+import { evaluatorReadRoutes, evaluatorScoreRoutes } from "./routes/evaluator.js";
 import { langfuseFetchRoutes } from "./routes/langfuse-fetch.js";
 import { langfuseRoutes } from "./routes/langfuse.js";
 import { otlpRoutes } from "./routes/otlp.js";
@@ -223,6 +224,35 @@ export function createApp(deps: AppDeps): Hono<AuthEnv> {
   otel.use("/otel/traces/*", rateLimit(deps.redis, rateLimitOptions));
   otel.route("/", otlpRoutes({ storage: deps.storage, queue: deps.queue }));
   app.route("/v1", otel);
+
+  // Native evaluator integration. Unlike the operator's project-explicit
+  // live trace view, this key-implicit machine feed exposes settled versions
+  // only and derives the project exclusively from the Integration credential.
+  const evaluatorRead = new Hono<AuthEnv>();
+  const evaluatorTraceAuth = machineAuth(deps.pgPool, deps.redis, "traces:read");
+  evaluatorRead.use("/evaluator/*", async (c, next) => {
+    // This router is mounted before the score writer. Do not accidentally
+    // make POST /evaluator/scores require traces:read in addition to its own
+    // scores:write capability merely because the path shares a prefix.
+    if (c.req.method !== "GET") return next();
+    return evaluatorTraceAuth(c, next);
+  });
+  evaluatorRead.route(
+    "/",
+    evaluatorReadRoutes({
+      clickhouse: deps.clickhouse,
+      pool: deps.pgPool,
+      defaultTraceQuietPeriodSeconds:
+        deps.defaultTraceQuietPeriodSeconds ?? DEFAULT_TRACE_QUIET_PERIOD_SECONDS
+    })
+  );
+  app.route("/api/v1", evaluatorRead);
+
+  const evaluatorScore = new Hono<AuthEnv>();
+  evaluatorScore.use("/evaluator/scores/*", machineAuth(deps.pgPool, deps.redis, "scores:write"));
+  evaluatorScore.use("/evaluator/scores/*", rateLimit(deps.redis, rateLimitOptions));
+  evaluatorScore.route("/", evaluatorScoreRoutes({ storage: deps.storage, queue: deps.queue }));
+  app.route("/api/v1", evaluatorScore);
 
   // LangFuse compat reads: GET /api/public/traces[/:id] — LangFuse's own
   // fetch API paths, consumed by coeval's poller (M8) and any other

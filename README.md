@@ -5,7 +5,7 @@
 
 **The system of record for AI interaction data.** Ingest LLM traces from anywhere (native SDK, plain JSON, OpenTelemetry `gen_ai.*`, LangFuse-compatible endpoints), store them durably and cheaply, and export them anywhere (Parquet to your warehouse, OTLP forwarding, webhooks, full API).
 
-Deliberately narrow: **storage + pipes + a great trace viewer**. Evals and prompt management live elsewhere — bring any eval tool. Ironside's fetch and score APIs are LangFuse-compatible, so anything that can read traces and post scores works ([coeval](https://github.com/luka-zivkovic/coeval) is one example).
+Deliberately narrow: **storage + pipes + a great trace viewer**. Evals and prompt management live elsewhere — bring any eval tool. Ironside exposes a native, versioned settled-trace feed for evaluator systems such as [Coeval](https://github.com/luka-zivkovic/coeval), while retaining LangFuse-compatible fetch and score APIs for existing tools.
 
 Status: pre-release, under active development. See [ROADMAP.md](./ROADMAP.md). Licensed under the [Ironside Sustainable Use License](./LICENSE.md) — self-hosting for your own organization's use is always free and unrestricted; see the license for the (narrow) limitations.
 

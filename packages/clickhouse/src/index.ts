@@ -25,8 +25,10 @@ export {
 } from "./environments.js";
 export {
   listTraces,
+  listSettledTraceVersions,
   listTracePage,
   getTrace,
+  getVersionedTrace,
   getTraceRawAnchor,
   listObservationsForTrace,
   listScoresForTrace,
@@ -36,7 +38,10 @@ export {
   type ListTracesFilter,
   type ListTracePageFilter,
   type TraceRow,
+  type SettledTraceVersionRow,
+  type SettledTraceVersionCursor,
   type TraceDetailRow,
+  type VersionedTraceDetailRow,
   type TraceRawAnchorRow,
   type ObservationRow,
   type ScoreRow,

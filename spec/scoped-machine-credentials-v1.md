@@ -15,6 +15,10 @@ Authorization checks immutable primitive capabilities stored on each credential.
 | `/api/public/traces` | GET | `traces:read` |
 | `/api/public/traces/:id` | GET | `traces:read` |
 | `/api/public/scores` | POST | `scores:write` |
+| `/api/v1/evaluator/context` | GET | `traces:read` |
+| `/api/v1/evaluator/traces` | GET | `traces:read` |
+| `/api/v1/evaluator/traces/:id` | GET | `traces:read` |
+| `/api/v1/evaluator/scores` | POST | `scores:write` |
 
 The initial presets expand to these frozen snapshots:
 

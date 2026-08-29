@@ -52,16 +52,16 @@ export LANGFUSE_SECRET_KEY="\${IRONSIDE_API_KEY}"`
       id: "integration",
       preset: "integration",
       title: "Evaluator integration",
-      description: "Read settled traces and submit scores through the LangFuse-compatible API.",
+      description: "Read versioned settled traces and submit idempotent evaluator assessments.",
       code: `curl --fail-with-body \\
   --header "Authorization: Bearer \${IRONSIDE_API_KEY}" \\
-  "${base}/api/public/traces?limit=20"
+  "${base}/api/v1/evaluator/context"
 
 curl --fail-with-body --request POST \\
   --header "Authorization: Bearer \${IRONSIDE_API_KEY}" \\
   --header "Content-Type: application/json" \\
-  --data '{"traceId":"<trace-id>","name":"quality","value":1}' \\
-  "${base}/api/public/scores"`
+  --data '{"id":"<assessment-id>","traceId":"<trace-id>","name":"quality","value":1,"assessmentLabel":"pass","evaluator":{"provider":"coeval","versionId":"<version-id>","criterionKey":"quality"}}' \\
+  "${base}/api/v1/evaluator/scores"`
     }
   ];
 }

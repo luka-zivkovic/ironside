@@ -10,3 +10,4 @@ export * from "./owner-auth.js";
 export * from "./encryption.js";
 export * from "./finalization.js";
 export * from "./environment.js";
+export * from "./evaluator.js";

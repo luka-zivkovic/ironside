@@ -8,8 +8,8 @@ describe("connection snippets", () => {
 
     expect(code).toContain('host: "https://ironside.example.com"');
     expect(code).toContain("https://ironside.example.com/v1/otel/traces");
-    expect(code).toContain("https://ironside.example.com/api/public/traces?limit=20");
-    expect(code).toContain("https://ironside.example.com/api/public/scores");
+    expect(code).toContain("https://ironside.example.com/api/v1/evaluator/context");
+    expect(code).toContain("https://ironside.example.com/api/v1/evaluator/scores");
     expect(code).toContain("authorization=Bearer%20${IRONSIDE_API_KEY}");
     expect(code).toContain("LANGFUSE_BASEURL=https://ironside.example.com");
     expect(code).toContain('LANGFUSE_SECRET_KEY="${IRONSIDE_API_KEY}"');

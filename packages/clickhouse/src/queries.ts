@@ -119,6 +119,69 @@ export interface TraceRow {
   metadata: Record<string, string>;
 }
 
+export interface SettledTraceVersionRow extends TraceRow {
+  trace_version: string;
+}
+
+export interface SettledTraceVersionCursor {
+  traceVersion: string;
+  traceId: string;
+}
+
+/**
+ * Stable bootstrap scan for evaluator consumers. Unlike the operator trace
+ * list, ordering and pagination use the server-owned latest activity clock,
+ * which is also the immutable identity of the settled snapshot.
+ */
+export async function listSettledTraceVersions(
+  client: ClickHouseClient,
+  input: {
+    projectId: string;
+    settledBefore: string;
+    limit: number;
+    cursor?: SettledTraceVersionCursor | undefined;
+  }
+): Promise<SettledTraceVersionRow[]> {
+  const cursorCondition = input.cursor
+    ? `and (activity.last_activity_at, t.id) >
+         ({cursorVersion:DateTime64(6)}, {cursorTraceId:String})`
+    : "";
+  const result = await client.query({
+    query: `
+      select t.id, t.timestamp, t.name, t.user_id, t.session_id,
+             t.environment, t.tags, t.metadata,
+             activity.last_activity_at as trace_version
+      from traces as t final
+      inner join (${traceActivityQuery()}) as activity on activity.trace_id = t.id
+      where t.project_id = {projectId:String}
+        and activity.last_activity_at <= {settledBefore:DateTime64(6)}
+        ${cursorCondition}
+      order by activity.last_activity_at asc, t.id asc
+      limit {limit:UInt32}
+    `,
+    query_params: {
+      projectId: input.projectId,
+      settledBefore: toClickHouseDateTime(input.settledBefore),
+      limit: input.limit,
+      ...(input.cursor && {
+        cursorVersion: toClickHouseDateTime(input.cursor.traceVersion),
+        cursorTraceId: input.cursor.traceId
+      })
+    },
+    format: "JSONEachRow"
+  });
+  const rows = await result.json<SettledTraceVersionRow>();
+  return rows.map((row) => ({
+    ...row,
+    timestamp: fromClickHouseDateTime(row.timestamp),
+    // Ingest receipt clocks originate as JavaScript ISO timestamps and the
+    // write boundary stores millisecond precision. ClickHouse renders the
+    // DateTime64(6) column with three additional zeroes; collapse those so
+    // the durable Postgres feed and ClickHouse snapshot use one exact token.
+    trace_version: new Date(fromClickHouseDateTime(row.trace_version)).toISOString()
+  }));
+}
+
 /**
  * Lists traces newest-first with keyset (timestamp, id) pagination — stable
  * under concurrent inserts, unlike OFFSET-based paging. Uses FINAL: at
@@ -238,6 +301,39 @@ export interface TraceDetailRow {
   metadata: Record<string, string>;
   input: string | null;
   output: string | null;
+}
+
+export interface VersionedTraceDetailRow extends TraceDetailRow {
+  trace_version: string;
+}
+
+/** Current trace payload plus its server-owned latest activity version. */
+export async function getVersionedTrace(
+  client: ClickHouseClient,
+  projectId: string,
+  traceId: string
+): Promise<VersionedTraceDetailRow | null> {
+  const result = await client.query({
+    query: `
+      select t.id, t.timestamp, t.name, t.user_id, t.session_id, t.environment,
+             t.release, t.version, t.tags, t.metadata, t.input, t.output,
+             activity.last_activity_at as trace_version
+      from traces as t final
+      inner join (${traceActivityQuery("traceId")}) as activity on activity.trace_id = t.id
+      where t.project_id = {projectId:String} and t.id = {traceId:String}
+      limit 1
+    `,
+    query_params: { projectId, traceId },
+    format: "JSONEachRow"
+  });
+  const rows = await result.json<VersionedTraceDetailRow>();
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    ...row,
+    timestamp: fromClickHouseDateTime(row.timestamp),
+    trace_version: new Date(fromClickHouseDateTime(row.trace_version)).toISOString()
+  };
 }
 
 export interface ObservationRow {

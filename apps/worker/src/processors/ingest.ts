@@ -7,6 +7,7 @@ import {
 } from "@ironside/clickhouse";
 import {
   getRawRetentionIntent,
+  publishEvaluatorTraceActivities,
   recordIngestFailures,
   withRawRetentionObjectLock,
   type RecordIngestFailureInput
@@ -177,6 +178,20 @@ export function createIngestProcessor(deps: IngestProcessorDeps) {
     // Applied refs are written last. If the write fails, a retry is
     // idempotent and the pending state remains honest.
     await insertRawEventRefs(deps.clickhouse, rawRefs, batch.receivedAt, true);
+
+    // Publish only trace/observation activity after every ClickHouse row and
+    // raw reference is durable. Scores are downstream annotations and must
+    // never reopen or republish an evaluator snapshot. A Postgres failure
+    // retries the idempotent materialization before the pending intent is
+    // removed, closing the accepted-before-outage cursor gap.
+    await publishEvaluatorTraceActivities(deps.pool, {
+      projectId,
+      traceIds: [
+        ...traces.map((trace) => trace.id),
+        ...observations.map((observation) => observation.traceId)
+      ],
+      traceVersion: batch.receivedAt
+    });
 
     if (failures.length > 0) {
       deps.onDeadLetter?.(failures.length);
