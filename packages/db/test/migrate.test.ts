@@ -38,8 +38,11 @@ describe("runMigrations (postgres)", () => {
       "raw_retention_intents"
     ]);
 
-    const applied = await pool.query("select id from ironside_migrations order by id");
-    expect(applied.rows).toEqual([{ id: "0001_baseline" }]);
+    const applied = await pool.query("select id, checksum from ironside_migrations order by id");
+    expect(applied.rows).toEqual([{
+      id: "0001_baseline",
+      checksum: "54309d8feec00b2eabaf677c3fcb4acac8047a477151bc7b37c23fe1c5ce8d86"
+    }]);
     expect((await pool.query("select to_regclass('api_keys') as table_name")).rows).toEqual([
       { table_name: null }
     ]);

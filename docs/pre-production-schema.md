@@ -1,43 +1,51 @@
-# Pre-production schema policy
+# Database schema lifecycle
 
-Ironside has no production installations or data-compatibility promise yet. The
-repository therefore carries one final-state Postgres baseline and one
-final-state ClickHouse baseline instead of an upgrade path through every schema
-the project used during development:
+Ironside used a disposable pre-production schema until the first persistent
+external installation was deployed on **2026-08-28**. That event froze the
+final-state Postgres and ClickHouse baselines:
 
 - `packages/db/migrations/0001_baseline.sql`
 - `packages/clickhouse/migrations/0001_baseline.sql`
 
-Schema changes edit those files in place. Each migration ledger stores the
-baseline SHA-256 checksum. A changed checksum or an obsolete migration id makes
-startup fail with a reset instruction; application code never tries to upgrade
-or reinterpret an older local schema.
+The accepted bytes are identified by these SHA-256 digests:
 
-This is a temporary pre-production rule. Before anyone relies on a deployed
-Ironside database, freeze the then-current baselines and switch to append-only,
-forward migrations with an explicit compatibility and rollback policy.
+- Postgres: `54309d8feec00b2eabaf677c3fcb4acac8047a477151bc7b37c23fe1c5ce8d86`
+- ClickHouse: `47aa8eead3f96a6669dae8f123330ea881f08011aa5efc7d01344ff443167a80`
 
-## Resetting the checked-in local stack
+Those files are immutable. Every later schema change adds a new ordered SQL
+file, an upgrade test starting from the previously released schema, and release
+notes covering compatibility, deployment order, and recovery. Both migration
+runners store and verify every applied checksum. Changed, missing, or
+incompatible history fails closed with guidance to restore a compatible image;
+runtime code never tells an operator to erase persistent data.
 
-The reset is intentionally destructive: it removes the Compose-managed
-Postgres, ClickHouse, and MinIO volumes, including all local traces, projects,
-credentials, and raw events.
+Downgrade is supported only when the release notes say that no data migration
+ran. After a forward migration, recovery is either a tested forward fix or a
+restore of all affected stores followed by the previous application version.
+Rollback SQL is not assumed to be safe.
+
+The original `0001` baselines intentionally remain capable of creating a fresh
+installation in one step; their historical composition is recorded below.
+
+## Disposable local reset
+
+Developers may reset a stack only when they have positively identified it as
+disposable. This command removes Compose-managed Postgres, ClickHouse, Redis,
+and MinIO volumes, including traces, projects, credentials, and raw events:
 
 ```sh
 docker compose down -v
 docker compose up -d --build
 ```
 
-Then generate a fresh one-time owner setup code and create the first project as
-described in `docs/self-hosting.md`. External Postgres, ClickHouse, or object
-storage must be cleared with that provider's own tooling; do not point a newer
-pre-production build at an older database.
+Never use this command to update or repair an installation. Restore or migrate
+persistent data as described in `docs/self-hosting.md` and `docs/coolify.md`.
 
 ## Schema PR audit
 
-Every merged PR that introduced or changed an Ironside schema was reviewed for
-this reset. Runtime behavior remains represented directly in the baselines;
-upgrade-only behavior was removed.
+Every merged PR that introduced or changed an Ironside schema before the freeze
+was reviewed for the final baseline. Runtime behavior remains represented
+directly in the baselines; development-only upgrade behavior was removed.
 
 | PR | Schema contribution now in the baseline | Upgrade-only behavior removed |
 |---|---|---|

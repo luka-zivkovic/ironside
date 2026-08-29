@@ -10,6 +10,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // Arbitrary fixed lock id that serializes concurrent Ironside startup.
 const MIGRATION_LOCK_ID = 427193856;
+const FROZEN_BASELINE_ID = "0001_baseline";
+const FROZEN_BASELINE_SHA256 = "54309d8feec00b2eabaf677c3fcb4acac8047a477151bc7b37c23fe1c5ce8d86";
 
 export async function runMigrations(pool: Pool): Promise<void> {
   const client = await pool.connect();
@@ -29,7 +31,8 @@ export async function runMigrations(pool: Pool): Promise<void> {
       .filter((id) => !migrationIds.has(id));
     if (obsolete.length > 0) {
       throw new Error(
-        `obsolete pre-production schema history detected (${obsolete.join(", ")}); reset Postgres before starting Ironside`
+        `Postgres migration history is newer than or incompatible with this release ` +
+        `(${obsolete.join(", ")}); restore a compatible Ironside image and do not reset persistent data`
       );
     }
 
@@ -37,6 +40,12 @@ export async function runMigrations(pool: Pool): Promise<void> {
       const id = file.replace(/\.sql$/, "");
       const sql = await readFile(join(migrationsDir, file), "utf8");
       const checksum = createHash("sha256").update(sql).digest("hex");
+      if (id === FROZEN_BASELINE_ID && checksum !== FROZEN_BASELINE_SHA256) {
+        throw new Error(
+          `frozen Postgres baseline checksum changed (${checksum}); expected ${FROZEN_BASELINE_SHA256}. ` +
+          "Add a new forward migration instead of editing 0001_baseline.sql"
+        );
+      }
       const existing = await client.query<{ checksum: string }>(
         "select checksum from ironside_migrations where id = $1",
         [id]
@@ -44,7 +53,8 @@ export async function runMigrations(pool: Pool): Promise<void> {
       if (existing.rows[0]) {
         if (existing.rows[0].checksum !== checksum) {
           throw new Error(
-            `pre-production baseline ${id} changed; reset Postgres before starting Ironside`
+            `applied Postgres migration ${id} checksum does not match this release; ` +
+            "restore an image containing the original migration"
           );
         }
         continue;

@@ -75,5 +75,5 @@ curl -sS -b ironside-owner.cookies \
 Treat the cookie jar like a password, keep it outside the repository, and
 delete it after the operation. The browser UI is the preferred human workflow.
 
-The current pre-production baseline contains the scoped credential table
+The frozen baseline contains the scoped credential table
 directly; see `spec/scoped-machine-credentials-v1.md`.

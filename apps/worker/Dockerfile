@@ -36,4 +36,6 @@ COPY --from=build /repo/packages/storage/dist ./packages/storage/dist
 COPY --from=build /repo/packages/mappers/dist ./packages/mappers/dist
 COPY --from=build /repo/apps/worker/dist ./apps/worker/dist
 
+HEALTHCHECK --interval=30s --timeout=10s --retries=5 \
+  CMD ["node", "-e", "const h=process.env.METRICS_TOKEN?{authorization:'Bearer '+process.env.METRICS_TOKEN}:{};fetch('http://127.0.0.1:'+(process.env.METRICS_PORT||9464)+'/metrics',{headers:h}).then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
 CMD ["node", "apps/worker/dist/src/index.js"]

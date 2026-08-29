@@ -1,0 +1,187 @@
+# Generic single-host Ironside distribution managed by trustctl.
+# Operator customizations belong in compose.override.yaml; trustctl treats this
+# file as release-owned and refuses to update it after local edits.
+x-ironside-environment: &ironside-environment
+  DATABASE_URL: postgresql://ironside:${IRONSIDE_POSTGRES_PASSWORD:?IRONSIDE_POSTGRES_PASSWORD is required}@postgres:5432/${IRONSIDE_POSTGRES_DB:-ironside}
+  CLICKHOUSE_URL: http://clickhouse:8123
+  CLICKHOUSE_USER: ironside
+  CLICKHOUSE_PASSWORD: ${IRONSIDE_CLICKHOUSE_PASSWORD:?IRONSIDE_CLICKHOUSE_PASSWORD is required}
+  CLICKHOUSE_DB: ${IRONSIDE_CLICKHOUSE_DB:-ironside}
+  REDIS_URL: redis://:${IRONSIDE_REDIS_PASSWORD:?IRONSIDE_REDIS_PASSWORD is required}@redis:6379
+  S3_ENDPOINT: http://minio:9000
+  S3_ACCESS_KEY: ironside
+  S3_SECRET_KEY: ${IRONSIDE_MINIO_PASSWORD:?IRONSIDE_MINIO_PASSWORD is required}
+  S3_BUCKET: ${IRONSIDE_S3_BUCKET:-ironside-raw}
+  S3_REGION: ${IRONSIDE_S3_REGION:-us-east-1}
+  DEFAULT_TRACE_QUIET_PERIOD_SECONDS: ${IRONSIDE_TRACE_QUIET_PERIOD_SECONDS:-300}
+  METRICS_TOKEN: ${IRONSIDE_METRICS_TOKEN:?IRONSIDE_METRICS_TOKEN is required}
+  IRONSIDE_ENCRYPTION_SECRET: ${IRONSIDE_ENCRYPTION_SECRET:?IRONSIDE_ENCRYPTION_SECRET is required}
+
+services:
+  web:
+    image: ghcr.io/luka-zivkovic/ironside-web:${IRONSIDE_VERSION:?IRONSIDE_VERSION is required}
+    restart: unless-stopped
+    ports:
+      - "${IRONSIDE_BIND_ADDRESS:-127.0.0.1}:${IRONSIDE_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+
+  api:
+    image: ghcr.io/luka-zivkovic/ironside-api:${IRONSIDE_VERSION:?IRONSIDE_VERSION is required}
+    restart: unless-stopped
+    init: true
+    environment:
+      <<: *ironside-environment
+      PORT: "8788"
+      WEB_ORIGINS: ${IRONSIDE_PUBLIC_URL:-http://localhost:8080}
+      AUTH_INSECURE_COOKIES: ${IRONSIDE_AUTH_INSECURE_COOKIES:-true}
+      AUTH_TRUST_PROXY: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8788/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+
+  worker:
+    image: ghcr.io/luka-zivkovic/ironside-worker:${IRONSIDE_VERSION:?IRONSIDE_VERSION is required}
+    restart: unless-stopped
+    init: true
+    environment:
+      <<: *ironside-environment
+      DEFAULT_RETENTION_DAYS: ${IRONSIDE_DEFAULT_RETENTION_DAYS:-90}
+      RETENTION_INTERVAL_MS: ${IRONSIDE_RETENTION_INTERVAL_MS:-21600000}
+      INGEST_RECOVERY_INTERVAL_MS: ${IRONSIDE_INGEST_RECOVERY_INTERVAL_MS:-30000}
+      INGEST_RECOVERY_BATCH_SIZE: ${IRONSIDE_INGEST_RECOVERY_BATCH_SIZE:-1000}
+      RAW_RETENTION_EXECUTION_ENABLED: "false"
+      METRICS_PORT: "9464"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:9464/metrics',{headers:{authorization:'Bearer '+process.env.METRICS_TOKEN}}).then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 8
+
+  postgres:
+    image: postgres:16.15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ironside
+      POSTGRES_PASSWORD: ${IRONSIDE_POSTGRES_PASSWORD:?IRONSIDE_POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${IRONSIDE_POSTGRES_DB:-ironside}
+    volumes:
+      - ironside_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.3.14.14-alpine
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_USER: ironside
+      CLICKHOUSE_PASSWORD: ${IRONSIDE_CLICKHOUSE_PASSWORD:?IRONSIDE_CLICKHOUSE_PASSWORD is required}
+      CLICKHOUSE_DB: ${IRONSIDE_CLICKHOUSE_DB:-ironside}
+    volumes:
+      - ironside_clickhouse_data:/var/lib/clickhouse
+    configs:
+      - source: ironside_clickhouse_backups
+        target: /etc/clickhouse-server/config.d/backups.xml
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "clickhouse-client --user \"$${CLICKHOUSE_USER}\" --password \"$${CLICKHOUSE_PASSWORD}\" --query 'SELECT 1'"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    image: redis:7.4.7-alpine
+    restart: unless-stopped
+    command:
+      [
+        "sh",
+        "-c",
+        "exec redis-server --appendonly yes --requirepass \"$${REDIS_PASSWORD}\""
+      ]
+    environment:
+      REDIS_PASSWORD: ${IRONSIDE_REDIS_PASSWORD:?IRONSIDE_REDIS_PASSWORD is required}
+    volumes:
+      - ironside_redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ironside
+      MINIO_ROOT_PASSWORD: ${IRONSIDE_MINIO_PASSWORD:?IRONSIDE_MINIO_PASSWORD is required}
+    volumes:
+      - ironside_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  ironside_postgres_data:
+  ironside_clickhouse_data:
+  ironside_redis_data:
+  ironside_minio_data:
+
+configs:
+  ironside_clickhouse_backups:
+    content: |
+      <clickhouse>
+          <backups>
+              <allowed_path>/var/lib/clickhouse/backups/</allowed_path>
+          </backups>
+      </clickhouse>

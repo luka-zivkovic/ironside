@@ -32,10 +32,13 @@ describe("runMigrations (clickhouse)", () => {
     ]);
 
     const applied = await client.query({
-      query: "select id from ironside_migrations final order by id",
+      query: "select id, checksum from ironside_migrations final order by id",
       format: "JSONEachRow"
     });
-    expect(await applied.json()).toEqual([{ id: "0001_baseline" }]);
+    expect(await applied.json()).toEqual([{
+      id: "0001_baseline",
+      checksum: "47aa8eead3f96a6669dae8f123330ea881f08011aa5efc7d01344ff443167a80"
+    }]);
   });
 
   it("round-trips a trace row through the Map metadata column", async () => {

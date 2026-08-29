@@ -31,8 +31,8 @@ below are complete.
 ## Before a stable release
 
 - Validate the LangSmith importer against a representative live account.
-- Replace the temporary pre-production schema reset policy with append-only,
-  forward migrations and documented rollback expectations.
+- Complete upgrade and restore drills for the frozen append-only Postgres and
+  ClickHouse migration policy on every release that changes stored data.
 - Complete fresh-machine installation, upgrade, backup, and recovery drills
   against the published container images.
 - Expand production deployment guidance for TLS, secret management, object
