@@ -1,14 +1,19 @@
 import {
   createClickHouseClient,
   getTraceRawIndex,
+  hasPendingTraceRawRefs,
+  insertRawEventRefs,
   insertTraces,
   runMigrations as runChMigrations
 } from "@ironside/clickhouse";
 import {
+  claimEvaluatorScoreReceipt,
   claimRawRetentionIntentExecution,
   createRawRetentionIntents,
   listProjectEnvironments,
   listIngestFailures,
+  markEvaluatorScoreReceiptStaged,
+  publishEvaluatorTraceActivities,
   runMigrations as runPgMigrations
 } from "@ironside/db";
 import { createIngestQueue, enqueueBatch } from "@ironside/queue";
@@ -23,7 +28,11 @@ import { Pool } from "pg";
 import { ulid } from "ulid";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.js";
-import { createIngestProcessor } from "../src/processors/ingest.js";
+import {
+  createIngestProcessor,
+  recoverTerminalEvaluatorTraceRefs,
+  settlePublishedEvaluatorTraceRefs
+} from "../src/processors/ingest.js";
 
 // End-to-end pipeline test: build the same envelope apps/api would produce,
 // store it, enqueue it, then run the processor directly against the
@@ -158,7 +167,10 @@ describe("ingest processor", () => {
           idempotencyKey: "hash-1",
           body: {
             id: traceId,
-            timestamp: "2026-07-12T00:00:00.000Z",
+            // Keep this integration fixture inside every concurrent retention
+            // window. A fixed historical timestamp eventually becomes a
+            // legitimate deletion target for another test file.
+            timestamp: new Date().toISOString(),
             name: "checkout",
             environment: "production",
             metadata: { plan: "pro" }
@@ -270,6 +282,132 @@ describe("ingest processor", () => {
       format: "JSONEachRow"
     });
     expect(await result.json()).toHaveLength(1);
+  });
+
+  it("keeps score-only batches from blocking evaluator snapshots", async () => {
+    const traceId = `trace_${ulid()}`;
+    const batch: IngestBatch = {
+      batchId: ulid(),
+      projectId,
+      receivedAt: new Date().toISOString(),
+      events: [
+        {
+          id: ulid(),
+          type: "score-upsert",
+          source: "native",
+          schemaVersion: INGEST_SCHEMA_VERSION,
+          idempotencyKey: "score-only-ref",
+          body: {
+            id: `score_${ulid()}`,
+            traceId,
+            name: "quality",
+            dataType: "numeric",
+            value: 0.9,
+            source: "eval"
+          }
+        }
+      ]
+    };
+    const job = await storeAndEnqueue(batch);
+    await processBatch(job);
+
+    await expect(hasPendingTraceRawRefs(clickhouse, projectId, traceId)).resolves.toBe(false);
+    await job.remove();
+  });
+
+  it("keeps a staged evaluator score retryable until ClickHouse materializes it", async () => {
+    const traceId = `trace_${ulid()}`;
+    const scoreId = `score_${ulid()}`;
+    const batchId = ulid();
+    const batch: IngestBatch = {
+      batchId,
+      projectId,
+      receivedAt: new Date().toISOString(),
+      events: [{
+        id: `event_${batchId}`,
+        type: "score-upsert",
+        source: "native",
+        schemaVersion: INGEST_SCHEMA_VERSION,
+        idempotencyKey: "evaluator-score-terminal-recovery",
+        body: {
+          id: scoreId,
+          traceId,
+          name: "quality",
+          dataType: "numeric",
+          value: 0.9,
+          source: "eval"
+        }
+      }]
+    };
+    await claimEvaluatorScoreReceipt(pool, {
+      projectId,
+      scoreId,
+      traceId,
+      requestFingerprint: "c".repeat(64),
+      candidateBatchId: batchId
+    });
+    await markEvaluatorScoreReceiptStaged(pool, { projectId, scoreId, batchId });
+    const job = await storeAndEnqueue(batch);
+
+    await expect(recoverTerminalEvaluatorTraceRefs(
+      { storage, clickhouse, pool },
+      job.data
+    )).resolves.toBe("retry");
+    await processBatch(job);
+    await expect(recoverTerminalEvaluatorTraceRefs(
+      { storage, clickhouse, pool },
+      job.data
+    )).resolves.toBe("quarantine");
+    await job.remove();
+  });
+
+  it("settles a raw ref when a job fails after its evaluator publication commits", async () => {
+    const traceId = `trace_${ulid()}`;
+    const batch: IngestBatch = {
+      batchId: ulid(),
+      projectId,
+      receivedAt: new Date().toISOString(),
+      events: [
+        {
+          id: ulid(),
+          type: "trace-upsert",
+          source: "native",
+          schemaVersion: INGEST_SCHEMA_VERSION,
+          idempotencyKey: "post-publication-recovery",
+          body: { id: traceId, timestamp: "2026-07-12T00:00:00.000Z" }
+        }
+      ]
+    };
+    const job = await storeAndEnqueue(batch);
+    const ref = {
+      projectId,
+      traceId,
+      objectKey: job.data.objectKey,
+      receivedAt: batch.receivedAt
+    };
+    await insertRawEventRefs(clickhouse, [ref], batch.receivedAt, false);
+    await expect(recoverTerminalEvaluatorTraceRefs(
+      { storage, clickhouse, pool },
+      job.data
+    )).resolves.toBe("retry");
+    await publishEvaluatorTraceActivities(pool, {
+      projectId,
+      traceIds: [traceId],
+      sourceActivityAt: batch.receivedAt,
+      activityId: batch.batchId
+    });
+    await expect(hasPendingTraceRawRefs(clickhouse, projectId, traceId)).resolves.toBe(true);
+
+    await expect(settlePublishedEvaluatorTraceRefs(
+      { storage, clickhouse, pool },
+      job.data
+    )).resolves.toBe(1);
+    await expect(hasPendingTraceRawRefs(clickhouse, projectId, traceId)).resolves.toBe(false);
+    await expect(recoverTerminalEvaluatorTraceRefs(
+      { storage, clickhouse, pool },
+      job.data
+    )).resolves.toBe("quarantine");
+    await job.remove();
   });
 });
 
@@ -436,6 +574,7 @@ describe("ingest processor dead-lettering (M9-03)", () => {
     // the best-effort diagnostic insert.
     const brokenPool = {
       connect: pool.connect.bind(pool),
+      options: pool.options,
       query: (text: string, params?: unknown[]) =>
         text.includes("insert into ingest_event_failures")
           ? Promise.reject(new Error("postgres unavailable"))

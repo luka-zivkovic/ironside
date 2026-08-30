@@ -30,10 +30,16 @@ create table import_checkpoints (
   source text not null,
   checkpoint jsonb not null default '{}'::jsonb,
   status text not null default 'idle',
+  run_token text,
+  lease_expires_at timestamptz,
   last_error text,
   imported_count bigint not null default 0,
   updated_at timestamptz not null default now(),
-  unique (project_id, source)
+  unique (project_id, source),
+  constraint import_checkpoints_run_token_check
+    check (run_token is null or (
+      length(run_token) > 0 and run_token = btrim(run_token)
+    ))
 );
 
 create index import_checkpoints_project_id_idx on import_checkpoints(project_id);
@@ -315,3 +321,119 @@ create table project_environment_registry_state (
 
 create index project_environment_registry_due_idx
   on project_environment_registry_state(next_rebuild_at);
+
+-- Durable publication state for the native evaluator integration. ClickHouse
+-- remains the trace store; PostgreSQL supplies commit-ordered cursors,
+-- idempotency, and crash-recoverable materialization barriers.
+create table evaluator_trace_feed (
+  project_id text not null references projects(id) on delete cascade,
+  trace_id text not null,
+  trace_version timestamptz not null,
+  source_activity_at timestamptz not null,
+  published_at timestamptz not null default clock_timestamp(),
+  primary key (project_id, trace_id),
+  constraint evaluator_trace_feed_trace_id_check
+    check (length(trace_id) > 0 and trace_id = btrim(trace_id))
+);
+
+create index evaluator_trace_feed_project_cursor_idx
+  on evaluator_trace_feed (project_id, published_at, trace_id);
+
+create table evaluator_trace_feed_watermarks (
+  project_id text primary key references projects(id) on delete cascade,
+  published_at timestamptz not null
+);
+
+create table evaluator_score_receipts (
+  project_id text not null references projects(id) on delete cascade,
+  score_id text not null,
+  trace_id text not null,
+  request_fingerprint text not null,
+  score_timestamp timestamptz not null default clock_timestamp(),
+  ingest_batch_id text,
+  ingest_staged_at timestamptz,
+  ingest_materialized_at timestamptz,
+  primary key (project_id, score_id),
+  constraint evaluator_score_receipts_score_id_check
+    check (length(score_id) > 0 and score_id = btrim(score_id)),
+  constraint evaluator_score_receipts_trace_id_check
+    check (length(trace_id) > 0 and trace_id = btrim(trace_id)),
+  constraint evaluator_score_receipts_fingerprint_check
+    check (request_fingerprint ~ '^[0-9a-f]{64}$'),
+  constraint evaluator_score_receipts_ingest_batch_id_check
+    check (ingest_batch_id is null or (
+      length(ingest_batch_id) > 0 and ingest_batch_id = btrim(ingest_batch_id)
+    )),
+  constraint evaluator_score_receipts_materialized_after_staging_check
+    check (ingest_materialized_at is null or ingest_staged_at is not null)
+);
+
+create index evaluator_score_receipts_trace_idx
+  on evaluator_score_receipts (project_id, trace_id);
+
+create table evaluator_trace_feed_activities (
+  project_id text not null references projects(id) on delete cascade,
+  trace_id text not null,
+  activity_id text not null,
+  created_at timestamptz not null default clock_timestamp(),
+  primary key (project_id, trace_id, activity_id),
+  constraint evaluator_trace_feed_activities_trace_id_check
+    check (length(trace_id) > 0 and trace_id = btrim(trace_id)),
+  constraint evaluator_trace_feed_activities_activity_id_check
+    check (length(activity_id) > 0 and activity_id = btrim(activity_id))
+);
+
+create index evaluator_trace_feed_activities_project_activity_idx
+  on evaluator_trace_feed_activities (project_id, activity_id);
+
+create table evaluator_import_trace_state (
+  project_id text not null references projects(id) on delete cascade,
+  trace_id text not null,
+  source text not null,
+  content_hash text not null,
+  evaluator_content_hash text not null,
+  activity_id text not null,
+  source_activity_at timestamptz not null,
+  pending boolean not null default true,
+  publish_required boolean not null default true,
+  staged_at timestamptz not null default clock_timestamp(),
+  snapshot jsonb,
+  run_token text,
+  primary key (project_id, trace_id, source),
+  constraint evaluator_import_trace_state_source_check
+    check (source in ('langfuse', 'langsmith')),
+  constraint evaluator_import_trace_state_content_hash_check
+    check (content_hash ~ '^[0-9a-f]{64}$'),
+  constraint evaluator_import_trace_state_evaluator_content_hash_check
+    check (evaluator_content_hash ~ '^[0-9a-f]{64}$'),
+  constraint evaluator_import_trace_state_pending_snapshot_check
+    check (not pending or (
+      snapshot is not null
+      and run_token is not null
+      and length(run_token) > 0
+      and run_token = btrim(run_token)
+    ))
+);
+
+create index evaluator_import_trace_state_pending_idx
+  on evaluator_import_trace_state (project_id, trace_id)
+  where pending;
+
+create table evaluator_import_retention_cutoffs (
+  project_id text primary key references projects(id) on delete cascade,
+  trace_timestamp_before timestamptz not null,
+  updated_at timestamptz not null default clock_timestamp()
+);
+
+comment on table evaluator_trace_feed is
+  'Latest successfully materialized trace/observation activity per project trace for evaluator-feed cursors. Scores never update this table.';
+comment on table evaluator_trace_feed_activities is
+  'Idempotency ledger for materialized ingest batches published into the evaluator trace feed.';
+comment on table evaluator_trace_feed_watermarks is
+  'Durable per-project publication high-water marks for commit-ordered evaluator cursors.';
+comment on table evaluator_score_receipts is
+  'First-write timestamp, materialization state, and request identity for retry-idempotent native evaluator scores.';
+comment on table evaluator_import_trace_state is
+  'Durable current snapshot, fenced run generation, and fail-closed pending barrier for pull-imported traces.';
+comment on table evaluator_import_retention_cutoffs is
+  'Monotonic trace timestamp cutoff preventing pull imports from resurrecting retention-expired data.';

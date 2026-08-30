@@ -1,31 +1,16 @@
 # Database schema lifecycle
 
-Ironside used a disposable pre-production schema until the first persistent
-external installation was deployed on **2026-08-28**. That event froze the
-final-state Postgres and ClickHouse baselines:
+Ironside currently supports clean installations only. Founder-only deployments
+are disposable test instances, so the complete current schemas live in:
 
 - `packages/db/migrations/0001_baseline.sql`
 - `packages/clickhouse/migrations/0001_baseline.sql`
 
-The accepted bytes are identified by these SHA-256 digests:
-
-- Postgres: `54309d8feec00b2eabaf677c3fcb4acac8047a477151bc7b37c23fe1c5ce8d86`
-- ClickHouse: `47aa8eead3f96a6669dae8f123330ea881f08011aa5efc7d01344ff443167a80`
-
-Those files are immutable. Every later schema change adds a new ordered SQL
-file, an upgrade test starting from the previously released schema, and release
-notes covering compatibility, deployment order, and recovery. Both migration
-runners store and verify every applied checksum. Changed, missing, or
-incompatible history fails closed with guidance to restore a compatible image;
-runtime code never tells an operator to erase persistent data.
-
-Downgrade is supported only when the release notes say that no data migration
-ran. After a forward migration, recovery is either a tested forward fix or a
-restore of all affected stores followed by the previous application version.
-Rollback SQL is not assumed to be safe.
-
-The original `0001` baselines intentionally remain capable of creating a fresh
-installation in one step; their historical composition is recorded below.
+Each migration runner stores and verifies the current baseline checksum and
+rejects any other ledger. There is no supported in-place schema upgrade during
+this pre-launch period; recreate disposable instances when a baseline changes.
+Runtime crash recovery and data-integrity invariants still apply to every
+instance after it starts serving work.
 
 ## Disposable local reset
 
@@ -38,14 +23,14 @@ docker compose down -v
 docker compose up -d --build
 ```
 
-Never use this command to update or repair an installation. Restore or migrate
-persistent data as described in `docs/self-hosting.md` and `docs/coolify.md`.
+Use this only for the founder-owned disposable instances covered by the current
+clean-install support boundary.
 
 ## Schema PR audit
 
-Every merged PR that introduced or changed an Ironside schema before the freeze
-was reviewed for the final baseline. Runtime behavior remains represented
-directly in the baselines; development-only upgrade behavior was removed.
+Every merged PR that introduced or changed an Ironside schema was reviewed for
+the current baseline. Runtime behavior remains represented directly in the
+baselines; development-only upgrade behavior is removed.
 
 | PR | Schema contribution now in the baseline | Upgrade-only behavior removed |
 |---|---|---|

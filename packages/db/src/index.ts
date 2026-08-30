@@ -1,5 +1,10 @@
 export { runMigrations } from "./migrate.js";
 export {
+  closeEvaluatorLifecycleFence,
+  withEvaluatorDataWriteFence,
+  withEvaluatorRetentionFence
+} from "./evaluator-lifecycle-fence.js";
+export {
   getOwnerAuthState,
   issueSetupChallenge,
   issueRecoveryChallenge,
@@ -23,6 +28,7 @@ export {
 export {
   getImportCheckpoint,
   claimImportRun,
+  renewImportRunLease,
   saveImportProgress,
   markImportRunIdle,
   markImportRunFailed,
@@ -145,6 +151,34 @@ export {
   type CreateProjectInput,
   type ProjectQuotas
 } from "./projects.js";
+export {
+  stageEvaluatorImportTraces,
+  claimPendingEvaluatorImportSnapshots,
+  discardPendingEvaluatorImportSnapshot,
+  ensureEvaluatorImportRetentionCutoffs,
+  getEvaluatorImportRetentionCutoff,
+  recordEvaluatorImportRetentionCutoffs,
+  listEvaluatorImportRecoveryCandidates,
+  listPendingEvaluatorImportTraceIds,
+  publishEvaluatorTraceActivities,
+  claimEvaluatorScoreReceipt,
+  markEvaluatorScoreReceiptStaged,
+  markEvaluatorScoreReceiptMaterialized,
+  hasUnmaterializedEvaluatorScoreReceiptBatch,
+  EvaluatorScoreIdempotencyConflictError,
+  listEvaluatorTraceActivities,
+  getEvaluatorTracePublications,
+  listEvaluatorPublishedTraceIdsForActivity,
+  deleteEvaluatorTraceFeedEntries,
+  listEvaluatorTraceFeedKeys,
+  type EvaluatorTraceActivity,
+  type EvaluatorTraceFeedCursor,
+  type EvaluatorImportSource,
+  type EvaluatorImportTraceState,
+  type EvaluatorImportTraceSnapshot,
+  type EvaluatorPendingImportSnapshot,
+  type EvaluatorTracePublication
+} from "./evaluator-trace-feed.js";
 export {
   createMediaAsset,
   getMediaAsset,

@@ -192,6 +192,24 @@ const mediaRoute: RouteCase = {
 
 const traceRoutes: RouteCase[] = [
   {
+    name: "native evaluator context",
+    allowedStatus: 200,
+    request: (token) => app.request("/api/v1/evaluator/context", { headers: bearer(token) })
+  },
+  {
+    name: "native evaluator trace feed",
+    allowedStatus: 200,
+    request: (token) => app.request("/api/v1/evaluator/traces?limit=1", { headers: bearer(token) })
+  },
+  {
+    name: "native evaluator trace detail",
+    allowedStatus: 404,
+    request: (token) => app.request(
+      `/api/v1/evaluator/traces/trace_${ulid()}?version=${encodeURIComponent(new Date().toISOString())}`,
+      { headers: bearer(token) }
+    )
+  },
+  {
     name: "trace list",
     allowedStatus: 200,
     request: (token) => app.request("/api/public/traces?limit=1", { headers: bearer(token) })
@@ -214,6 +232,28 @@ const scoreRoute: RouteCase = {
     })
 };
 
+const evaluatorScoreRoute: RouteCase = {
+  name: "native evaluator score write",
+  allowedStatus: 200,
+  request: (token) =>
+    app.request("/api/v1/evaluator/scores", {
+      method: "POST",
+      headers: bearer(token, "application/json"),
+      body: JSON.stringify({
+        id: `score_${ulid()}`,
+        traceId: `trace_${ulid()}`,
+        name: "coeval_assessment/support-quality",
+        value: 1,
+        assessmentLabel: "pass",
+        evaluator: {
+          provider: "coeval",
+          versionId: "skillv_1",
+          criterionKey: "support-quality"
+        }
+      })
+    })
+};
+
 describe("machine route capability matrix", () => {
   for (const route of [...ingestRoutes, mediaRoute]) {
     it(`allows Ingest, but denies Integration: ${route.name}`, async () => {
@@ -222,7 +262,7 @@ describe("machine route capability matrix", () => {
     });
   }
 
-  for (const route of [...traceRoutes, scoreRoute]) {
+  for (const route of [...traceRoutes, scoreRoute, evaluatorScoreRoute]) {
     it(`allows Integration, but denies Ingest: ${route.name}`, async () => {
       expect((await route.request(integrationToken)).status).toBe(route.allowedStatus);
       expect((await route.request(ingestToken)).status).toBe(403);
@@ -237,6 +277,18 @@ describe("machine route capability matrix", () => {
     });
     expect(inline.status).toBe(202);
     expect((await scoreRoute.request(ingestToken)).status).toBe(403);
+  });
+
+  it("authenticates HEAD before Hono dispatches it through evaluator GET handlers", async () => {
+    expect((await app.request("/api/v1/evaluator/context", { method: "HEAD" })).status).toBe(401);
+    expect((await app.request("/api/v1/evaluator/context", {
+      method: "HEAD",
+      headers: bearer(ingestToken)
+    })).status).toBe(403);
+    expect((await app.request("/api/v1/evaluator/context", {
+      method: "HEAD",
+      headers: bearer(integrationToken)
+    })).status).toBe(200);
   });
 
   it("enforces capabilities under LangFuse Basic auth too", async () => {

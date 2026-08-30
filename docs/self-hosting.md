@@ -12,7 +12,7 @@ docker compose up -d --build
 
 This builds the `api`/`worker`/`web` images locally and starts the whole stack. First boot takes a few minutes (image builds + Postgres/ClickHouse initialization); subsequent `docker compose up` runs are fast, since Docker caches the image layers and the infra containers keep their data in named volumes (`pgdata`, `chdata`, `miniodata`).
 
-`api` and `worker` each verify the same Postgres/ClickHouse migration history on boot and ensure the `ironside-raw` object storage bucket exists, so there's no separate schema step to run by hand. The first persistent external deployment froze both baselines on 2026-08-28; later releases use append-only forward migrations. See [Database schema lifecycle](pre-production-schema.md).
+`api` and `worker` each verify the same current Postgres/ClickHouse baseline on boot and ensure the `ironside-raw` object storage bucket exists, so there's no separate schema step to run by hand. This pre-launch release supports clean database installs only; founder-owned test instances are recreated when either baseline changes. See [Database schema lifecycle](pre-production-schema.md).
 
 Once every container reports healthy (`docker compose ps`), generate a short-lived, one-time owner setup code from the host:
 
@@ -28,7 +28,7 @@ Native ingest, OTLP, media upload, and `/api/public/*` remain key-implicit; nati
 
 The credential presets are **Ingest** (`ingest`, `media:write`) and **Integration** (`traces:read`, `scores:write`). Optional expiry, creation/revocation actors, status, and last use are visible in Connections. Plaintext is returned only by the create response and must be placed in your secret manager. To rotate, create the replacement preset, update the client, verify its last-use timestamp, and revoke the old credential.
 
-Machine credentials use the `ironside_sc_...` token class. There is no older Ironside credential class in the frozen baseline.
+Machine credentials use the `ironside_sc_...` token class. There is no older Ironside credential class in the current baseline.
 
 If the owner password is lost, issue a recovery capability from the host and open `/recover`:
 
@@ -83,8 +83,8 @@ generic Compose bundle, boots a disposable stack, verifies the public health
 route and owner-setup command, and only then creates a **draft** GitHub
 release. After the first workflow run, an owner must make all three GHCR
 packages public; package visibility persists for later versions. Verify
-anonymous pulls, document whether the release has no data migration or a
-forward migration with its restore expectations, and then publish the draft.
+anonymous pulls, document whether the current clean baseline changed, and then
+publish the draft.
 Default trustctl installs and update checks see only the published release.
 Do not use `latest`, `main`, or another floating tag for a persistent instance.
 
@@ -213,34 +213,16 @@ For production, prefer pointing `S3_ENDPOINT` at real S3 and using bucket versio
 
 The three backups are not a single consistent snapshot — a trace ingested between the ClickHouse and Postgres dumps exists in one and not the other. This is fine in practice: the stores are independently meaningful (Postgres = control plane, ClickHouse = data, raw log = history), and the raw log is append-only so a slightly-later object-storage backup only ever contains *more* history. If you need a hard-consistent snapshot, `docker compose stop api worker` first (ingest pauses; ACKed-but-unprocessed batches wait safely in Redis/raw log), back up all three, then `start`.
 
-## Upgrading
+## Updating during founder-only testing
 
-Treat an upgrade as a coordinated change to three application images and up to
-four stateful services:
-
-1. Read every intervening release note and identify Postgres, ClickHouse,
-   object-storage, Redis, Compose, and secret changes.
-2. Restore representative backups into a separate trial stack and deploy the
-   exact target version there.
-3. Before production, stop or pause writes when the release notes require it,
-   take fresh off-host Postgres, ClickHouse, and object-storage backups, and
-   record the current exact app and infrastructure image versions.
-4. Change API, worker, and web to the same target version. Never run mixed app
-   versions unless that release explicitly documents rolling compatibility.
-5. Deploy, inspect both migration runners, verify `/health`, owner sign-in,
-   ingest, query, queue recovery, scheduled work, and the worker metrics health
-   check.
-6. Retain the backups and old Compose definition for the recovery window.
-
-An image downgrade is valid only when release notes declare that no data
-migration ran. After a forward migration, recover by a tested forward fix or
-restore every affected store before starting the old images. Never use
-`docker compose down -v` as an upgrade step.
-
-Both `api` and `worker` verify the frozen baselines and every later migration
-checksum on boot. Concurrent first starts are safe (Postgres uses an advisory
-lock; ClickHouse uses idempotent DDL). In-flight queue jobs survive a worker
-restart, and durable pending-ingest intents reconstruct lost Redis jobs.
+An image-only update is supported only when the release notes say the baseline
+is unchanged. Change API, worker, and web to the same exact target version and
+verify health, owner sign-in, ingest, query, queue recovery, and scheduled work.
+When either baseline changes, create a clean instance instead of carrying the
+old database forward. Both `api` and `worker` verify the current baselines on
+boot. Concurrent first starts are safe, in-flight queue jobs survive ordinary
+worker restarts, and durable pending-ingest intents reconstruct lost Redis
+jobs within one current instance.
 
 Coolify-specific installation, backup coverage, and version-change steps are
 in [the Coolify runbook](coolify.md).

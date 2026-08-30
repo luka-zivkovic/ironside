@@ -30,6 +30,78 @@ describe("mapNativeEvents", () => {
     });
   });
 
+  it("normalizes surrounding whitespace from storage and publication identifiers", () => {
+    const { rows, errors } = mapNativeEvents("proj_x", [
+      event({
+        body: {
+          id: "  trace_trimmed  ",
+          timestamp: "2026-07-12T00:00:00Z"
+        }
+      }),
+      event({
+        id: "evt_obs_trimmed",
+        type: "observation-upsert",
+        body: {
+          id: "  obs_trimmed  ",
+          traceId: "  trace_trimmed  ",
+          type: "span",
+          startTime: "2026-07-12T00:00:00Z"
+        }
+      })
+    ]);
+    expect(errors).toEqual([]);
+    expect(rows.traces[0]?.id).toBe("trace_trimmed");
+    expect(rows.observations[0]).toMatchObject({
+      id: "obs_trimmed",
+      traceId: "trace_trimmed"
+    });
+  });
+
+  it("rejects identifiers that PostgreSQL cannot safely publish", () => {
+    const { rows, errors } = mapNativeEvents("proj_x", [
+      event({ id: "evt_nul", body: {
+        id: "trace\0poison",
+        timestamp: "2026-07-12T00:00:00Z"
+      } }),
+      event({ id: "evt_oversize", body: {
+        id: "é".repeat(300),
+        timestamp: "2026-07-12T00:00:00Z"
+      } }),
+      event({ id: "evt_surrogate", body: {
+        id: "trace\ud800poison",
+        timestamp: "2026-07-12T00:00:00Z"
+      } }),
+      event({ id: "evt_trailing_high", body: {
+        id: "trace\ud800",
+        timestamp: "2026-07-12T00:00:00Z"
+      } }),
+      event({ id: "evt_lone_low", body: {
+        id: "trace\udfffpoison",
+        timestamp: "2026-07-12T00:00:00Z"
+      } })
+    ]);
+    expect(rows.traces).toEqual([]);
+    expect(errors.map((error) => error.eventId)).toEqual([
+      "evt_nul",
+      "evt_oversize",
+      "evt_surrogate",
+      "evt_trailing_high",
+      "evt_lone_low"
+    ]);
+  });
+
+  it("accepts identifiers containing valid surrogate pairs", () => {
+    const { rows, errors } = mapNativeEvents("proj_x", [event({
+      id: "evt_pair",
+      body: {
+        id: "trace_😀",
+        timestamp: "2026-07-12T00:00:00Z"
+      }
+    })]);
+    expect(errors).toEqual([]);
+    expect(rows.traces[0]?.id).toBe("trace_😀");
+  });
+
   it("normalizes a valid environment and drops only invalid optional environment metadata", () => {
     const valid = mapNativeEvents("proj_x", [
       event({ body: { ...(event().body as object), environment: "  Produc\u0065\u0301tion  " } })

@@ -1,6 +1,12 @@
 import { createServer, type Server } from "node:http";
 import { createClickHouseClient, runMigrations as runChMigrations } from "@ironside/clickhouse";
-import { getImportCheckpoint, runMigrations as runPgMigrations } from "@ironside/db";
+import {
+  getEvaluatorTracePublications,
+  getImportCheckpoint,
+  listPendingEvaluatorImportTraceIds,
+  recordEvaluatorImportRetentionCutoffs,
+  runMigrations as runPgMigrations
+} from "@ironside/db";
 import { Pool } from "pg";
 import { ulid } from "ulid";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -45,6 +51,10 @@ beforeAll(async () => {
     "insert into projects (id, organization_id, name) values ($1, $2, $3)",
     [projectId, orgId, "langsmith-importer-test"]
   );
+  await recordEvaluatorImportRetentionCutoffs(pool, [{
+    projectId,
+    traceTimestampBefore: "1970-01-01T00:00:00.000Z"
+  }]);
 
   server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
@@ -138,7 +148,7 @@ describe("runLangsmithImport", () => {
   it("imports all runs across multiple cursor pages and clears the cursor on exhaustion", async () => {
     fixtureRuns = Array.from({ length: 5 }, (_, i) => ({
       id: `run_${ulid()}`,
-      start_time: `2026-07-12T00:00:0${i}.000Z`,
+      start_time: `2026-08-12T00:00:0${i}.000Z`,
       name: `run-${i}`
     }));
 
@@ -158,7 +168,7 @@ describe("runLangsmithImport", () => {
     expect(checkpoint?.status).toBe("idle");
     expect(checkpoint?.importedCount).toBe(5);
     expect(checkpoint?.checkpoint.cursor).toBeUndefined();
-    expect(checkpoint?.checkpoint.lastStartTime).toBe("2026-07-12T00:00:04.000Z");
+    expect(checkpoint?.checkpoint.lastStartTime).toBe("2026-08-12T00:00:04.000Z");
 
     const ids = fixtureRuns.map((r) => r.id);
     const rows = await clickhouse.query({
@@ -172,7 +182,7 @@ describe("runLangsmithImport", () => {
   it("startTime stays fixed for the whole run — every page request uses the same start_time, not a drifting one", async () => {
     fixtureRuns = Array.from({ length: 6 }, (_, i) => ({
       id: `run_${ulid()}`,
-      start_time: `2026-07-12T05:00:0${i}.000Z`,
+      start_time: `2026-08-12T05:00:0${i}.000Z`,
       name: `run-${i}`
     }));
 
@@ -195,7 +205,7 @@ describe("runLangsmithImport", () => {
   it("resumes from the saved checkpoint (lastStartTime) on the next run, not from scratch", async () => {
     fixtureRuns = Array.from({ length: 3 }, (_, i) => ({
       id: `run_${ulid()}`,
-      start_time: `2026-07-12T01:00:0${i}.000Z`,
+      start_time: `2026-08-12T01:00:0${i}.000Z`,
       name: `run-${i}`
     }));
 
@@ -209,7 +219,7 @@ describe("runLangsmithImport", () => {
     });
     requestLog = [];
 
-    const newer = { id: `run_${ulid()}`, start_time: "2026-07-12T01:00:05.000Z", name: "new" };
+    const newer = { id: `run_${ulid()}`, start_time: "2026-08-12T01:00:05.000Z", name: "new" };
     fixtureRuns.push(newer);
 
     await runLangsmithImport({
@@ -221,7 +231,7 @@ describe("runLangsmithImport", () => {
       pageSize: 10
     });
 
-    expect(requestLog[0]?.startTime).toBe("2026-07-12T01:00:02.000Z");
+    expect(requestLog[0]?.startTime).toBe("2026-08-12T01:00:02.000Z");
 
     const rows = await clickhouse.query({
       query: `select id from traces final where project_id = {projectId:String} and id = {id:String}`,
@@ -234,7 +244,7 @@ describe("runLangsmithImport", () => {
   it("stops after maxPagesPerRun and reports resumable=true, preserving the cursor", async () => {
     fixtureRuns = Array.from({ length: 6 }, (_, i) => ({
       id: `run_${ulid()}`,
-      start_time: `2026-07-12T02:00:0${i}.000Z`,
+      start_time: `2026-08-12T02:00:0${i}.000Z`,
       name: `run-${i}`
     }));
 
@@ -253,6 +263,26 @@ describe("runLangsmithImport", () => {
     const checkpoint = await getImportCheckpoint(pool, projectId, "langsmith");
     expect(checkpoint?.status).toBe("idle");
     expect(checkpoint?.checkpoint.cursor).toBe("offset:2"); // not cleared — more pages remain
+    expect(checkpoint?.checkpoint.lastStartTime).toBeUndefined();
+
+    requestLog = [];
+    await runLangsmithImport({
+      pool,
+      clickhouse,
+      projectId,
+      client: clientConfig(),
+      sessionIds: ["sess_1"],
+      pageSize: 2
+    });
+    expect(requestLog[0]).toEqual({ startTime: null, cursor: "offset:2" });
+    const ids = fixtureRuns.map((run) => run.id);
+    const rows = await clickhouse.query({
+      query: `select id from traces final
+               where project_id = {projectId:String} and id in ({ids:Array(String)})`,
+      query_params: { projectId, ids },
+      format: "JSONEachRow"
+    });
+    expect(await rows.json()).toHaveLength(6);
   });
 
   it("imports the FULL tree: child runs as observations (typed, usage/cost parsed from decimal strings) and feedback as scores on root AND child runs", async () => {
@@ -260,17 +290,17 @@ describe("runLangsmithImport", () => {
     const childId = `run_${ulid()}`;
     const rootFeedbackId = `fb_${ulid()}`;
     const childFeedbackId = `fb_${ulid()}`;
-    fixtureRuns = [{ id: rootId, start_time: "2026-07-12T07:00:00.000Z", name: "full-data-root" }];
+    fixtureRuns = [{ id: rootId, start_time: "2026-08-12T07:00:00.000Z", name: "full-data-root" }];
     fixtureTraceRuns[rootId] = [
-      { id: rootId, trace_id: rootId, run_type: "chain", name: "full-data-root", start_time: "2026-07-12T07:00:00.000Z", end_time: "2026-07-12T07:00:02.000Z" },
+      { id: rootId, trace_id: rootId, run_type: "chain", name: "full-data-root", start_time: "2026-08-12T07:00:00.000Z", end_time: "2026-08-12T07:00:02.000Z" },
       {
         id: childId,
         trace_id: rootId,
         parent_run_id: rootId,
         run_type: "llm",
         name: "llm-call",
-        start_time: "2026-07-12T07:00:00.500Z",
-        end_time: "2026-07-12T07:00:01.500Z",
+        start_time: "2026-08-12T07:00:00.500Z",
+        end_time: "2026-08-12T07:00:01.500Z",
         status: "error",
         error: "rate limited",
         inputs: { messages: [{ role: "user", content: "hi" }] },
@@ -284,10 +314,10 @@ describe("runLangsmithImport", () => {
       }
     ];
     fixtureFeedback[rootId] = [
-      { id: rootFeedbackId, run_id: rootId, trace_id: rootId, key: "overall-quality", score: 1, created_at: "2026-07-10T00:00:00.000Z" }
+      { id: rootFeedbackId, run_id: rootId, trace_id: rootId, key: "overall-quality", score: 1, created_at: "2026-08-10T00:00:00.000Z" }
     ];
     fixtureFeedback[childId] = [
-      { id: childFeedbackId, run_id: childId, trace_id: rootId, key: "helpfulness", score: 0, comment: "rate limited, unhelpful", created_at: "2026-07-10T00:00:01.000Z" }
+      { id: childFeedbackId, run_id: childId, trace_id: rootId, key: "helpfulness", score: 0, comment: "rate limited, unhelpful", created_at: "2026-08-10T00:00:01.000Z" }
     ];
 
     const result = await runLangsmithImport({
@@ -344,17 +374,25 @@ describe("runLangsmithImport", () => {
     expect(childFeedback.observation_id).toBe(childId); // feedback on a CHILD run links to that observation
     expect(childFeedback.value).toBe(0); // value 0 must survive — meaningful data, not falsy noise
     expect(childFeedback.comment).toBe("rate limited, unhelpful");
-    expect(childFeedback.timestamp.startsWith("2026-07-10")).toBe(true); // original feedback time, not import time
+    expect(childFeedback.timestamp.startsWith("2026-08-10")).toBe(true); // original feedback time, not import time
+    const publication = (await getEvaluatorTracePublications(pool, projectId, [rootId]))
+      .get(rootId);
+    expect(publication).toBeDefined();
+    expect((await listPendingEvaluatorImportTraceIds(pool, projectId, [rootId])).has(rootId))
+      .toBe(false);
   });
 
   it("a concurrent call while a run is already 'running' returns null instead of racing the checkpoint", async () => {
-    fixtureRuns = [{ id: `run_${ulid()}`, start_time: "2026-07-12T03:00:00.000Z", name: "x" }];
+    fixtureRuns = [{ id: `run_${ulid()}`, start_time: "2026-08-12T03:00:00.000Z", name: "x" }];
 
     await pool.query(
-      `insert into import_checkpoints (id, project_id, source, status)
-       values ($1, $2, 'langsmith', 'running')
-       on conflict (project_id, source) do update set status = 'running'`,
-      [`import_${ulid()}`, projectId]
+      `insert into import_checkpoints
+         (id, project_id, source, status, run_token, lease_expires_at)
+       values ($1, $2, 'langsmith', 'running', $3, clock_timestamp() + interval '5 minutes')
+       on conflict (project_id, source) do update
+         set status = 'running', run_token = excluded.run_token,
+             lease_expires_at = excluded.lease_expires_at`,
+      [`import_${ulid()}`, projectId, `run_${ulid()}`]
     );
 
     const result = await runLangsmithImport({

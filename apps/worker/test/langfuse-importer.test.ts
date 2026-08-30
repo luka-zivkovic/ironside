@@ -1,10 +1,24 @@
 import { createServer, type Server } from "node:http";
-import { createClickHouseClient, runMigrations as runChMigrations } from "@ironside/clickhouse";
-import { getImportCheckpoint, runMigrations as runPgMigrations } from "@ironside/db";
+import { createClickHouseClient, insertScores, runMigrations as runChMigrations } from "@ironside/clickhouse";
+import {
+  claimImportRun,
+  getEvaluatorTracePublications,
+  getImportCheckpoint,
+  listPendingEvaluatorImportTraceIds,
+  recordEvaluatorImportRetentionCutoffs,
+  runMigrations as runPgMigrations,
+  stageEvaluatorImportTraces
+} from "@ironside/db";
 import { Pool } from "pg";
 import { ulid } from "ulid";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { runLangfuseImport } from "../src/importers/langfuse-importer.js";
+import {
+  importedEvaluatorTraceContentHash,
+  importedTraceContentHash,
+  materializeEvaluatorImportSnapshot,
+  recoverAbandonedEvaluatorImports
+} from "../src/importers/evaluator-publication.js";
 import { loadConfig } from "../src/config.js";
 
 // Integration test against a real Postgres + ClickHouse (compose stack)
@@ -40,6 +54,10 @@ beforeAll(async () => {
     "insert into projects (id, organization_id, name) values ($1, $2, $3)",
     [projectId, orgId, "langfuse-importer-test"]
   );
+  await recordEvaluatorImportRetentionCutoffs(pool, [{
+    projectId,
+    traceTimestampBefore: "1970-01-01T00:00:00.000Z"
+  }]);
 
   server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
@@ -113,7 +131,7 @@ describe("runLangfuseImport", () => {
   it("imports all traces across multiple pages and marks the checkpoint idle with page reset", async () => {
     fixtureTraces = Array.from({ length: 5 }, (_, i) => ({
       id: `trace_${ulid()}`,
-      timestamp: `2026-07-12T00:00:0${i}.000Z`,
+      timestamp: `2026-08-12T00:00:0${i}.000Z`,
       name: `trace-${i}`
     }));
 
@@ -132,7 +150,7 @@ describe("runLangfuseImport", () => {
     expect(checkpoint?.status).toBe("idle");
     expect(checkpoint?.importedCount).toBe(5);
     expect(checkpoint?.checkpoint.page).toBe(1); // reset after exhausting all pages
-    expect(checkpoint?.checkpoint.lastTimestamp).toBe("2026-07-12T00:00:04.000Z");
+    expect(checkpoint?.checkpoint.lastTimestamp).toBe("2026-08-12T00:00:04.000Z");
 
     const ids = fixtureTraces.map((t) => t.id);
     const rows = await clickhouse.query({
@@ -146,7 +164,7 @@ describe("runLangfuseImport", () => {
   it("resumes from the saved checkpoint instead of re-importing from scratch (fromTimestamp is used on the next run)", async () => {
     fixtureTraces = Array.from({ length: 3 }, (_, i) => ({
       id: `trace_${ulid()}`,
-      timestamp: `2026-07-12T01:00:0${i}.000Z`,
+      timestamp: `2026-08-12T01:00:0${i}.000Z`,
       name: `trace-${i}`
     }));
 
@@ -155,7 +173,7 @@ describe("runLangfuseImport", () => {
 
     // Add more traces "created after" the first run and rerun — should
     // only fetch from the checkpointed lastTimestamp forward.
-    const newer = { id: `trace_${ulid()}`, timestamp: "2026-07-12T01:00:05.000Z", name: "new" };
+    const newer = { id: `trace_${ulid()}`, timestamp: "2026-08-12T01:00:05.000Z", name: "new" };
     fixtureTraces.push(newer);
 
     const result = await runLangfuseImport({
@@ -166,7 +184,7 @@ describe("runLangfuseImport", () => {
       pageSize: 10
     });
 
-    expect(requestLog[0]?.fromTimestamp).toBe("2026-07-12T01:00:02.000Z");
+    expect(requestLog[0]?.fromTimestamp).toBe("2026-08-12T01:00:02.000Z");
     // The last-seen trace from the prior run is re-fetched too (>= boundary
     // is inclusive), so imported count on the resume run is 2 (last-seen +
     // new), not just the 1 new trace — a real re-insert, not a bug, since
@@ -184,7 +202,7 @@ describe("runLangfuseImport", () => {
   it("stops after maxPagesPerRun and reports resumable=true, without losing progress", async () => {
     fixtureTraces = Array.from({ length: 6 }, (_, i) => ({
       id: `trace_${ulid()}`,
-      timestamp: `2026-07-12T02:00:0${i}.000Z`,
+      timestamp: `2026-08-12T02:00:0${i}.000Z`,
       name: `trace-${i}`
     }));
 
@@ -219,7 +237,7 @@ describe("runLangfuseImport", () => {
     // exactly the missing assertion.
     fixtureTraces = Array.from({ length: 7 }, (_, i) => ({
       id: `trace_${ulid()}`,
-      timestamp: `2026-07-12T04:00:0${i}.000Z`,
+      timestamp: `2026-08-12T04:00:0${i}.000Z`,
       name: `capped-resume-${i}`
     }));
 
@@ -259,7 +277,7 @@ describe("runLangfuseImport", () => {
     const obsId = `obs_${ulid()}`;
     const childObsId = `obs_${ulid()}`;
     const scoreId = `score_${ulid()}`;
-    fixtureTraces = [{ id: traceId, timestamp: "2026-07-12T05:00:00.000Z", name: "full-data" }];
+    fixtureTraces = [{ id: traceId, timestamp: "2026-08-12T05:00:00.000Z", name: "full-data" }];
     fixtureDetails = {
       [traceId]: {
         environment: "production",
@@ -270,8 +288,8 @@ describe("runLangfuseImport", () => {
             parentObservationId: null,
             type: "SPAN", // uppercase, as the real API returns
             name: "handler",
-            startTime: "2026-07-12T05:00:00.000Z",
-            endTime: "2026-07-12T05:00:01.000Z",
+            startTime: "2026-08-12T05:00:00.000Z",
+            endTime: "2026-08-12T05:00:01.000Z",
             level: "DEFAULT"
           },
           {
@@ -280,9 +298,9 @@ describe("runLangfuseImport", () => {
             parentObservationId: obsId,
             type: "GENERATION",
             name: "llm-call",
-            startTime: "2026-07-12T05:00:00.100Z",
-            endTime: "2026-07-12T05:00:00.900Z",
-            completionStartTime: "2026-07-12T05:00:00.300Z",
+            startTime: "2026-08-12T05:00:00.100Z",
+            endTime: "2026-08-12T05:00:00.900Z",
+            completionStartTime: "2026-08-12T05:00:00.300Z",
             level: "WARNING",
             statusMessage: "slow response",
             model: "gpt-4o",
@@ -307,7 +325,7 @@ describe("runLangfuseImport", () => {
             dataType: "CATEGORICAL",
             source: "API",
             comment: "too slow",
-            timestamp: "2026-07-11T09:30:00.000Z" // the ORIGINAL score time, well before import time
+            timestamp: "2026-08-11T09:30:00.000Z" // the ORIGINAL score time, well before import time
           }
         ]
       }
@@ -370,7 +388,12 @@ describe("runLangfuseImport", () => {
     expect(score.comment).toBe("too slow");
     // The ORIGINAL score timestamp survives the import — without the new
     // Score.timestamp field, ClickHouse would default this to insert time.
-    expect(score.timestamp.startsWith("2026-07-11")).toBe(true);
+    expect(score.timestamp.startsWith("2026-08-11")).toBe(true);
+    const publication = (await getEvaluatorTracePublications(pool, projectId, [traceId]))
+      .get(traceId);
+    expect(publication).toBeDefined();
+    expect((await listPendingEvaluatorImportTraceIds(pool, projectId, [traceId])).has(traceId))
+      .toBe(false);
 
     // The trace itself carries the detail-only environment field.
     const traceRows = await clickhouse.query({
@@ -381,6 +404,295 @@ describe("runLangfuseImport", () => {
     expect(((await traceRows.json()) as { environment: string }[])[0]?.environment).toBe("production");
   });
 
+  it("imports a valid trace while filtering unusable provider scores", async () => {
+    const traceId = `trace_${ulid()}`;
+    fixtureTraces = [{
+      id: traceId,
+      timestamp: "2026-08-12T05:30:00.000Z",
+      name: "valid-trace-invalid-scores"
+    }];
+    fixtureDetails = {
+      [traceId]: {
+        scores: [
+          { id: `score_${ulid()}`, traceId, name: "valueless", comment: "note only" },
+          {
+            id: `score_${ulid()}`,
+            traceId,
+            name: "bad-time",
+            value: 1,
+            timestamp: "not-a-date"
+          }
+        ]
+      }
+    };
+
+    await expect(runLangfuseImport({
+      pool,
+      clickhouse,
+      projectId,
+      client: clientConfig(),
+      pageSize: 10
+    })).resolves.toMatchObject({ imported: 1 });
+
+    const traceRows = await clickhouse.query({
+      query: `select id from traces final
+               where project_id = {projectId:String} and id = {traceId:String}`,
+      query_params: { projectId, traceId },
+      format: "JSONEachRow"
+    });
+    expect(await traceRows.json()).toEqual([{ id: traceId }]);
+    const scoreRows = await clickhouse.query({
+      query: `select id from scores final
+               where project_id = {projectId:String} and trace_id = {traceId:String}`,
+      query_params: { projectId, traceId },
+      format: "JSONEachRow"
+    });
+    expect(await scoreRows.json()).toEqual([]);
+    expect((await getEvaluatorTracePublications(pool, projectId, [traceId])).has(traceId))
+      .toBe(true);
+    await expect(getImportCheckpoint(pool, projectId, "langfuse"))
+      .resolves.toMatchObject({ status: "idle", checkpoint: { page: 1 } });
+  });
+
+  it("tombstones observations and scores omitted by a later full snapshot", async () => {
+    const traceId = `trace_${ulid()}`;
+    const retainedId = `obs_${ulid()}`;
+    const removedId = `obs_${ulid()}`;
+    const removedScoreId = `score_${ulid()}`;
+    const localScoreId = `score_${ulid()}`;
+    const trace = { id: traceId, timestamp: "2026-08-12T05:30:00.000Z", name: "changing" };
+    fixtureTraces = [trace];
+    const observation = (id: string) => ({
+      id,
+      traceId,
+      type: "SPAN",
+      startTime: "2026-08-12T05:30:00.000Z",
+      level: "DEFAULT"
+    });
+    const score = {
+      id: removedScoreId,
+      traceId,
+      name: "removed-score",
+      value: 1,
+      dataType: "NUMERIC",
+      source: "API",
+      timestamp: "2026-08-12T05:30:00.000Z"
+    };
+    await insertScores(clickhouse, [{
+      id: localScoreId,
+      projectId,
+      traceId,
+      name: "local-assessment",
+      dataType: "numeric",
+      value: 0.5,
+      source: "eval",
+      metadata: {}
+    }], { eventTs: "2026-08-12T05:29:00.000Z" });
+    fixtureDetails = {
+      [traceId]: {
+        observations: [observation(retainedId), observation(removedId)],
+        scores: [score]
+      }
+    };
+    await runLangfuseImport({ pool, clickhouse, projectId, client: clientConfig(), pageSize: 10 });
+
+    // First change only the observation set; the score must survive.
+    fixtureDetails = {
+      [traceId]: { observations: [observation(retainedId)], scores: [score] }
+    };
+    await runLangfuseImport({ pool, clickhouse, projectId, client: clientConfig(), pageSize: 10 });
+
+    const rows = await clickhouse.query({
+      query: `select id from observations final
+               where project_id = {projectId:String} and trace_id = {traceId:String}
+               order by id`,
+      query_params: { projectId, traceId },
+      format: "JSONEachRow"
+    });
+    expect(await rows.json()).toEqual([{ id: retainedId }]);
+    const retainedScoreRows = await clickhouse.query({
+      query: `select id from scores final
+               where project_id = {projectId:String} and trace_id = {traceId:String}
+                 and id = {scoreId:String}`,
+      query_params: { projectId, traceId, scoreId: removedScoreId },
+      format: "JSONEachRow"
+    });
+    expect(await retainedScoreRows.json()).toEqual([{ id: removedScoreId }]);
+
+    // Then change only the score set. Score content participates in the
+    // generation hash, so this must materialize and tombstone the omission.
+    fixtureDetails = { [traceId]: { observations: [observation(retainedId)] } };
+    await runLangfuseImport({ pool, clickhouse, projectId, client: clientConfig(), pageSize: 10 });
+    const scoreRows = await clickhouse.query({
+      query: `select id from scores final
+               where project_id = {projectId:String} and trace_id = {traceId:String}
+                 and id = {scoreId:String}`,
+      query_params: { projectId, traceId, scoreId: removedScoreId },
+      format: "JSONEachRow"
+    });
+    expect(await scoreRows.json()).toEqual([]);
+    const localScoreRows = await clickhouse.query({
+      query: `select id from scores final
+               where project_id = {projectId:String} and trace_id = {traceId:String}
+                 and id = {scoreId:String}`,
+      query_params: { projectId, traceId, scoreId: localScoreId },
+      format: "JSONEachRow"
+    });
+    expect(await localScoreRows.json()).toEqual([{ id: localScoreId }]);
+  });
+
+  it("recovers a durable staged snapshot after its import lease expires", async () => {
+    const traceId = `trace_${ulid()}`;
+    const runToken = `import_crashed_${ulid()}`;
+    await claimImportRun(pool, projectId, "langfuse", runToken);
+    const trace = {
+      id: traceId,
+      projectId,
+      timestamp: "2026-08-12T05:45:00.000Z",
+      name: "crash-recovery",
+      tags: [],
+      metadata: {}
+    };
+    await stageEvaluatorImportTraces(pool, {
+      projectId,
+      source: "langfuse",
+      runToken,
+      candidateActivityId: `import_${ulid()}`,
+      candidateActivityAt: "2026-08-30T12:00:00.000Z",
+      traces: [{
+        traceId,
+        contentHash: importedTraceContentHash(trace, [], []),
+        evaluatorContentHash: importedEvaluatorTraceContentHash(trace, []),
+        snapshot: {
+          trace,
+          observations: [],
+          scores: []
+        }
+      }]
+    });
+    await pool.query(
+      `update import_checkpoints
+          set lease_expires_at = clock_timestamp() - interval '1 second'
+        where project_id = $1 and source = 'langfuse'`,
+      [projectId]
+    );
+
+    await expect(recoverAbandonedEvaluatorImports({
+      pool,
+      clickhouse,
+      limit: 10
+    })).resolves.toBe(1);
+    expect((await listPendingEvaluatorImportTraceIds(pool, projectId, [traceId])).has(traceId))
+      .toBe(false);
+    expect((await getEvaluatorTracePublications(pool, projectId, [traceId])).has(traceId))
+      .toBe(true);
+  });
+
+  it("uses the staged monotonic generation for scores when candidate clocks do not advance", async () => {
+    const traceId = `trace_${ulid()}`;
+    const scoreId = `score_${ulid()}`;
+    const runToken = `import_same_ms_${ulid()}`;
+    const candidateActivityAt = "2026-08-30T12:30:00.000Z";
+    const trace = {
+      id: traceId,
+      projectId,
+      timestamp: "2026-08-12T05:50:00.000Z",
+      tags: [],
+      metadata: {}
+    };
+    const snapshot = {
+      trace,
+      observations: [],
+      scores: [{
+        id: scoreId,
+        projectId,
+        traceId,
+        name: "provider-score",
+        dataType: "numeric" as const,
+        value: 1,
+        source: "api" as const,
+        metadata: {}
+      }]
+    };
+    await claimImportRun(pool, projectId, "langfuse", runToken);
+    const first = (await stageEvaluatorImportTraces(pool, {
+      projectId,
+      source: "langfuse",
+      runToken,
+      candidateActivityId: `import_activity_${ulid()}`,
+      candidateActivityAt,
+      traces: [{
+        traceId,
+        contentHash: "a".repeat(64),
+        evaluatorContentHash: "e".repeat(64),
+        snapshot: { ...snapshot, scores: [] }
+      }]
+    })).get(traceId)!;
+    await materializeEvaluatorImportSnapshot({ pool, clickhouse, projectId, runToken }, {
+      ...first,
+      source: "langfuse",
+      snapshot: { ...snapshot, scores: [] }
+    });
+    const firstTraceRows = await clickhouse.query({
+      query: `select event_ts from traces final
+               where project_id = {projectId:String} and id = {traceId:String}`,
+      query_params: { projectId, traceId },
+      format: "JSONEachRow"
+    });
+    const [firstTraceRow] = await firstTraceRows.json<{ event_ts: string }>();
+    const firstPublication = (await getEvaluatorTracePublications(
+      pool,
+      projectId,
+      [traceId]
+    )).get(traceId)!;
+
+    const second = (await stageEvaluatorImportTraces(pool, {
+      projectId,
+      source: "langfuse",
+      runToken,
+      candidateActivityId: `import_activity_${ulid()}`,
+      candidateActivityAt,
+      traces: [{
+        traceId,
+        contentHash: "b".repeat(64),
+        evaluatorContentHash: "e".repeat(64),
+        snapshot
+      }]
+    })).get(traceId)!;
+    expect(Date.parse(second.sourceActivityAt)).toBeGreaterThan(Date.parse(candidateActivityAt));
+    await materializeEvaluatorImportSnapshot({ pool, clickhouse, projectId, runToken }, {
+      ...second,
+      source: "langfuse",
+      snapshot
+    });
+
+    const rows = await clickhouse.query({
+      query: `select id, event_ts, timestamp from scores final
+               where project_id = {projectId:String} and trace_id = {traceId:String}
+                 and id = {scoreId:String}`,
+      query_params: { projectId, traceId, scoreId },
+      format: "JSONEachRow"
+    });
+    expect(await rows.json()).toEqual([{
+      id: scoreId,
+      event_ts: new Date(second.sourceActivityAt).toISOString().replace("T", " ").replace("Z", "000"),
+      timestamp: "2026-08-12 05:50:00.000"
+    }]);
+    const secondPublication = (await getEvaluatorTracePublications(
+      pool,
+      projectId,
+      [traceId]
+    )).get(traceId)!;
+    expect(secondPublication.traceVersion).toBe(firstPublication.traceVersion);
+    const secondTraceRows = await clickhouse.query({
+      query: `select event_ts from traces final
+               where project_id = {projectId:String} and id = {traceId:String}`,
+      query_params: { projectId, traceId },
+      format: "JSONEachRow"
+    });
+    expect(await secondTraceRows.json()).toEqual([firstTraceRow]);
+  });
+
   it("a failed detail fetch fails the run without advancing the checkpoint past that page", async () => {
     // Two traces on one page; the second's detail endpoint returns 500.
     // The run must fail (not silently import a partial page), and the
@@ -389,8 +701,8 @@ describe("runLangfuseImport", () => {
     const okId = `trace_${ulid()}`;
     const brokenId = `trace_${ulid()}`;
     fixtureTraces = [
-      { id: okId, timestamp: "2026-07-12T06:00:00.000Z", name: "ok" },
-      { id: brokenId, timestamp: "2026-07-12T06:00:01.000Z", name: "broken-detail" }
+      { id: okId, timestamp: "2026-08-12T06:00:00.000Z", name: "ok" },
+      { id: brokenId, timestamp: "2026-08-12T06:00:01.000Z", name: "broken-detail" }
     ];
     fixtureDetails = { [brokenId]: { failWith: 500 } };
 
@@ -410,16 +722,144 @@ describe("runLangfuseImport", () => {
     expect(retry?.imported).toBe(2);
   });
 
+  it("skips an invalid provider identifier per trace and advances the page", async () => {
+    const invalidId = "x".repeat(513);
+    fixtureTraces = [{
+      id: invalidId,
+      timestamp: "2026-08-12T06:30:00.000Z",
+      name: "invalid-id"
+    }];
+    const invalid: Array<{ traceId: string; error: unknown }> = [];
+
+    await expect(runLangfuseImport({
+      pool,
+      clickhouse,
+      projectId,
+      client: clientConfig(),
+      pageSize: 10,
+      onInvalidTrace: (traceId, error) => invalid.push({ traceId, error })
+    })).resolves.toMatchObject({ imported: 0, resumable: false });
+
+    expect(invalid).toHaveLength(1);
+    expect(invalid[0]?.traceId).toBe(invalidId);
+    await expect(getImportCheckpoint(pool, projectId, "langfuse"))
+      .resolves.toMatchObject({ status: "idle", checkpoint: { page: 1 } });
+  });
+
+  it("does not resurrect an expired inclusive-boundary trace", async () => {
+    const traceId = `trace_${ulid()}`;
+    const localScoreId = `score_${ulid()}`;
+    fixtureTraces = [{
+      id: traceId,
+      timestamp: "2020-07-12T00:00:00.000Z",
+      name: "expired-boundary"
+    }];
+    await recordEvaluatorImportRetentionCutoffs(pool, [{
+      projectId,
+      traceTimestampBefore: "2024-01-01T00:00:00.000Z"
+    }]);
+    await insertScores(clickhouse, [{
+      id: localScoreId,
+      projectId,
+      traceId,
+      name: "local-assessment",
+      dataType: "numeric",
+      value: 1,
+      source: "eval",
+      timestamp: "2026-08-12T00:00:00.000Z",
+      metadata: {}
+    }], { eventTs: "2026-08-12T00:00:00.000Z" });
+    try {
+      await runLangfuseImport({ pool, clickhouse, projectId, client: clientConfig(), pageSize: 10 });
+      await runLangfuseImport({ pool, clickhouse, projectId, client: clientConfig(), pageSize: 10 });
+
+      const rows = await clickhouse.query({
+        query: "select id from traces final where project_id = {projectId:String} and id = {traceId:String}",
+        query_params: { projectId, traceId },
+        format: "JSONEachRow"
+      });
+      expect(await rows.json()).toEqual([]);
+      expect((await getEvaluatorTracePublications(pool, projectId, [traceId])).has(traceId))
+        .toBe(false);
+      const scoreRows = await clickhouse.query({
+        query: `select id from scores final
+                 where project_id = {projectId:String} and trace_id = {traceId:String}`,
+        query_params: { projectId, traceId },
+        format: "JSONEachRow"
+      });
+      expect(await scoreRows.json()).toEqual([]);
+      const retentionMarker = await clickhouse.query({
+        query: `select trace_id from evaluator_trace_retention final
+                 where project_id = {projectId:String} and trace_id = {traceId:String}`,
+        query_params: { projectId, traceId },
+        format: "JSONEachRow"
+      });
+      expect(await retentionMarker.json()).toEqual([{ trace_id: traceId }]);
+    } finally {
+      await pool.query(
+        "delete from evaluator_import_retention_cutoffs where project_id = $1",
+        [projectId]
+      );
+      await recordEvaluatorImportRetentionCutoffs(pool, [{
+        projectId,
+        traceTimestampBefore: "1970-01-01T00:00:00.000Z"
+      }]);
+    }
+  });
+
+  it("fails closed before ClickHouse writes when the retention cutoff is missing", async () => {
+    const traceId = `trace_${ulid()}`;
+    fixtureTraces = [{
+      id: traceId,
+      timestamp: "2026-08-12T02:00:00.000Z",
+      name: "missing-cutoff"
+    }];
+    await pool.query(
+      "delete from evaluator_import_retention_cutoffs where project_id = $1",
+      [projectId]
+    );
+    try {
+      await expect(runLangfuseImport({
+        pool,
+        clickhouse,
+        projectId,
+        client: clientConfig(),
+        pageSize: 10
+      })).rejects.toThrow("retention cutoff is not initialized");
+      const rows = await clickhouse.query({
+        query: `select id from traces final
+                 where project_id = {projectId:String} and id = {traceId:String}`,
+        query_params: { projectId, traceId },
+        format: "JSONEachRow"
+      });
+      expect(await rows.json()).toEqual([]);
+      expect((await getEvaluatorTracePublications(pool, projectId, [traceId])).has(traceId))
+        .toBe(false);
+    } finally {
+      await pool.query(
+        "delete from evaluator_import_trace_state where project_id = $1 and trace_id = $2",
+        [projectId, traceId]
+      );
+      await recordEvaluatorImportRetentionCutoffs(pool, [{
+        projectId,
+        traceTimestampBefore: "1970-01-01T00:00:00.000Z"
+      }]);
+    }
+  });
+
   it("a concurrent call while a run is already 'running' returns null instead of racing the checkpoint", async () => {
-    fixtureTraces = [{ id: `trace_${ulid()}`, timestamp: "2026-07-12T03:00:00.000Z", name: "x" }];
+    fixtureTraces = [{ id: `trace_${ulid()}`, timestamp: "2026-08-12T03:00:00.000Z", name: "x" }];
 
     // Manually put the checkpoint into a running state to simulate an
     // in-flight run without actually holding one open concurrently.
     await pool.query(
-      `insert into import_checkpoints (id, project_id, source, status)
-       values ($1, $2, 'langfuse', 'running')
-       on conflict (project_id, source) do update set status = 'running'`,
-      [`import_${ulid()}`, projectId]
+      `insert into import_checkpoints
+         (id, project_id, source, status, run_token, lease_expires_at)
+       values ($1, $2, 'langfuse', 'running', $3, clock_timestamp() + interval '5 minutes')
+       on conflict (project_id, source) do update
+         set status = 'running', run_token = excluded.run_token,
+             lease_expires_at = excluded.lease_expires_at`,
+      [`import_${ulid()}`, projectId, `run_${ulid()}`]
     );
 
     const result = await runLangfuseImport({

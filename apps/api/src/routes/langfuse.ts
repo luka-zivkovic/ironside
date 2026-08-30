@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { IngestBatch, IngestEvent, QueueMessage } from "@ironside/shared";
 import {
   INGEST_SCHEMA_VERSION,
+  identifierSchema,
   langfuseIngestionRequestSchema,
   type LangfuseIngestionResponse
 } from "@ironside/shared";
@@ -164,9 +165,9 @@ export function langfuseRoutes(deps: LangfuseDeps): Hono<AuthEnv> {
 // matching the compat layer's general posture (LangFuse clients shouldn't
 // 400 on fields Ironside doesn't model).
 const langfuseCreateScoreSchema = z.object({
-  id: z.string().min(1).optional(),
-  traceId: z.string().min(1),
-  observationId: z.string().min(1).nullable().optional(),
+  id: identifierSchema.optional(),
+  traceId: identifierSchema,
+  observationId: identifierSchema.nullable().optional(),
   name: z.string().min(1),
   value: z.union([z.number(), z.string().min(1)]),
   comment: z.string().nullable().optional(),

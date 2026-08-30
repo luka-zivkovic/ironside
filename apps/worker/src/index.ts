@@ -1,11 +1,18 @@
 import { createClickHouseClient, runMigrations as runChMigrations } from "@ironside/clickhouse";
-import { runMigrations as runPgMigrations } from "@ironside/db";
+import {
+  closeEvaluatorLifecycleFence,
+  runMigrations as runPgMigrations
+} from "@ironside/db";
 import { createIngestQueue, createIngestWorker } from "@ironside/queue";
 import { createObjectStorage } from "@ironside/storage";
 import { Pool } from "pg";
 import { loadConfig } from "./config.js";
 import { createWorkerMetrics } from "./metrics.js";
-import { createIngestProcessor } from "./processors/ingest.js";
+import {
+  createIngestProcessor,
+  recoverTerminalEvaluatorTraceRefs,
+  settlePublishedEvaluatorTraceRefs
+} from "./processors/ingest.js";
 import { startPendingIngestRecovery } from "./recovery/recovery-loop.js";
 import { verifyPendingIngestStorage } from "./recovery/storage-permissions.js";
 import { startScheduler } from "./scheduler.js";
@@ -47,6 +54,17 @@ worker.on("completed", (job) => {
 worker.on("failed", (job, err) => {
   metrics.batchesFailed.inc();
   console.error(`[ingest] batch=${job?.data.batchId} failed:`, err);
+  if (job) {
+    void settlePublishedEvaluatorTraceRefs(
+      { storage, clickhouse, pool: pgPool },
+      job.data
+    ).catch((recoveryError) => {
+      console.error(
+        `[ingest] batch=${job.data.batchId} failed to settle its committed evaluator publication:`,
+        recoveryError
+      );
+    });
+  }
 });
 
 console.log("ironside-worker: ingest consumer running");
@@ -58,6 +76,11 @@ const recovery = startPendingIngestRecovery({
   retentionExecutionEnabled: config.rawRetentionExecutionEnabled,
   intervalMs: config.ingestRecoveryIntervalMs,
   batchSize: config.ingestRecoveryBatchSize,
+  beforeTerminalFailure: (message) =>
+    recoverTerminalEvaluatorTraceRefs(
+      { storage, clickhouse, pool: pgPool },
+      message
+    ),
   onResult: (result) => {
     const recovered = result.enqueued;
     if (recovered > 0) {
@@ -98,6 +121,7 @@ async function shutdown(): Promise<void> {
   metricsServer.close();
   await worker.close();
   await queue.close();
+  await closeEvaluatorLifecycleFence(pgPool);
   await pgPool.end();
   await clickhouse.close();
   storage.close();

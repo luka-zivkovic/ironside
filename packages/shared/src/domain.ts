@@ -10,14 +10,39 @@ import { environmentNameSchema } from "./environment.js";
 
 /** ISO 8601 timestamp with optional offset. */
 const timestampSchema = z.iso.datetime({ offset: true });
+const utf8 = new TextEncoder();
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      if (index + 1 >= value.length) return true;
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
+export const identifierSchema = z.string()
+  .trim()
+  .min(1)
+  .max(512)
+  .refine((value) => !value.includes("\0"), "identifier must not contain NUL")
+  .refine((value) => !hasUnpairedSurrogate(value), "identifier must be valid Unicode")
+  .refine(
+    (value) => utf8.encode(value).byteLength <= 512,
+    "identifier must not exceed 512 UTF-8 bytes"
+  );
 
 /** Arbitrary key/value metadata, values stringified. */
 export const metadataSchema = z.record(z.string(), z.string());
 export type Metadata = z.infer<typeof metadataSchema>;
 
 export const traceSchema = z.object({
-  id: z.string().min(1),
-  projectId: z.string().min(1),
+  id: identifierSchema,
+  projectId: identifierSchema,
   timestamp: timestampSchema,
   name: z.string().optional(),
   userId: z.string().optional(),
@@ -44,10 +69,10 @@ export const observationLevelSchema = z.enum([
 export type ObservationLevel = z.infer<typeof observationLevelSchema>;
 
 export const observationSchema = z.object({
-  id: z.string().min(1),
-  traceId: z.string().min(1),
-  projectId: z.string().min(1),
-  parentObservationId: z.string().optional(),
+  id: identifierSchema,
+  traceId: identifierSchema,
+  projectId: identifierSchema,
+  parentObservationId: identifierSchema.optional(),
   type: observationTypeSchema,
   name: z.string().optional(),
   startTime: timestampSchema,
@@ -83,10 +108,10 @@ export type ScoreSource = z.infer<typeof scoreSourceSchema>;
 // itself — omitting from scoreSchema is not possible, so the check does not
 // travel automatically.
 export const scoreObjectSchema = z.object({
-  id: z.string().min(1),
-  projectId: z.string().min(1),
-  traceId: z.string().min(1),
-  observationId: z.string().optional(),
+  id: identifierSchema,
+  projectId: identifierSchema,
+  traceId: identifierSchema,
+  observationId: identifierSchema.optional(),
   name: z.string().min(1),
   dataType: scoreDataTypeSchema,
   value: z.number().optional(),

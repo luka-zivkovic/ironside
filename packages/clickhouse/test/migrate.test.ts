@@ -23,6 +23,7 @@ describe("runMigrations (clickhouse)", () => {
     const rows = await result.json<{ name: string }>();
     const names = rows.map((r) => r.name).sort();
     expect(names).toEqual([
+      "evaluator_trace_retention",
       "ironside_migrations",
       "observations",
       "raw_event_refs",
@@ -35,10 +36,23 @@ describe("runMigrations (clickhouse)", () => {
       query: "select id, checksum from ironside_migrations final order by id",
       format: "JSONEachRow"
     });
-    expect(await applied.json()).toEqual([{
-      id: "0001_baseline",
-      checksum: "47aa8eead3f96a6669dae8f123330ea881f08011aa5efc7d01344ff443167a80"
-    }]);
+    expect(await applied.json()).toEqual([
+      {
+        id: "0001_baseline",
+        checksum: "ae18071157ef24c3102aba2d89ae34df489f189f12ede77824c02d88ff8c49bc"
+      }
+    ]);
+
+    const traceIndex = await client.query({
+      query: `
+        select name
+          from system.data_skipping_indices
+         where database = currentDatabase() and table = 'traces'
+           and name = 'idx_trace_id'
+      `,
+      format: "JSONEachRow"
+    });
+    expect(await traceIndex.json()).toEqual([{ name: "idx_trace_id" }]);
   });
 
   it("round-trips a trace row through the Map metadata column", async () => {

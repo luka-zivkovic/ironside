@@ -21,6 +21,147 @@ export interface InsertOptions {
   eventTs: string;
 }
 
+/**
+ * Full-snapshot pull imports must remove rows omitted by the new snapshot and
+ * old sort-key variants whose source timestamp changed. Write engine-native
+ * tombstones one microsecond before the new live generation so a retry of the
+ * same generation remains a no-op and the live rows deterministically win.
+ */
+export async function tombstoneImportedTraceSnapshot(
+  client: ClickHouseClient,
+  projectId: string,
+  traceId: string,
+  eventTs: string,
+  importSource: "langfuse" | "langsmith"
+): Promise<void> {
+  const settings = {
+    max_execution_time: 30,
+    max_threads: 2,
+    max_memory_usage: String(256 * 1024 * 1024),
+    max_rows_to_read: "5000000",
+    read_overflow_mode: "throw" as const
+  };
+  await Promise.all([
+    client.command({
+      query: `
+        insert into traces (project_id, id, timestamp, event_ts, is_deleted)
+        select project_id, id, timestamp,
+               subtractMicroseconds({eventTs:DateTime64(6)}, 1), 1
+          from traces final
+         where project_id = {projectId:String} and id = {traceId:String}
+      `,
+      query_params: { projectId, traceId, eventTs: toClickHouseDateTime(eventTs) },
+      clickhouse_settings: settings
+    }),
+    client.command({
+      query: `
+        insert into observations
+          (project_id, id, trace_id, start_time, event_ts, is_deleted)
+        select project_id, id, trace_id, start_time,
+               subtractMicroseconds({eventTs:DateTime64(6)}, 1), 1
+         from observations final
+         where project_id = {projectId:String} and trace_id = {traceId:String}
+      `,
+      query_params: { projectId, traceId, eventTs: toClickHouseDateTime(eventTs) },
+      clickhouse_settings: settings
+    }),
+    tombstoneImportedScores(client, projectId, traceId, eventTs, importSource)
+  ]);
+}
+
+/** Reconciles only feedback owned by one pull provider. */
+export async function tombstoneImportedScores(
+  client: ClickHouseClient,
+  projectId: string,
+  traceId: string,
+  eventTs: string,
+  importSource: "langfuse" | "langsmith"
+): Promise<void> {
+  await client.command({
+    query: `
+      insert into scores
+        (project_id, id, trace_id, timestamp, import_source, event_ts, is_deleted)
+      select project_id, id, trace_id, timestamp, import_source,
+             subtractMicroseconds({eventTs:DateTime64(6)}, 1), 1
+        from scores final
+       where project_id = {projectId:String} and trace_id = {traceId:String}
+         and import_source = {importSource:String}
+    `,
+    query_params: { projectId, traceId, eventTs: toClickHouseDateTime(eventTs), importSource },
+    clickhouse_settings: {
+      max_execution_time: 30,
+      max_threads: 2,
+      max_memory_usage: String(256 * 1024 * 1024),
+      max_rows_to_read: "5000000",
+      read_overflow_mode: "throw"
+    }
+  });
+}
+
+/**
+ * A retention cutoff can advance while a staged import is writing. In that
+ * race, write tombstones one microsecond after the attempted generation so
+ * the just-restored rows cannot survive the cutoff that already won in PG.
+ */
+export async function tombstoneExpiredImportedTraceSnapshot(
+  client: ClickHouseClient,
+  projectId: string,
+  traceId: string,
+  eventTs: string,
+  importSource?: "langfuse" | "langsmith"
+): Promise<void> {
+  const settings = {
+    max_execution_time: 30,
+    max_threads: 2,
+    max_memory_usage: String(256 * 1024 * 1024),
+    max_rows_to_read: "5000000",
+    read_overflow_mode: "throw" as const
+  };
+  await Promise.all([
+    client.command({
+      query: `
+        insert into traces (project_id, id, timestamp, event_ts, is_deleted)
+        select project_id, id, timestamp,
+               addMicroseconds({eventTs:DateTime64(6)}, 1), 1
+          from traces final
+         where project_id = {projectId:String} and id = {traceId:String}
+      `,
+      query_params: { projectId, traceId, eventTs: toClickHouseDateTime(eventTs) },
+      clickhouse_settings: settings
+    }),
+    client.command({
+      query: `
+        insert into observations
+          (project_id, id, trace_id, start_time, event_ts, is_deleted)
+        select project_id, id, trace_id, start_time,
+               addMicroseconds({eventTs:DateTime64(6)}, 1), 1
+         from observations final
+         where project_id = {projectId:String} and trace_id = {traceId:String}
+      `,
+      query_params: { projectId, traceId, eventTs: toClickHouseDateTime(eventTs) },
+      clickhouse_settings: settings
+    }),
+    client.command({
+      query: `
+        insert into scores
+          (project_id, id, trace_id, timestamp, import_source, event_ts, is_deleted)
+        select project_id, id, trace_id, timestamp, import_source,
+               addMicroseconds({eventTs:DateTime64(6)}, 1), 1
+         from scores final
+         where project_id = {projectId:String} and trace_id = {traceId:String}
+           ${importSource ? "and import_source = {importSource:String}" : ""}
+      `,
+      query_params: {
+        projectId,
+        traceId,
+        eventTs: toClickHouseDateTime(eventTs),
+        ...(importSource ? { importSource } : {})
+      },
+      clickhouse_settings: settings
+    })
+  ]);
+}
+
 export async function insertTraces(
   client: ClickHouseClient,
   traces: Trace[],
@@ -89,7 +230,7 @@ export async function insertObservations(
 export async function insertScores(
   client: ClickHouseClient,
   scores: Score[],
-  options: InsertOptions
+  options: InsertOptions & { importSource?: "langfuse" | "langsmith" }
 ): Promise<void> {
   if (scores.length === 0) return;
   const eventTs = toClickHouseDateTime(options.eventTs);
@@ -105,6 +246,7 @@ export async function insertScores(
       value: s.value ?? null,
       string_value: s.stringValue ?? null,
       source: s.source,
+      import_source: options.importSource ?? null,
       comment: s.comment ?? null,
       metadata: s.metadata,
       // Omit when absent so the column DEFAULT (insert time) applies —

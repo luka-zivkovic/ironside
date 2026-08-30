@@ -15,7 +15,11 @@ import { runExport } from "./exporters/export-runner.js";
 import { forwardOtlpTraces } from "./forwarders/otlp-forwarder.js";
 import { runLangfuseImport } from "./importers/langfuse-importer.js";
 import { runLangsmithImport } from "./importers/langsmith-importer.js";
-import { runRetention } from "./retention/retention-runner.js";
+import { recoverAbandonedEvaluatorImports } from "./importers/evaluator-publication.js";
+import {
+  runRetention,
+  seedEvaluatorImportRetentionCutoffs
+} from "./retention/retention-runner.js";
 import { runWebhooks } from "./webhooks/webhook-runner.js";
 import { runEnvironmentRegistryRebuildChunk } from "./environments/environment-registry.js";
 
@@ -163,6 +167,14 @@ export function startScheduler(options: SchedulerOptions): Scheduler {
   // a failure for the narrow window BEFORE the importer's own try block
   // ever starts: decrypting/parsing the stored credentials blob.
   async function tickImports(): Promise<void> {
+    await recoverAbandonedEvaluatorImports({
+      pool: options.pool,
+      clickhouse: options.clickhouse,
+      limit: claimBatchSize,
+      onEnvironmentRegistryOverflow: (count) =>
+        options.onEnvironmentRegistryOverflow?.("live", count),
+      onError: (_projectId, _source, error) => onError("import-recovery", error)
+    });
     const due = await claimDueImportSources(options.pool, claimBatchSize);
     for (const source of due) {
       try {
@@ -205,7 +217,9 @@ export function startScheduler(options: SchedulerOptions): Scheduler {
               secretKey: credentials.secretKey
             },
             onEnvironmentRegistryOverflow: (count) =>
-              options.onEnvironmentRegistryOverflow?.("live", count)
+              options.onEnvironmentRegistryOverflow?.("live", count),
+            onInvalidTrace: (traceId, error) =>
+              onError(`import:langfuse:${traceId}`, error)
           });
         } else {
           const credentials = parsed as unknown as {
@@ -218,7 +232,9 @@ export function startScheduler(options: SchedulerOptions): Scheduler {
             clickhouse: options.clickhouse,
             projectId: source.projectId,
             client: { apiKey: credentials.apiKey, ...(credentials.baseUrl && { baseUrl: credentials.baseUrl }) },
-            sessionIds: credentials.sessionIds
+            sessionIds: credentials.sessionIds,
+            onInvalidTrace: (traceId, error) =>
+              onError(`import:langsmith:${traceId}`, error)
           });
         }
         onRunOutcome("import", "success");
@@ -311,7 +327,18 @@ export function startScheduler(options: SchedulerOptions): Scheduler {
     if (stopped || importTicking) return;
     importTicking = true;
     try {
+      // Fail closed until every existing project has a durable cutoff. The
+      // first retention sweep runs on another timer and may lose this race
+      // during an upgrade, otherwise resurrecting an expired inclusive
+      // provider-checkpoint row before the cutoff ledger is initialized.
+      await seedEvaluatorImportRetentionCutoffs({
+        pool: options.pool,
+        defaultRetentionDays: options.defaultRetentionDays
+      });
       await tickImports();
+    } catch (error) {
+      onError("import", error);
+      onRunOutcome("import", "error");
     } finally {
       importTicking = false;
     }

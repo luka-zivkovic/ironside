@@ -21,11 +21,14 @@ describe("runMigrations (postgres)", () => {
        where table_schema = current_schema() and table_name in
        ('organizations', 'projects', 'ironside_migrations', 'raw_retention_intents',
         'owner_principals', 'owner_auth_challenges', 'owner_sessions', 'auth_audit_events',
-        'machine_credentials', 'project_environments', 'project_environment_registry_state')`
+        'machine_credentials', 'project_environments', 'project_environment_registry_state',
+        'evaluator_trace_feed', 'evaluator_import_trace_state')`
     );
     const names = tables.rows.map((r) => r.table_name).sort();
     expect(names).toEqual([
       "auth_audit_events",
+      "evaluator_import_trace_state",
+      "evaluator_trace_feed",
       "ironside_migrations",
       "machine_credentials",
       "organizations",
@@ -38,11 +41,15 @@ describe("runMigrations (postgres)", () => {
       "raw_retention_intents"
     ]);
 
-    const applied = await pool.query("select id, checksum from ironside_migrations order by id");
-    expect(applied.rows).toEqual([{
-      id: "0001_baseline",
-      checksum: "54309d8feec00b2eabaf677c3fcb4acac8047a477151bc7b37c23fe1c5ce8d86"
-    }]);
+    const applied = await pool.query(
+      `select id, checksum from ironside_migrations order by id collate "C"`
+    );
+    expect(applied.rows).toEqual([
+      {
+        id: "0001_baseline",
+        checksum: "ca0fe03d88db6c911b1c682303738c090b6351c192845b453781b7321d2b588b"
+      }
+    ]);
     expect((await pool.query("select to_regclass('api_keys') as table_name")).rows).toEqual([
       { table_name: null }
     ]);

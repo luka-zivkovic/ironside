@@ -24,6 +24,9 @@ export interface RecoveryLoopOptions {
   onError?: (error: unknown) => void;
   pool?: Pool;
   retentionExecutionEnabled?: boolean;
+  beforeTerminalFailure?: (
+    message: QueueMessage
+  ) => Promise<"quarantine" | "retry">;
 }
 
 const DEFAULT_INTERVAL_MS = 30_000;
@@ -39,6 +42,9 @@ export function startPendingIngestRecovery(options: RecoveryLoopOptions): Recove
     ...(options.batchSize !== undefined && { batchSize: options.batchSize }),
     onInvalid: (key, error) =>
       console.error(`[ingest-recovery] invalid durable intent ${key}:`, error),
+    ...(options.beforeTerminalFailure
+      ? { beforeTerminalFailure: options.beforeTerminalFailure }
+      : {}),
     ...(options.pool && options.retentionExecutionEnabled === true
       ? {
           coordinateMessage: <T>(message: QueueMessage, operation: () => Promise<T>) =>

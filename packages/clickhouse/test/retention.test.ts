@@ -1,8 +1,14 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { createClickHouseClient } from "../src/client.js";
 import { runMigrations } from "../src/migrate.js";
-import { insertTraces } from "../src/rows.js";
-import { dropPartitionsOlderThan, listPartitions, markProjectDataDeletedOlderThan } from "../src/retention.js";
+import { insertObservations, insertScores, insertTraces } from "../src/rows.js";
+import {
+  dropPartitionsOlderThan,
+  listPartitions,
+  markChildrenOfExpiredTracesDeleted,
+  markProjectDataDeletedOlderThan,
+  recordExpiredEvaluatorTraceIds
+} from "../src/retention.js";
 
 const client = createClickHouseClient({
   url: process.env.CLICKHOUSE_URL ?? "http://localhost:8123",
@@ -10,6 +16,8 @@ const client = createClickHouseClient({
   password: process.env.CLICKHOUSE_PASSWORD ?? "ironside",
   database: process.env.CLICKHOUSE_DB ?? "ironside"
 });
+
+vi.setConfig({ testTimeout: 15_000 });
 
 describe("retention", () => {
   afterAll(() => client.close());
@@ -135,6 +143,13 @@ describe("retention", () => {
     const oldTraceId = `trace_${crypto.randomUUID()}`;
     const recentTraceId = `trace_${crypto.randomUUID()}`;
     const otherOldTraceId = `trace_${crypto.randomUUID()}`;
+    // Keep fixtures in current/future physical partitions so another test
+    // file's legitimate global partition drop cannot erase the physical
+    // tombstone this assertion inspects. They are old/recent relative to this
+    // test's advanced logical cutoff, not an ancient shared partition.
+    const oldTimestamp = new Date();
+    const cutoff = new Date(oldTimestamp.getTime() + 24 * 60 * 60 * 1000);
+    const recentTimestamp = new Date(cutoff.getTime() + 24 * 60 * 60 * 1000);
 
     await insertTraces(
       client,
@@ -142,7 +157,7 @@ describe("retention", () => {
         {
           id: oldTraceId,
           projectId: targetProject,
-          timestamp: "2023-06-01T00:00:00.000Z",
+          timestamp: oldTimestamp.toISOString(),
           name: "old-trace",
           userId: "user_123",
           tags: ["a", "b"],
@@ -153,7 +168,7 @@ describe("retention", () => {
         {
           id: recentTraceId,
           projectId: targetProject,
-          timestamp: new Date().toISOString(),
+          timestamp: recentTimestamp.toISOString(),
           name: "recent-trace",
           tags: [],
           metadata: {}
@@ -161,7 +176,7 @@ describe("retention", () => {
         {
           id: otherOldTraceId,
           projectId: otherProject,
-          timestamp: "2023-06-01T00:00:00.000Z",
+          timestamp: oldTimestamp.toISOString(),
           name: "other-project-old-trace",
           tags: [],
           metadata: {}
@@ -170,7 +185,7 @@ describe("retention", () => {
       { eventTs: new Date().toISOString() }
     );
 
-    await markProjectDataDeletedOlderThan(client, "traces", targetProject, new Date("2024-01-01T00:00:00Z"));
+    await markProjectDataDeletedOlderThan(client, "traces", targetProject, cutoff);
 
     // ReplacingMergeTree(event_ts, is_deleted)'s is_deleted is the
     // engine's own tombstone marker: FINAL doesn't just dedup to the
@@ -219,6 +234,234 @@ describe("retention", () => {
     expect(latestVersion?.metadata).toEqual({ key: "value" });
     expect(JSON.parse(latestVersion?.input ?? "null")).toEqual({ q: "hello" });
     expect(JSON.parse(latestVersion?.output ?? "null")).toEqual({ a: "world" });
+  });
+
+  it("retains old observations while their parent trace remains in-window", async () => {
+    const projectId = `proj_retention_tree_${crypto.randomUUID()}`;
+    const traceId = `trace_${crypto.randomUUID()}`;
+    const observationId = `obs_${crypto.randomUUID()}`;
+    const eventTs = new Date().toISOString();
+    await insertTraces(client, [{
+      id: traceId,
+      projectId,
+      timestamp: new Date().toISOString(),
+      tags: [],
+      metadata: {}
+    }], { eventTs });
+    await insertObservations(client, [{
+      id: observationId,
+      traceId,
+      projectId,
+      type: "span",
+      startTime: "2020-01-15T00:00:00.000Z",
+      level: "default",
+      metadata: {}
+    }], { eventTs });
+
+    const cutoff = new Date("2024-01-01T00:00:00.000Z");
+    await markProjectDataDeletedOlderThan(client, "observations", projectId, cutoff);
+    const dropped = await dropPartitionsOlderThan(client, "observations", cutoff);
+
+    const remaining = await client.query({
+      query: "select id from observations final where project_id = {projectId:String} and id = {observationId:String}",
+      query_params: { projectId, observationId },
+      format: "JSONEachRow"
+    });
+    expect(await remaining.json()).toHaveLength(1);
+    expect(dropped).not.toContain("202001");
+  });
+
+  it("retains an old child partition while its policy-expired parent is still live", async () => {
+    const projectId = `proj_retention_boundary_tree_${crypto.randomUUID()}`;
+    const traceId = `trace_${crypto.randomUUID()}`;
+    const newerTraceId = `trace_${crypto.randomUUID()}`;
+    const observationId = `obs_${crypto.randomUUID()}`;
+    const eventTs = new Date().toISOString();
+    await insertTraces(client, [
+      {
+        id: traceId,
+        projectId,
+        timestamp: "2019-02-13T00:00:00.000Z",
+        tags: [],
+        metadata: {}
+      },
+      {
+        id: newerTraceId,
+        projectId,
+        timestamp: "2019-02-20T00:00:00.000Z",
+        tags: [],
+        metadata: {}
+      }
+    ], { eventTs });
+    await insertObservations(client, [{
+      id: observationId,
+      traceId,
+      projectId,
+      type: "span",
+      startTime: "2019-01-15T00:00:00.000Z",
+      level: "default",
+      metadata: {}
+    }], { eventTs });
+
+    const cutoff = new Date("2019-02-15T00:00:00.000Z");
+    const droppedTraces = await dropPartitionsOlderThan(client, "traces", cutoff);
+    const droppedObservations = await dropPartitionsOlderThan(client, "observations", cutoff);
+
+    expect(droppedTraces).not.toContain("201902");
+    expect(droppedObservations).not.toContain("201901");
+    const remaining = await client.query({
+      query: `select id from observations final
+               where project_id = {projectId:String} and id = {observationId:String}`,
+      query_params: { projectId, observationId },
+      format: "JSONEachRow"
+    });
+    expect(await remaining.json()).toHaveLength(1);
+  });
+
+  it("deletes recent observations and scores when their parent trace expires", async () => {
+    const projectId = `proj_retention_expired_tree_${crypto.randomUUID()}`;
+    const traceId = `trace_${crypto.randomUUID()}`;
+    const observationId = `obs_${crypto.randomUUID()}`;
+    const scoreId = `score_${crypto.randomUUID()}`;
+    const eventTs = new Date().toISOString();
+    const recent = new Date().toISOString();
+    await insertTraces(client, [{
+      id: traceId,
+      projectId,
+      timestamp: "2020-01-15T00:00:00.000Z",
+      tags: [],
+      metadata: {}
+    }], { eventTs });
+    await insertObservations(client, [{
+      id: observationId,
+      traceId,
+      projectId,
+      type: "span",
+      startTime: recent,
+      level: "default",
+      metadata: {}
+    }], { eventTs });
+    await insertScores(client, [{
+      id: scoreId,
+      traceId,
+      projectId,
+      name: "recent-assessment",
+      dataType: "numeric",
+      value: 1,
+      source: "eval",
+      timestamp: recent,
+      metadata: {}
+    }], { eventTs });
+
+    const cutoffs = [
+      { projectId, traceOlderThan: new Date("2024-01-01T00:00:00.000Z") }
+    ];
+    await recordExpiredEvaluatorTraceIds(client, cutoffs);
+    await markChildrenOfExpiredTracesDeleted(client, [projectId]);
+
+    // A policy-expired marker does not mutate the tree while partition grace
+    // or a global floor still leaves the parent visible.
+    for (const [table, id] of [["observations", observationId], ["scores", scoreId]] as const) {
+      const retained = await client.query({
+        query: `select id from ${table} final
+                 where project_id = {projectId:String} and id = {id:String}`,
+        query_params: { projectId, id },
+        format: "JSONEachRow"
+      });
+      expect(await retained.json()).toHaveLength(1);
+    }
+
+    await markProjectDataDeletedOlderThan(
+      client,
+      "traces",
+      projectId,
+      new Date("2024-01-01T00:00:00.000Z")
+    );
+    await markChildrenOfExpiredTracesDeleted(client, [projectId]);
+
+    for (const [table, id] of [["observations", observationId], ["scores", scoreId]] as const) {
+      const remaining = await client.query({
+        query: `select id from ${table} final
+                 where project_id = {projectId:String} and id = {id:String}`,
+        query_params: { projectId, id },
+        format: "JSONEachRow"
+      });
+      expect(await remaining.json()).toHaveLength(0);
+    }
+
+    // The parent identity remains durable after its live row disappears. A
+    // delayed recent child is removed on the next pass too.
+    const delayedObservationId = `obs_${crypto.randomUUID()}`;
+    await insertObservations(client, [{
+      id: delayedObservationId,
+      traceId,
+      projectId,
+      type: "span",
+      startTime: recent,
+      level: "default",
+      metadata: {}
+    }], { eventTs: new Date().toISOString() });
+    await markChildrenOfExpiredTracesDeleted(client, [projectId]);
+    const delayed = await client.query({
+      query: `select id from observations final
+               where project_id = {projectId:String} and id = {id:String}`,
+      query_params: { projectId, id: delayedObservationId },
+      format: "JSONEachRow"
+    });
+    expect(await delayed.json()).toHaveLength(0);
+  });
+
+  it("pages expired-parent capture and child reconciliation without a global row ceiling", async () => {
+    const projectId = `proj_retention_paged_${crypto.randomUUID()}`;
+    const eventTs = new Date().toISOString();
+    const traceIds = [0, 1, 2].map(() => `trace_${crypto.randomUUID()}`);
+    const observationIds = traceIds.map(() => `obs_${crypto.randomUUID()}`);
+    await insertTraces(client, traceIds.map((id, index) => ({
+      id,
+      projectId,
+      timestamp: `2020-01-${String(index + 10).padStart(2, "0")}T00:00:00.000Z`,
+      tags: [],
+      metadata: {}
+    })), { eventTs });
+    await insertObservations(client, traceIds.map((traceId, index) => ({
+      id: observationIds[index]!,
+      traceId,
+      projectId,
+      type: "span" as const,
+      startTime: new Date().toISOString(),
+      level: "default" as const,
+      metadata: {}
+    })), { eventTs });
+
+    await recordExpiredEvaluatorTraceIds(
+      client,
+      [{ projectId, traceOlderThan: new Date("2024-01-01T00:00:00.000Z") }],
+      { batchSize: 1 }
+    );
+    const markers = await client.query({
+      query: `select trace_id from evaluator_trace_retention final
+              where project_id = {projectId:String} order by trace_id`,
+      query_params: { projectId },
+      format: "JSONEachRow"
+    });
+    expect((await markers.json<{ trace_id: string }>()).map((row) => row.trace_id)).toEqual(
+      [...traceIds].sort()
+    );
+
+    await markProjectDataDeletedOlderThan(
+      client,
+      "traces",
+      projectId,
+      new Date("2024-01-01T00:00:00.000Z")
+    );
+    await markChildrenOfExpiredTracesDeleted(client, [projectId], { batchSize: 1 });
+    const remaining = await client.query({
+      query: `select id from observations final
+              where project_id = {projectId:String} and id in {ids:Array(String)}`,
+      query_params: { projectId, ids: observationIds },
+      format: "JSONEachRow"
+    });
+    expect(await remaining.json()).toHaveLength(0);
   });
 
   it("listPartitions returns partitions oldest-first with their actual min timestamp", async () => {

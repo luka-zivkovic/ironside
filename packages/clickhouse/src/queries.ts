@@ -27,13 +27,17 @@ export interface TraceFilter {
  * FINAL is essential: retention's engine-native tombstones carry a fresh
  * event_ts but represent deletion, not activity, and must disappear here.
  */
-function traceActivityQuery(traceIdParam?: string): string {
+function traceActivityQuery(traceIdParam?: string, traceIdsParam?: string): string {
   const traceCondition = traceIdParam
     ? `and id = {${traceIdParam}:String}`
-    : "";
+    : traceIdsParam
+      ? `and id in {${traceIdsParam}:Array(String)}`
+      : "";
   const observationCondition = traceIdParam
     ? `and trace_id = {${traceIdParam}:String}`
-    : "";
+    : traceIdsParam
+      ? `and trace_id in {${traceIdsParam}:Array(String)}`
+      : "";
   return `
     select trace_id, max(activity_at) as last_activity_at
     from (
@@ -117,6 +121,69 @@ export interface TraceRow {
   environment: string | null;
   tags: string[];
   metadata: Record<string, string>;
+}
+
+export interface SettledTraceVersionRow extends TraceRow {
+  trace_version: string;
+}
+
+export interface SettledTraceVersionCursor {
+  traceVersion: string;
+  traceId: string;
+}
+
+/**
+ * Stable bootstrap scan for evaluator consumers. Unlike the operator trace
+ * list, ordering and pagination use the server-owned latest activity clock,
+ * which is also the immutable identity of the settled snapshot.
+ */
+export async function listSettledTraceVersions(
+  client: ClickHouseClient,
+  input: {
+    projectId: string;
+    settledBefore: string;
+    limit: number;
+    cursor?: SettledTraceVersionCursor | undefined;
+  }
+): Promise<SettledTraceVersionRow[]> {
+  const cursorCondition = input.cursor
+    ? `and (activity.last_activity_at, t.id) >
+         ({cursorVersion:DateTime64(6)}, {cursorTraceId:String})`
+    : "";
+  const result = await client.query({
+    query: `
+      select t.id, t.timestamp, t.name, t.user_id, t.session_id,
+             t.environment, t.tags, t.metadata,
+             activity.last_activity_at as trace_version
+      from traces as t final
+      inner join (${traceActivityQuery()}) as activity on activity.trace_id = t.id
+      where t.project_id = {projectId:String}
+        and activity.last_activity_at <= {settledBefore:DateTime64(6)}
+        ${cursorCondition}
+      order by activity.last_activity_at asc, t.id asc
+      limit {limit:UInt32}
+    `,
+    query_params: {
+      projectId: input.projectId,
+      settledBefore: toClickHouseDateTime(input.settledBefore),
+      limit: input.limit,
+      ...(input.cursor && {
+        cursorVersion: toClickHouseDateTime(input.cursor.traceVersion),
+        cursorTraceId: input.cursor.traceId
+      })
+    },
+    format: "JSONEachRow"
+  });
+  const rows = await result.json<SettledTraceVersionRow>();
+  return rows.map((row) => ({
+    ...row,
+    timestamp: fromClickHouseDateTime(row.timestamp),
+    // Ingest receipt clocks originate as JavaScript ISO timestamps and the
+    // write boundary stores millisecond precision. ClickHouse renders the
+    // DateTime64(6) column with three additional zeroes; collapse those so
+    // the durable Postgres feed and ClickHouse snapshot use one exact token.
+    trace_version: new Date(fromClickHouseDateTime(row.trace_version)).toISOString()
+  }));
 }
 
 /**
@@ -238,6 +305,100 @@ export interface TraceDetailRow {
   metadata: Record<string, string>;
   input: string | null;
   output: string | null;
+}
+
+export interface VersionedTraceDetailRow extends TraceDetailRow {
+  trace_version: string;
+}
+
+export interface VersionedTraceSummaryRow extends TraceRow {
+  trace_version: string;
+}
+
+/** Current trace payload plus its server-owned latest activity version. */
+export async function getVersionedTrace(
+  client: ClickHouseClient,
+  projectId: string,
+  traceId: string
+): Promise<VersionedTraceDetailRow | null> {
+  return (await getVersionedTraces(client, projectId, [traceId])).get(traceId) ?? null;
+}
+
+/** Summary-only batch form for evaluator feed pages; omits large payloads. */
+export async function getVersionedTraceSummaries(
+  client: ClickHouseClient,
+  projectId: string,
+  traceIds: string[]
+): Promise<Map<string, VersionedTraceSummaryRow>> {
+  const uniqueTraceIds = [...new Set(traceIds)].filter(Boolean);
+  if (uniqueTraceIds.length === 0) return new Map();
+  const result = await client.query({
+    query: `
+      select t.id, t.timestamp, t.name, t.user_id, t.session_id,
+             t.environment, t.tags, t.metadata,
+             activity.last_activity_at as trace_version
+      from traces as t final
+      inner join (${traceActivityQuery(undefined, "traceIds")}) as activity on activity.trace_id = t.id
+      where t.project_id = {projectId:String} and t.id in {traceIds:Array(String)}
+    `,
+    query_params: { projectId, traceIds: uniqueTraceIds },
+    format: "JSONEachRow"
+  });
+  const rows = await result.json<VersionedTraceSummaryRow>();
+  return new Map(rows.map((row) => [row.id, {
+    ...row,
+    timestamp: fromClickHouseDateTime(row.timestamp),
+    trace_version: new Date(fromClickHouseDateTime(row.trace_version)).toISOString()
+  }]));
+}
+
+/** Bounded batch form used by evaluator feed pages to avoid one CH query per trace. */
+export async function getVersionedTraces(
+  client: ClickHouseClient,
+  projectId: string,
+  traceIds: string[]
+): Promise<Map<string, VersionedTraceDetailRow>> {
+  const uniqueTraceIds = [...new Set(traceIds)].filter(Boolean);
+  if (uniqueTraceIds.length === 0) return new Map();
+  const result = await client.query({
+    query: `
+      select t.id, t.timestamp, t.name, t.user_id, t.session_id, t.environment,
+             t.release, t.version, t.tags, t.metadata, t.input, t.output,
+             activity.last_activity_at as trace_version
+      from traces as t final
+      inner join (${traceActivityQuery(undefined, "traceIds")}) as activity on activity.trace_id = t.id
+      where t.project_id = {projectId:String} and t.id in {traceIds:Array(String)}
+    `,
+    query_params: { projectId, traceIds: uniqueTraceIds },
+    format: "JSONEachRow"
+  });
+  const rows = await result.json<VersionedTraceDetailRow>();
+  return new Map(rows.map((row) => [row.id, {
+    ...row,
+    timestamp: fromClickHouseDateTime(row.timestamp),
+    trace_version: new Date(fromClickHouseDateTime(row.trace_version)).toISOString()
+  }]));
+}
+
+/** Current trace identities only, used for bounded Postgres feed pruning. */
+export async function listExistingTraceIds(
+  client: ClickHouseClient,
+  projectId: string,
+  traceIds: string[]
+): Promise<Set<string>> {
+  const uniqueTraceIds = [...new Set(traceIds)].filter(Boolean);
+  if (uniqueTraceIds.length === 0) return new Set();
+  const result = await client.query({
+    query: `
+      select id
+      from traces final
+      where project_id = {projectId:String} and id in {traceIds:Array(String)}
+    `,
+    query_params: { projectId, traceIds: uniqueTraceIds },
+    format: "JSONEachRow"
+  });
+  const rows = await result.json<{ id: string }>();
+  return new Set(rows.map((row) => row.id));
 }
 
 export interface ObservationRow {

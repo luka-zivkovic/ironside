@@ -65,6 +65,26 @@ describe("mapLangfuseIngestionRequest — explicit null fields", () => {
 });
 
 describe("mapLangfuseIngestionRequest", () => {
+  it("rejects NUL and oversized domain identifiers as per-event errors", () => {
+    const { rows, response } = mapLangfuseIngestionRequest(
+      "proj_x",
+      request([
+        batchEvent({ id: "evt_nul", body: { id: "trace\0poison" } }),
+        batchEvent({
+          id: "evt_long",
+          type: "generation-create",
+          body: { id: "obs_1", traceId: "x".repeat(513) }
+        })
+      ])
+    );
+    expect(rows.traces).toEqual([]);
+    expect(rows.observations).toEqual([]);
+    expect(response.errors).toEqual([
+      expect.objectContaining({ id: "evt_nul", status: 400 }),
+      expect.objectContaining({ id: "evt_long", status: 400 })
+    ]);
+  });
+
   it("maps trace-create to a Trace row and reports success in the 207 response", () => {
     const { rows, response } = mapLangfuseIngestionRequest(
       "proj_x",

@@ -1,15 +1,24 @@
-import { insertObservations, insertScores, insertTraces, type ClickHouseClient } from "@ironside/clickhouse";
+import type { ClickHouseClient } from "@ironside/clickhouse";
 import {
   claimImportRun,
   getImportCheckpoint,
   markImportRunFailed,
   markImportRunIdle,
+  renewImportRunLease,
+  stageEvaluatorImportTraces,
   saveImportProgress
 } from "@ironside/db";
 import { ulid } from "ulid";
 import type { Pool } from "pg";
+import type { Trace } from "@ironside/shared";
 import { LangsmithClient, type LangsmithClientConfig, type LangsmithRun } from "./langsmith-client.js";
 import { mapLangsmithFeedback, mapLangsmithObservation, mapLangsmithRun } from "./langsmith-mapper.js";
+import {
+  importedTraceContentHash,
+  importedEvaluatorTraceContentHash,
+  importedTraceSnapshot,
+  recoverPendingEvaluatorImportSnapshots
+} from "./evaluator-publication.js";
 
 interface LangsmithCheckpointShape {
   [key: string]: unknown;
@@ -29,6 +38,8 @@ export interface RunLangsmithImportOptions {
   pageSize?: number;
   /** Safety cap on pages per invocation; resumes on the next call via the saved checkpoint. */
   maxPagesPerRun?: number;
+  /** Invalid provider rows are skipped so one poison trace cannot pin the source checkpoint. */
+  onInvalidTrace?: (traceId: string, error: unknown) => void;
 }
 
 export interface LangsmithImportResult {
@@ -65,20 +76,28 @@ export async function runLangsmithImport(
 
   const claimed = await claimImportRun(pool, projectId, "langsmith", `import_${ulid()}`);
   if (!claimed) return null; // another run is already in progress
+  const runToken = claimed.runToken!;
 
   const existing = await getImportCheckpoint(pool, projectId, "langsmith");
   const checkpoint: LangsmithCheckpointShape = {
     ...(existing?.checkpoint as LangsmithCheckpointShape | undefined)
   };
   const startTimeForThisRun = checkpoint.lastStartTime;
-  const eventTsForThisRun = new Date().toISOString();
-
   const client = new LangsmithClient(options.client);
   let totalImported = 0;
   let resumable = false;
+  let newestSeenStartTime: string | undefined;
 
   try {
+    await recoverPendingEvaluatorImportSnapshots({
+      pool,
+      clickhouse,
+      projectId,
+      source: "langsmith",
+      runToken
+    });
     for (let pagesFetched = 0; pagesFetched < maxPages; pagesFetched++) {
+      await renewImportRunLease(pool, projectId, "langsmith", runToken);
       const response = await client.queryRuns({
         sessionIds: options.sessionIds,
         limit: pageSize,
@@ -97,41 +116,76 @@ export async function runLangsmithImport(
         // save, same contract as the LangFuse importer: a retry re-fetches
         // the page and its trees idempotently, no partial page is ever
         // recorded as done.
-        const traces = [];
-        const observations = [];
-        const scores = [];
+        const traces: Trace[] = [];
+        const candidateActivityAt = new Date().toISOString();
+        const snapshots = new Map<string, ReturnType<typeof importedTraceSnapshot>>();
         for (const rootRun of response.runs as LangsmithRun[]) {
+          await renewImportRunLease(pool, projectId, "langsmith", runToken);
           const traceId = rootRun.trace_id ?? rootRun.id;
           const treeRuns = await client.getTraceRuns(traceId);
           // The trace-scoped query returns the root run again — dedup by
           // id so it isn't mapped as both a Trace and an Observation.
           const childRuns = treeRuns.filter((r) => r.id !== rootRun.id);
-
-          traces.push(mapLangsmithRun(projectId, rootRun));
-          for (const child of childRuns) {
-            observations.push(mapLangsmithObservation(projectId, traceId, child));
-          }
-
           const allRunIds = [rootRun.id, ...childRuns.map((r) => r.id)];
           const feedback = await client.getFeedbackForRuns(allRunIds);
-          for (const fb of feedback) {
-            // null = feedback with neither a numeric score nor a
-            // categorical value (e.g. comment/correction-only) — the
-            // domain Score schema requires at least one; skip rather
-            // than insert an invalid row with both columns null.
-            const score = mapLangsmithFeedback(projectId, traceId, fb);
-            if (score) scores.push(score);
+          try {
+            const trace = mapLangsmithRun(projectId, rootRun);
+            const traceObservations = childRuns.map((child) =>
+              mapLangsmithObservation(projectId, traceId, child)
+            );
+            const traceScores = feedback.flatMap((entry) => {
+              const score = mapLangsmithFeedback(projectId, traceId, entry);
+              return score ? [score] : [];
+            });
+            const snapshot = importedTraceSnapshot(
+              trace,
+              traceObservations,
+              traceScores
+            );
+            traces.push(snapshot.trace);
+            snapshots.set(snapshot.trace.id, snapshot);
+          } catch (error) {
+            (options.onInvalidTrace ?? ((id, cause) =>
+              console.error(`[import:langsmith] skipping invalid trace ${id}`, cause)
+            ))(traceId, error);
           }
         }
-        await insertTraces(clickhouse, traces, { eventTs: eventTsForThisRun });
-        await insertObservations(clickhouse, observations, { eventTs: eventTsForThisRun });
-        await insertScores(clickhouse, scores, { eventTs: eventTsForThisRun });
+        const staged = await stageEvaluatorImportTraces(pool, {
+          projectId,
+          source: "langsmith",
+          runToken,
+          candidateActivityId: `import_langsmith_${ulid()}`,
+          candidateActivityAt,
+          traces: traces.map((trace) => ({
+            traceId: trace.id,
+            contentHash: importedTraceContentHash(
+              trace,
+              snapshots.get(trace.id)!.observations,
+              snapshots.get(trace.id)!.scores
+            ),
+            evaluatorContentHash: importedEvaluatorTraceContentHash(
+              trace,
+              snapshots.get(trace.id)!.observations
+            ),
+            snapshot: snapshots.get(trace.id)!
+          }))
+        });
+        if (staged.size !== traces.length) throw new Error("missing staged LangSmith traces");
+        await recoverPendingEvaluatorImportSnapshots({
+          pool,
+          clickhouse,
+          projectId,
+          source: "langsmith",
+          runToken
+        });
         pageImported = traces.length;
         totalImported += pageImported;
         // order: "asc" server-side, so the last element is the newest
-        // start_time seen so far in this run.
+        // start_time seen so far in this run. Do not persist it alongside an
+        // in-window cursor: that opaque cursor was minted against the fixed
+        // startTimeForThisRun filter and changes meaning if the filter moves.
         const lastStartTime = response.runs.at(-1)?.start_time;
-        if (lastStartTime) checkpoint.lastStartTime = lastStartTime;
+        if (lastStartTime) newestSeenStartTime = lastStartTime;
       }
 
       const nextCursor = response.cursors?.next;
@@ -141,23 +195,25 @@ export async function runLangsmithImport(
         // a fresh window from lastStartTime forward, rather than resending
         // a stale/expired cursor from a completed window.
         delete checkpoint.cursor;
-        await saveImportProgress(pool, projectId, "langsmith", checkpoint, pageImported);
+        if (newestSeenStartTime) checkpoint.lastStartTime = newestSeenStartTime;
+        await saveImportProgress(pool, projectId, "langsmith", runToken, checkpoint, pageImported);
         break;
       }
 
       checkpoint.cursor = nextCursor;
-      await saveImportProgress(pool, projectId, "langsmith", checkpoint, pageImported);
+      await saveImportProgress(pool, projectId, "langsmith", runToken, checkpoint, pageImported);
 
       if (pagesFetched === maxPages - 1) resumable = true;
     }
 
-    await markImportRunIdle(pool, projectId, "langsmith");
+    await markImportRunIdle(pool, projectId, "langsmith", runToken);
     return { imported: totalImported, resumable };
   } catch (error) {
     await markImportRunFailed(
       pool,
       projectId,
       "langsmith",
+      runToken,
       error instanceof Error ? error.message : String(error)
     );
     throw error;

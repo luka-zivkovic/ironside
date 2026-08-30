@@ -90,11 +90,54 @@ export async function dropPartitionsOlderThan(
     const maxTs = new Date(fromClickHouseDateTime(row.max_ts));
     if (maxTs >= effectiveCutoff) continue; // has data within the retention window (plus grace period) — never drop
 
+    // Observations and scores are part of a trace snapshot. An old child can
+    // legitimately belong to a recent trace (late import/backfill). Dropping
+    // that child's monthly partition would change the evaluator-visible tree
+    // without changing the trace's activity/version, so retain the whole
+    // partition while any row in it belongs to a trace that is still live.
+    // The parent can remain visible even when its own timestamp is before the
+    // effective cutoff because its monthly partition contains a newer trace
+    // or is protected by the partition grace period.
+    if (
+      table !== "traces" &&
+      await partitionHasChildOfRetainedTrace(
+        client,
+        table,
+        partition.partition
+      )
+    ) {
+      continue;
+    }
+
     await client.exec({ query: `alter table ${table} drop partition ${partition.partition}` });
     dropped.push(partition.partition);
   }
 
   return dropped;
+}
+
+async function partitionHasChildOfRetainedTrace(
+  client: ClickHouseClient,
+  table: Exclude<RetainedTable, "traces">,
+  partition: string
+): Promise<boolean> {
+  const result = await client.query({
+    query: `
+      select count() as count
+        from ${table} final
+       where _partition_id = {partition:String}
+         and (project_id, trace_id) in (
+           select project_id, id
+             from traces final
+         )
+    `,
+    query_params: {
+      partition
+    },
+    format: "JSONEachRow"
+  });
+  const [row] = await result.json<{ count: string }>();
+  return Number(row?.count ?? 0) > 0;
 }
 
 function timestampColumn(table: RetainedTable): string {
@@ -121,7 +164,7 @@ const TABLE_COLUMNS: Record<RetainedTable, readonly string[]> = {
   ],
   scores: [
     "project_id", "id", "trace_id", "observation_id", "name", "data_type",
-    "value", "string_value", "source", "comment", "metadata", "timestamp"
+    "value", "string_value", "source", "import_source", "comment", "metadata", "timestamp"
   ]
 };
 
@@ -154,13 +197,201 @@ export async function markProjectDataDeletedOlderThan(
 ): Promise<void> {
   const column = timestampColumn(table);
   const columns = TABLE_COLUMNS[table];
+  const retainedParentGuard = table === "traces"
+    ? ""
+    : `and (project_id, trace_id) not in (
+         select project_id, id
+           from traces final
+          where project_id = {projectId:String}
+            and timestamp >= {olderThan:DateTime64(3)}
+       )`;
   await client.exec({
     query: `
       insert into ${table} (${columns.join(", ")}, is_deleted, event_ts)
       select ${columns.join(", ")}, 1, now64(6)
       from ${table} final
-      where project_id = {projectId:String} and ${column} < {olderThan:DateTime64(3)} and is_deleted = 0
+      where project_id = {projectId:String}
+        and ${column} < {olderThan:DateTime64(3)}
+        and is_deleted = 0
+        ${retainedParentGuard}
     `,
     query_params: { projectId, olderThan: toClickHouseDateTime(olderThan.toISOString()) }
   });
+}
+
+/**
+ * Whole-trace retention: once a durably marked parent is actually absent,
+ * remove every child even if that child carries a newer source timestamp.
+ * Policy-expired parents still preserved by partition grace/global floors keep
+ * their complete tree.
+ */
+export async function markChildrenOfExpiredTracesDeleted(
+  client: ClickHouseClient,
+  projectIdsInput: string[],
+  options: { batchSize?: number } = {}
+): Promise<void> {
+  const projectIds = [...new Set(projectIdsInput)];
+  if (projectIds.length === 0) return;
+  const batchSize = positiveBatchSize(options.batchSize, DEFAULT_CHILD_RECONCILIATION_BATCH_SIZE);
+  for (const projectId of projectIds) {
+    let afterTraceId = "";
+    while (true) {
+      const markerResult = await client.query({
+        query: `
+          select trace_id
+            from evaluator_trace_retention final
+           where project_id = {projectId:String}
+             and trace_id > {afterTraceId:String}
+           order by trace_id
+           limit {limit:UInt32}
+        `,
+        query_params: { projectId, afterTraceId, limit: batchSize + 1 },
+        format: "JSONEachRow",
+        clickhouse_settings: LIFECYCLE_PAGE_QUERY_SETTINGS
+      });
+      const markerRows = await markerResult.json<{ trace_id: string }>();
+      const page = markerRows.slice(0, batchSize);
+      if (page.length === 0) break;
+
+      const traceIds = page.map((row) => row.trace_id);
+      const liveResult = await client.query({
+        query: `
+          select distinct id
+            from traces final
+           where project_id = {projectId:String}
+             and id in {traceIds:Array(String)}
+        `,
+        query_params: { projectId, traceIds },
+        format: "JSONEachRow",
+        clickhouse_settings: LIFECYCLE_PAGE_QUERY_SETTINGS
+      });
+      const liveTraceIds = new Set(
+        (await liveResult.json<{ id: string }>()).map((row) => row.id)
+      );
+      const orphanTraceIds = traceIds.filter((traceId) => !liveTraceIds.has(traceId));
+
+      if (orphanTraceIds.length > 0) {
+        await Promise.all(
+          (["observations", "scores"] as const).map((table) => {
+            const columns = TABLE_COLUMNS[table];
+            return client.exec({
+              query: `
+                insert into ${table} (${columns.join(", ")}, is_deleted, event_ts)
+                select ${columns.join(", ")}, 1, now64(6)
+                  from ${table} final
+                 where project_id = {projectId:String}
+                   and trace_id in {traceIds:Array(String)}
+                   and is_deleted = 0
+              `,
+              query_params: { projectId, traceIds: orphanTraceIds },
+              clickhouse_settings: LIFECYCLE_PAGE_QUERY_SETTINGS
+            });
+          })
+        );
+      }
+
+      afterTraceId = page.at(-1)!.trace_id;
+      if (markerRows.length <= batchSize) break;
+    }
+  }
+}
+
+/** Stage durable parent identities before trace deletion makes them invisible. */
+export async function recordExpiredEvaluatorTraceIds(
+  client: ClickHouseClient,
+  entries: Array<{ projectId: string; traceOlderThan: Date }>,
+  options: { batchSize?: number } = {}
+): Promise<void> {
+  const unique = [...new Map(entries.map((entry) => [entry.projectId, entry])).values()];
+  if (unique.length === 0) return;
+  const batchSize = positiveBatchSize(options.batchSize, DEFAULT_EXPIRED_PARENT_BATCH_SIZE);
+  for (const entry of unique) {
+    let afterDate = "1970-01-01";
+    let afterTraceId = "";
+    let hasCursor = false;
+    while (true) {
+      // Page in the same `(project_id, toDate(timestamp), id)` order as the
+      // traces table. A fixed max_rows_to_read turns retention into a permanent
+      // failure threshold once one installation grows past it; keyset paging
+      // instead makes bounded forward progress without loading every expired
+      // trace into either ClickHouse or the worker process at once.
+      const result = await client.query({
+        query: `
+          select id, toString(toDate(timestamp)) as trace_date
+            from traces final
+           where project_id = {projectId:String}
+             and timestamp < {cutoff:DateTime64(3)}
+             and (
+               {hasCursor:UInt8} = 0
+               or (toDate(timestamp), id) > ({afterDate:Date}, {afterTraceId:String})
+             )
+           order by toDate(timestamp), id
+           limit {limit:UInt32}
+        `,
+        query_params: {
+          projectId: entry.projectId,
+          cutoff: toClickHouseDateTime(entry.traceOlderThan.toISOString()),
+          hasCursor: hasCursor ? 1 : 0,
+          afterDate,
+          afterTraceId,
+          limit: batchSize + 1
+        },
+        format: "JSONEachRow",
+        clickhouse_settings: LIFECYCLE_PAGE_QUERY_SETTINGS
+      });
+      const rows = await result.json<{ id: string; trace_date: string }>();
+      const page = rows.slice(0, batchSize);
+      if (page.length === 0) break;
+
+      const expiredAt = toClickHouseDateTime(new Date().toISOString());
+      await client.insert({
+        table: "evaluator_trace_retention",
+        values: page.map((row) => ({
+          project_id: entry.projectId,
+          trace_id: row.id,
+          expired_at: expiredAt
+        })),
+        format: "JSONEachRow"
+      });
+
+      const last = page.at(-1)!;
+      afterDate = last.trace_date;
+      afterTraceId = last.id;
+      hasCursor = true;
+      if (rows.length <= batchSize) break;
+    }
+  }
+}
+
+/** Persist one exact expired parent before an import-side tombstone hides it. */
+export async function recordExpiredEvaluatorTraceId(
+  client: ClickHouseClient,
+  projectId: string,
+  traceId: string
+): Promise<void> {
+  await client.insert({
+    table: "evaluator_trace_retention",
+    values: [{
+      project_id: projectId,
+      trace_id: traceId,
+      expired_at: toClickHouseDateTime(new Date().toISOString())
+    }],
+    format: "JSONEachRow"
+  });
+}
+
+const DEFAULT_EXPIRED_PARENT_BATCH_SIZE = 10_000;
+const DEFAULT_CHILD_RECONCILIATION_BATCH_SIZE = 500;
+const LIFECYCLE_PAGE_QUERY_SETTINGS = {
+  max_execution_time: 60,
+  max_threads: 4,
+  max_memory_usage: String(512 * 1024 * 1024)
+};
+
+function positiveBatchSize(value: number | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error("retention batchSize must be a positive safe integer");
+  }
+  return value;
 }
