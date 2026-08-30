@@ -54,6 +54,10 @@ describe("runMigrations (postgres)", () => {
       {
         id: "0003_evaluator_import_materialization",
         checksum: "2bc6bd96cef21f9536a8fad76e4d51d868e04063c93e092d82b95bf6791499ba"
+      },
+      {
+        id: "0004_evaluator_recovery_leases",
+        checksum: "12f2134728d088b4f8f0f26901a770619a6fcc376ac5d04c6483fda42c67968d"
       }
     ]);
     expect((await pool.query("select to_regclass('api_keys') as table_name")).rows).toEqual([

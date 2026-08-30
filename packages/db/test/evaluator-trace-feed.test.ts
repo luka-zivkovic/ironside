@@ -3,15 +3,18 @@ import { ulid } from "ulid";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   claimEvaluatorScoreReceipt,
+  claimPendingEvaluatorImportSnapshots,
   deleteEvaluatorTraceFeedEntries,
   EvaluatorScoreIdempotencyConflictError,
   listPendingEvaluatorImportTraceIds,
   listEvaluatorTraceFeedKeys,
   listEvaluatorTraceActivities,
+  markEvaluatorScoreReceiptMaterialized,
   markEvaluatorScoreReceiptStaged,
   publishEvaluatorTraceActivities,
   stageEvaluatorImportTraces
 } from "../src/evaluator-trace-feed.js";
+import { claimImportRun } from "../src/import-checkpoints.js";
 import { runMigrations } from "../src/migrate.js";
 
 const connectionString =
@@ -243,7 +246,8 @@ describe("evaluator trace feed (postgres)", () => {
     })).resolves.toEqual({
       timestamp: "2026-08-29T23:59:59.999Z",
       batchId: "batch_score_first",
-      staged: false
+      staged: false,
+      materialized: false
     });
     await markEvaluatorScoreReceiptStaged(pool, {
       projectId,
@@ -257,6 +261,17 @@ describe("evaluator trace feed (postgres)", () => {
       requestFingerprint,
       candidateBatchId: "batch_score_after_stage"
     })).resolves.toMatchObject({ batchId: "batch_score_first", staged: true });
+    await expect(markEvaluatorScoreReceiptMaterialized(pool, {
+      projectId,
+      batchId: "batch_score_first"
+    })).resolves.toBe(true);
+    await expect(claimEvaluatorScoreReceipt(pool, {
+      projectId,
+      scoreId,
+      traceId,
+      requestFingerprint,
+      candidateBatchId: "batch_score_after_materialized"
+    })).resolves.toMatchObject({ materialized: true });
     await expect(claimEvaluatorScoreReceipt(pool, {
       projectId,
       scoreId,
@@ -268,13 +283,31 @@ describe("evaluator trace feed (postgres)", () => {
 
   it("stages imported snapshots with stable retries and monotonic reversions", async () => {
     const traceId = `trace_${ulid()}`;
+    const runToken = `import_test_${ulid()}`;
+    await claimImportRun(pool, projectId, "langfuse", runToken);
     const stage = (contentHash: string, candidateActivityId: string, candidateActivityAt: string) =>
       stageEvaluatorImportTraces(pool, {
         projectId,
         source: "langfuse",
+        runToken,
         candidateActivityId,
         candidateActivityAt,
-        traces: [{ traceId, contentHash }]
+        traces: [{
+          traceId,
+          contentHash,
+          snapshot: {
+            trace: {
+              id: traceId,
+              projectId,
+              timestamp: "2026-08-30T09:00:00.000Z",
+              tags: [],
+              metadata: {}
+            },
+            observations: [],
+            scores: [],
+            scoreActivityAt: candidateActivityAt
+          }
+        }]
       });
     const first = (await stage("a".repeat(64), "import_a1", "2026-08-30T12:00:00.000Z"))
       .get(traceId)!;
@@ -285,7 +318,8 @@ describe("evaluator trace feed (postgres)", () => {
       traceIds: [traceId],
       sourceActivityAt: first.sourceActivityAt,
       activityId: first.activityId,
-      importSource: "langfuse"
+      importSource: "langfuse",
+      importRunToken: runToken
     });
 
     const retry = (await stage("a".repeat(64), "import_a_retry", "2026-08-30T12:01:00.000Z"))
@@ -296,7 +330,8 @@ describe("evaluator trace feed (postgres)", () => {
       traceIds: [traceId],
       sourceActivityAt: retry.sourceActivityAt,
       activityId: retry.activityId,
-      importSource: "langfuse"
+      importSource: "langfuse",
+      importRunToken: runToken
     });
 
     const changed = (await stage("b".repeat(64), "import_b", "2026-08-30T11:00:00.000Z"))
@@ -308,7 +343,8 @@ describe("evaluator trace feed (postgres)", () => {
       traceIds: [traceId],
       sourceActivityAt: first.sourceActivityAt,
       activityId: first.activityId,
-      importSource: "langfuse"
+      importSource: "langfuse",
+      importRunToken: runToken
     })).rejects.toThrow("stale imported evaluator materialization");
     expect((await listPendingEvaluatorImportTraceIds(pool, projectId, [traceId])).has(traceId))
       .toBe(true);
@@ -317,12 +353,36 @@ describe("evaluator trace feed (postgres)", () => {
       traceIds: [traceId],
       sourceActivityAt: changed.sourceActivityAt,
       activityId: changed.activityId,
-      importSource: "langfuse"
+      importSource: "langfuse",
+      importRunToken: runToken
     });
 
     const reverted = (await stage("a".repeat(64), "import_a2", "2026-08-30T10:00:00.000Z"))
       .get(traceId)!;
     expect(reverted.activityId).toBe("import_a2");
     expect(reverted.sourceActivityAt > changed.sourceActivityAt).toBe(true);
+
+    await pool.query(
+      `update import_checkpoints
+          set lease_expires_at = clock_timestamp() - interval '1 second'
+        where project_id = $1 and source = 'langfuse'`,
+      [projectId]
+    );
+    const takeoverToken = `import_takeover_${ulid()}`;
+    await expect(claimImportRun(pool, projectId, "langfuse", takeoverToken))
+      .resolves.toMatchObject({ runToken: takeoverToken });
+    await expect(stage("c".repeat(64), "import_stale", "2026-08-30T13:00:00.000Z"))
+      .rejects.toThrow("import run lease was lost");
+    await expect(claimPendingEvaluatorImportSnapshots(pool, {
+      projectId,
+      source: "langfuse",
+      runToken: takeoverToken
+    })).resolves.toEqual([
+      expect.objectContaining({
+        traceId,
+        activityId: reverted.activityId,
+        sourceActivityAt: reverted.sourceActivityAt
+      })
+    ]);
   });
 });

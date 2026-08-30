@@ -380,4 +380,89 @@ describe("native evaluator integration", () => {
       })
     ]);
   });
+
+  it("advances past retention-regressed activity but blocks unpublished newer materialization", async () => {
+    const retentionProjectId = `proj_${ulid()}`;
+    await pool.query(
+      "insert into projects (id, organization_id, name) values ($1, $2, $3)",
+      [retentionProjectId, organizationId, "Retention feed ordering"]
+    );
+    const retentionKey = (
+      await createTestMachineCredential(pool, retentionProjectId, "coeval-retention", "integration")
+    ).token;
+    const retentionHeaders = { authorization: `Bearer ${retentionKey}` };
+    const initial = evaluatorTraceFeedResponseSchema.parse(await (
+      await app.request("/api/v1/evaluator/traces?limit=10", { headers: retentionHeaders })
+    ).json());
+
+    const oldActivityAt = "2026-08-20T12:00:00.000Z";
+    const publishedActivityAt = "2026-08-20T12:01:00.000Z";
+    const regressedTrace: Trace = {
+      ...trace,
+      id: `trace_${ulid()}`,
+      projectId: retentionProjectId,
+      timestamp: oldActivityAt,
+      name: "retention-regressed"
+    };
+    const followingTrace: Trace = {
+      ...trace,
+      id: `trace_${ulid()}`,
+      projectId: retentionProjectId,
+      timestamp: publishedActivityAt,
+      name: "following-publication"
+    };
+    await insertTraces(clickhouse, [regressedTrace], { eventTs: oldActivityAt });
+    await publishEvaluatorTraceActivities(pool, {
+      projectId: retentionProjectId,
+      traceIds: [regressedTrace.id],
+      sourceActivityAt: publishedActivityAt,
+      activityId: "batch_retention_regressed"
+    });
+    await insertTraces(clickhouse, [followingTrace], { eventTs: publishedActivityAt });
+    await publishEvaluatorTraceActivities(pool, {
+      projectId: retentionProjectId,
+      traceIds: [followingTrace.id],
+      sourceActivityAt: publishedActivityAt,
+      activityId: "batch_after_retention"
+    });
+
+    const afterRegression = evaluatorTraceFeedResponseSchema.parse(await (
+      await app.request(
+        `/api/v1/evaluator/traces?limit=10&cursor=${encodeURIComponent(initial.nextCursor)}`,
+        { headers: retentionHeaders }
+      )
+    ).json());
+    expect(afterRegression.traces).toEqual([
+      expect.objectContaining({ traceId: followingTrace.id })
+    ]);
+    expect(afterRegression.nextCursor).not.toBe(initial.nextCursor);
+
+    const unpublishedSourceAt = "2026-08-20T12:02:00.000Z";
+    const materializedAt = "2026-08-20T12:03:00.000Z";
+    const unpublishedTrace: Trace = {
+      ...trace,
+      id: `trace_${ulid()}`,
+      projectId: retentionProjectId,
+      timestamp: materializedAt,
+      name: "newer-than-feed"
+    };
+    await insertTraces(clickhouse, [unpublishedTrace], { eventTs: materializedAt });
+    await publishEvaluatorTraceActivities(pool, {
+      projectId: retentionProjectId,
+      traceIds: [unpublishedTrace.id],
+      sourceActivityAt: unpublishedSourceAt,
+      activityId: "batch_before_newer_materialization"
+    });
+    const blocked = evaluatorTraceFeedResponseSchema.parse(await (
+      await app.request(
+        `/api/v1/evaluator/traces?limit=10&cursor=${encodeURIComponent(afterRegression.nextCursor)}`,
+        { headers: retentionHeaders }
+      )
+    ).json());
+    expect(blocked).toMatchObject({
+      traces: [],
+      hasMore: false,
+      nextCursor: afterRegression.nextCursor
+    });
+  });
 });

@@ -35,10 +35,16 @@ describe("runMigrations (clickhouse)", () => {
       query: "select id, checksum from ironside_migrations final order by id",
       format: "JSONEachRow"
     });
-    expect(await applied.json()).toEqual([{
-      id: "0001_baseline",
-      checksum: "47aa8eead3f96a6669dae8f123330ea881f08011aa5efc7d01344ff443167a80"
-    }]);
+    expect(await applied.json()).toEqual([
+      {
+        id: "0001_baseline",
+        checksum: "47aa8eead3f96a6669dae8f123330ea881f08011aa5efc7d01344ff443167a80"
+      },
+      {
+        id: "0002_raw_event_refs_object_projection",
+        checksum: "088767d7d215fa64cd36c5c4719053d34dc87ac2006593892af2a9a9d886e60e"
+      }
+    ]);
   });
 
   it("round-trips a trace row through the Map metadata column", async () => {

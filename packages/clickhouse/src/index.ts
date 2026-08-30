@@ -1,6 +1,12 @@
 export { createClickHouseClient, type ClickHouseConfig } from "./client.js";
 export { runMigrations } from "./migrate.js";
-export { insertTraces, insertObservations, insertScores, type InsertOptions } from "./rows.js";
+export {
+  insertTraces,
+  insertObservations,
+  insertScores,
+  tombstoneImportedTraceSnapshot,
+  type InsertOptions
+} from "./rows.js";
 export {
   insertRawEventRefs,
   markRawObjectRefsRetentionExpired,

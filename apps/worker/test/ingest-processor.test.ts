@@ -7,10 +7,12 @@ import {
   runMigrations as runChMigrations
 } from "@ironside/clickhouse";
 import {
+  claimEvaluatorScoreReceipt,
   claimRawRetentionIntentExecution,
   createRawRetentionIntents,
   listProjectEnvironments,
   listIngestFailures,
+  markEvaluatorScoreReceiptStaged,
   publishEvaluatorTraceActivities,
   runMigrations as runPgMigrations
 } from "@ironside/db";
@@ -307,6 +309,52 @@ describe("ingest processor", () => {
     await processBatch(job);
 
     await expect(hasPendingTraceRawRefs(clickhouse, projectId, traceId)).resolves.toBe(false);
+    await job.remove();
+  });
+
+  it("keeps a staged evaluator score retryable until ClickHouse materializes it", async () => {
+    const traceId = `trace_${ulid()}`;
+    const scoreId = `score_${ulid()}`;
+    const batchId = ulid();
+    const batch: IngestBatch = {
+      batchId,
+      projectId,
+      receivedAt: new Date().toISOString(),
+      events: [{
+        id: `event_${batchId}`,
+        type: "score-upsert",
+        source: "native",
+        schemaVersion: INGEST_SCHEMA_VERSION,
+        idempotencyKey: "evaluator-score-terminal-recovery",
+        body: {
+          id: scoreId,
+          traceId,
+          name: "quality",
+          dataType: "numeric",
+          value: 0.9,
+          source: "eval"
+        }
+      }]
+    };
+    await claimEvaluatorScoreReceipt(pool, {
+      projectId,
+      scoreId,
+      traceId,
+      requestFingerprint: "c".repeat(64),
+      candidateBatchId: batchId
+    });
+    await markEvaluatorScoreReceiptStaged(pool, { projectId, scoreId, batchId });
+    const job = await storeAndEnqueue(batch);
+
+    await expect(recoverTerminalEvaluatorTraceRefs(
+      { storage, clickhouse, pool },
+      job.data
+    )).resolves.toBe("retry");
+    await processBatch(job);
+    await expect(recoverTerminalEvaluatorTraceRefs(
+      { storage, clickhouse, pool },
+      job.data
+    )).resolves.toBe("quarantine");
     await job.remove();
   });
 

@@ -1,10 +1,10 @@
-import { insertObservations, insertScores, insertTraces, type ClickHouseClient } from "@ironside/clickhouse";
+import type { ClickHouseClient } from "@ironside/clickhouse";
 import {
   claimImportRun,
   getImportCheckpoint,
   markImportRunFailed,
   markImportRunIdle,
-  publishEvaluatorTraceActivities,
+  renewImportRunLease,
   stageEvaluatorImportTraces,
   saveImportProgress
 } from "@ironside/db";
@@ -13,8 +13,11 @@ import type { Pool } from "pg";
 import type { Observation, Score, Trace } from "@ironside/shared";
 import { LangfuseClient, type LangfuseClientConfig, type LangfuseListTrace } from "./langfuse-client.js";
 import { mapLangfuseObservation, mapLangfuseScore, mapLangfuseTraceDetail } from "./langfuse-mapper.js";
-import { observeTraceEnvironments } from "../environments/environment-registry.js";
-import { importedTraceContentHash } from "./evaluator-publication.js";
+import {
+  importedTraceContentHash,
+  importedTraceSnapshot,
+  recoverPendingEvaluatorImportSnapshots
+} from "./evaluator-publication.js";
 
 interface LangfuseCheckpointShape {
   [key: string]: unknown;
@@ -65,6 +68,7 @@ export async function runLangfuseImport(
 
   const claimed = await claimImportRun(pool, projectId, "langfuse", `import_${ulid()}`);
   if (!claimed) return null; // another run is already in progress
+  const runToken = claimed.runToken!;
 
   const existing = await getImportCheckpoint(pool, projectId, "langfuse");
   const checkpoint: LangfuseCheckpointShape = {
@@ -105,7 +109,16 @@ export async function runLangfuseImport(
   let newestSeenTimestamp: string | undefined;
 
   try {
+    await recoverPendingEvaluatorImportSnapshots({
+      pool,
+      clickhouse,
+      projectId,
+      source: "langfuse",
+      runToken,
+      onEnvironmentRegistryOverflow: options.onEnvironmentRegistryOverflow
+    });
     for (let pagesFetched = 0; pagesFetched < maxPages; pagesFetched++) {
+      await renewImportRunLease(pool, projectId, "langfuse", runToken);
       const response = await client.listTraces({
         page: checkpoint.page,
         limit: pageSize,
@@ -126,6 +139,7 @@ export async function runLangfuseImport(
         const observations: Observation[] = [];
         const scores: Score[] = [];
         for (const listTrace of response.data as LangfuseListTrace[]) {
+          await renewImportRunLease(pool, projectId, "langfuse", runToken);
           const detail = await client.getTraceDetail(listTrace.id);
           traces.push(mapLangfuseTraceDetail(projectId, detail));
           for (const obs of detail.observations) {
@@ -136,9 +150,16 @@ export async function runLangfuseImport(
           }
         }
         const candidateActivityAt = new Date().toISOString();
+        const snapshots = new Map(traces.map((trace) => [trace.id, importedTraceSnapshot(
+          trace,
+          observations,
+          scores,
+          candidateActivityAt
+        )]));
         const staged = await stageEvaluatorImportTraces(pool, {
           projectId,
           source: "langfuse",
+          runToken,
           candidateActivityId: `import_langfuse_${ulid()}`,
           candidateActivityAt,
           traces: traces.map((trace) => ({
@@ -146,46 +167,19 @@ export async function runLangfuseImport(
             contentHash: importedTraceContentHash(
               trace,
               observations.filter((observation) => observation.traceId === trace.id)
-            )
+            ),
+            snapshot: snapshots.get(trace.id)!
           }))
         });
-        const byActivity = new Map<string, {
-          traces: typeof traces;
-          observations: typeof observations;
-        }>();
-        for (const trace of traces) {
-          const state = staged.get(trace.id);
-          if (!state) throw new Error(`missing staged Langfuse trace: ${trace.id}`);
-          const group = byActivity.get(state.sourceActivityAt) ?? { traces: [], observations: [] };
-          group.traces.push(trace);
-          group.observations.push(
-            ...observations.filter((observation) => observation.traceId === trace.id)
-          );
-          byActivity.set(state.sourceActivityAt, group);
-        }
-        for (const [eventTs, group] of byActivity) {
-          await Promise.all([
-            insertTraces(clickhouse, group.traces, { eventTs }),
-            insertObservations(clickhouse, group.observations, { eventTs })
-          ]);
-        }
-        await insertScores(clickhouse, scores, { eventTs: candidateActivityAt });
-        await observeTraceEnvironments(
+        if (staged.size !== traces.length) throw new Error("missing staged Langfuse traces");
+        await recoverPendingEvaluatorImportSnapshots({
           pool,
+          clickhouse,
           projectId,
-          traces,
-          options.onEnvironmentRegistryOverflow
-        );
-        for (const trace of traces) {
-          const state = staged.get(trace.id)!;
-          await publishEvaluatorTraceActivities(pool, {
-            projectId,
-            traceIds: [trace.id],
-            sourceActivityAt: state.sourceActivityAt,
-            activityId: state.activityId,
-            importSource: "langfuse"
-          });
-        }
+          source: "langfuse",
+          runToken,
+          onEnvironmentRegistryOverflow: options.onEnvironmentRegistryOverflow
+        });
         pageImported = traces.length;
         totalImported += pageImported;
         // Oldest-first within a page too (orderBy=timestamp.asc server-side),
@@ -211,7 +205,7 @@ export async function runLangfuseImport(
         // spec/langfuse-importer-v1.md's limitations.
         if (newestSeenTimestamp) checkpoint.lastTimestamp = newestSeenTimestamp;
         checkpoint.page = 1;
-        await saveImportProgress(pool, projectId, "langfuse", checkpoint, pageImported);
+        await saveImportProgress(pool, projectId, "langfuse", runToken, checkpoint, pageImported);
         break;
       }
 
@@ -220,18 +214,19 @@ export async function runLangfuseImport(
       // is relative to, so a resume (next call, or crash recovery)
       // continues at exactly this window position.
       checkpoint.page += 1;
-      await saveImportProgress(pool, projectId, "langfuse", checkpoint, pageImported);
+      await saveImportProgress(pool, projectId, "langfuse", runToken, checkpoint, pageImported);
 
       if (pagesFetched === maxPages - 1) resumable = true;
     }
 
-    await markImportRunIdle(pool, projectId, "langfuse");
+    await markImportRunIdle(pool, projectId, "langfuse", runToken);
     return { imported: totalImported, resumable };
   } catch (error) {
     await markImportRunFailed(
       pool,
       projectId,
       "langfuse",
+      runToken,
       error instanceof Error ? error.message : String(error)
     );
     throw error;

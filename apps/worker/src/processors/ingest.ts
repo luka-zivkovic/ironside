@@ -8,7 +8,9 @@ import {
 } from "@ironside/clickhouse";
 import {
   getRawRetentionIntent,
+  hasUnmaterializedEvaluatorScoreReceiptBatch,
   listEvaluatorPublishedTraceIdsForActivity,
+  markEvaluatorScoreReceiptMaterialized,
   publishEvaluatorTraceActivities,
   recordIngestFailures,
   withRawRetentionObjectLock,
@@ -81,6 +83,12 @@ export async function recoverTerminalEvaluatorTraceRefs(
 ): Promise<"quarantine" | "retry"> {
   if (await settlePublishedEvaluatorTraceRefs(deps, message) > 0) {
     return "quarantine";
+  }
+  if (await hasUnmaterializedEvaluatorScoreReceiptBatch(deps.pool, {
+    projectId: message.projectId,
+    batchId: message.batchId
+  })) {
+    return "retry";
   }
   return await hasPendingRawObjectRefs(
     deps.clickhouse,
@@ -227,6 +235,14 @@ export function createIngestProcessor(deps: IngestProcessorDeps) {
       insertObservations(deps.clickhouse, observations, insertOptions),
       insertScores(deps.clickhouse, scores, insertOptions)
     ]);
+    // Evaluator score receipts suppress later HTTP retries only after the
+    // durable ingest intent exists. Record the second commit point once its
+    // ClickHouse score row is actually present; terminal recovery keeps an
+    // unmaterialized staged batch retryable.
+    await markEvaluatorScoreReceiptMaterialized(deps.pool, {
+      projectId,
+      batchId: batch.batchId
+    });
 
     // Discovery is derived, but it is part of this job's durable materialize
     // step: a failure retries the idempotent ClickHouse writes rather than

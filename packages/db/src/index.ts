@@ -23,6 +23,7 @@ export {
 export {
   getImportCheckpoint,
   claimImportRun,
+  renewImportRunLease,
   saveImportProgress,
   markImportRunIdle,
   markImportRunFailed,
@@ -147,10 +148,14 @@ export {
 } from "./projects.js";
 export {
   stageEvaluatorImportTraces,
+  claimPendingEvaluatorImportSnapshots,
+  listEvaluatorImportRecoveryCandidates,
   listPendingEvaluatorImportTraceIds,
   publishEvaluatorTraceActivities,
   claimEvaluatorScoreReceipt,
   markEvaluatorScoreReceiptStaged,
+  markEvaluatorScoreReceiptMaterialized,
+  hasUnmaterializedEvaluatorScoreReceiptBatch,
   EvaluatorScoreIdempotencyConflictError,
   listEvaluatorTraceActivities,
   getEvaluatorTracePublications,
@@ -161,6 +166,8 @@ export {
   type EvaluatorTraceFeedCursor,
   type EvaluatorImportSource,
   type EvaluatorImportTraceState,
+  type EvaluatorImportTraceSnapshot,
+  type EvaluatorPendingImportSnapshot,
   type EvaluatorTracePublication
 } from "./evaluator-trace-feed.js";
 export {

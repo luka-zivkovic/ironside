@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { identifierSchema } from "./domain.js";
 import { machineCapabilitySchema } from "./management.js";
 import { traceTreeResponseSchema } from "./query.js";
 
@@ -19,7 +20,7 @@ export const evaluatorContextResponseSchema = z.object({
 export type EvaluatorContextResponse = z.infer<typeof evaluatorContextResponseSchema>;
 
 export const evaluatorTraceSummarySchema = z.object({
-  traceId: z.string().trim().min(1),
+  traceId: identifierSchema,
   traceVersion: z.iso.datetime({ offset: true }),
   timestamp: z.iso.datetime({ offset: true }),
   name: z.string().nullable(),
@@ -45,8 +46,8 @@ export const evaluatorTraceResponseSchema = traceTreeResponseSchema.extend({
 export type EvaluatorTraceResponse = z.infer<typeof evaluatorTraceResponseSchema>;
 
 export const evaluatorScoreInputSchema = z.object({
-  id: z.string().trim().min(1),
-  traceId: z.string().trim().min(1),
+  id: identifierSchema,
+  traceId: identifierSchema,
   name: z.string().min(1),
   value: z.number(),
   assessmentLabel: z.string().min(1).max(100),

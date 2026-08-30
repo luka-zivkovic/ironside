@@ -15,6 +15,7 @@ import { runExport } from "./exporters/export-runner.js";
 import { forwardOtlpTraces } from "./forwarders/otlp-forwarder.js";
 import { runLangfuseImport } from "./importers/langfuse-importer.js";
 import { runLangsmithImport } from "./importers/langsmith-importer.js";
+import { recoverAbandonedEvaluatorImports } from "./importers/evaluator-publication.js";
 import { runRetention } from "./retention/retention-runner.js";
 import { runWebhooks } from "./webhooks/webhook-runner.js";
 import { runEnvironmentRegistryRebuildChunk } from "./environments/environment-registry.js";
@@ -163,6 +164,14 @@ export function startScheduler(options: SchedulerOptions): Scheduler {
   // a failure for the narrow window BEFORE the importer's own try block
   // ever starts: decrypting/parsing the stored credentials blob.
   async function tickImports(): Promise<void> {
+    await recoverAbandonedEvaluatorImports({
+      pool: options.pool,
+      clickhouse: options.clickhouse,
+      limit: claimBatchSize,
+      onEnvironmentRegistryOverflow: (count) =>
+        options.onEnvironmentRegistryOverflow?.("live", count),
+      onError: (_projectId, _source, error) => onError("import-recovery", error)
+    });
     const due = await claimDueImportSources(options.pool, claimBatchSize);
     for (const source of due) {
       try {

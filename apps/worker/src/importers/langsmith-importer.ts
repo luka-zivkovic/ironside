@@ -1,10 +1,10 @@
-import { insertObservations, insertScores, insertTraces, type ClickHouseClient } from "@ironside/clickhouse";
+import type { ClickHouseClient } from "@ironside/clickhouse";
 import {
   claimImportRun,
   getImportCheckpoint,
   markImportRunFailed,
   markImportRunIdle,
-  publishEvaluatorTraceActivities,
+  renewImportRunLease,
   stageEvaluatorImportTraces,
   saveImportProgress
 } from "@ironside/db";
@@ -13,7 +13,11 @@ import type { Pool } from "pg";
 import type { Observation, Score, Trace } from "@ironside/shared";
 import { LangsmithClient, type LangsmithClientConfig, type LangsmithRun } from "./langsmith-client.js";
 import { mapLangsmithFeedback, mapLangsmithObservation, mapLangsmithRun } from "./langsmith-mapper.js";
-import { importedTraceContentHash } from "./evaluator-publication.js";
+import {
+  importedTraceContentHash,
+  importedTraceSnapshot,
+  recoverPendingEvaluatorImportSnapshots
+} from "./evaluator-publication.js";
 
 interface LangsmithCheckpointShape {
   [key: string]: unknown;
@@ -69,6 +73,7 @@ export async function runLangsmithImport(
 
   const claimed = await claimImportRun(pool, projectId, "langsmith", `import_${ulid()}`);
   if (!claimed) return null; // another run is already in progress
+  const runToken = claimed.runToken!;
 
   const existing = await getImportCheckpoint(pool, projectId, "langsmith");
   const checkpoint: LangsmithCheckpointShape = {
@@ -80,7 +85,15 @@ export async function runLangsmithImport(
   let resumable = false;
 
   try {
+    await recoverPendingEvaluatorImportSnapshots({
+      pool,
+      clickhouse,
+      projectId,
+      source: "langsmith",
+      runToken
+    });
     for (let pagesFetched = 0; pagesFetched < maxPages; pagesFetched++) {
+      await renewImportRunLease(pool, projectId, "langsmith", runToken);
       const response = await client.queryRuns({
         sessionIds: options.sessionIds,
         limit: pageSize,
@@ -103,6 +116,7 @@ export async function runLangsmithImport(
         const observations: Observation[] = [];
         const scores: Score[] = [];
         for (const rootRun of response.runs as LangsmithRun[]) {
+          await renewImportRunLease(pool, projectId, "langsmith", runToken);
           const traceId = rootRun.trace_id ?? rootRun.id;
           const treeRuns = await client.getTraceRuns(traceId);
           // The trace-scoped query returns the root run again — dedup by
@@ -126,9 +140,16 @@ export async function runLangsmithImport(
           }
         }
         const candidateActivityAt = new Date().toISOString();
+        const snapshots = new Map(traces.map((trace) => [trace.id, importedTraceSnapshot(
+          trace,
+          observations,
+          scores,
+          candidateActivityAt
+        )]));
         const staged = await stageEvaluatorImportTraces(pool, {
           projectId,
           source: "langsmith",
+          runToken,
           candidateActivityId: `import_langsmith_${ulid()}`,
           candidateActivityAt,
           traces: traces.map((trace) => ({
@@ -136,40 +157,18 @@ export async function runLangsmithImport(
             contentHash: importedTraceContentHash(
               trace,
               observations.filter((observation) => observation.traceId === trace.id)
-            )
+            ),
+            snapshot: snapshots.get(trace.id)!
           }))
         });
-        const byActivity = new Map<string, {
-          traces: typeof traces;
-          observations: typeof observations;
-        }>();
-        for (const trace of traces) {
-          const state = staged.get(trace.id);
-          if (!state) throw new Error(`missing staged LangSmith trace: ${trace.id}`);
-          const group = byActivity.get(state.sourceActivityAt) ?? { traces: [], observations: [] };
-          group.traces.push(trace);
-          group.observations.push(
-            ...observations.filter((observation) => observation.traceId === trace.id)
-          );
-          byActivity.set(state.sourceActivityAt, group);
-        }
-        for (const [eventTs, group] of byActivity) {
-          await Promise.all([
-            insertTraces(clickhouse, group.traces, { eventTs }),
-            insertObservations(clickhouse, group.observations, { eventTs })
-          ]);
-        }
-        await insertScores(clickhouse, scores, { eventTs: candidateActivityAt });
-        for (const trace of traces) {
-          const state = staged.get(trace.id)!;
-          await publishEvaluatorTraceActivities(pool, {
-            projectId,
-            traceIds: [trace.id],
-            sourceActivityAt: state.sourceActivityAt,
-            activityId: state.activityId,
-            importSource: "langsmith"
-          });
-        }
+        if (staged.size !== traces.length) throw new Error("missing staged LangSmith traces");
+        await recoverPendingEvaluatorImportSnapshots({
+          pool,
+          clickhouse,
+          projectId,
+          source: "langsmith",
+          runToken
+        });
         pageImported = traces.length;
         totalImported += pageImported;
         // order: "asc" server-side, so the last element is the newest
@@ -185,23 +184,24 @@ export async function runLangsmithImport(
         // a fresh window from lastStartTime forward, rather than resending
         // a stale/expired cursor from a completed window.
         delete checkpoint.cursor;
-        await saveImportProgress(pool, projectId, "langsmith", checkpoint, pageImported);
+        await saveImportProgress(pool, projectId, "langsmith", runToken, checkpoint, pageImported);
         break;
       }
 
       checkpoint.cursor = nextCursor;
-      await saveImportProgress(pool, projectId, "langsmith", checkpoint, pageImported);
+      await saveImportProgress(pool, projectId, "langsmith", runToken, checkpoint, pageImported);
 
       if (pagesFetched === maxPages - 1) resumable = true;
     }
 
-    await markImportRunIdle(pool, projectId, "langsmith");
+    await markImportRunIdle(pool, projectId, "langsmith", runToken);
     return { imported: totalImported, resumable };
   } catch (error) {
     await markImportRunFailed(
       pool,
       projectId,
       "langsmith",
+      runToken,
       error instanceof Error ? error.message : String(error)
     );
     throw error;

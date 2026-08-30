@@ -1,3 +1,4 @@
+import type { Observation, Score, Trace } from "@ironside/shared";
 import type { Pool } from "pg";
 
 export interface EvaluatorTraceActivity {
@@ -14,10 +15,22 @@ export interface EvaluatorTraceFeedCursor {
 
 export type EvaluatorImportSource = "langfuse" | "langsmith";
 
+export interface EvaluatorImportTraceSnapshot {
+  trace: Trace;
+  observations: Observation[];
+  scores: Score[];
+  scoreActivityAt: string;
+}
+
 export interface EvaluatorImportTraceState {
   traceId: string;
   activityId: string;
   sourceActivityAt: string;
+}
+
+export interface EvaluatorPendingImportSnapshot extends EvaluatorImportTraceState {
+  source: EvaluatorImportSource;
+  snapshot: EvaluatorImportTraceSnapshot;
 }
 
 /**
@@ -30,9 +43,14 @@ export async function stageEvaluatorImportTraces(
   input: {
     projectId: string;
     source: EvaluatorImportSource;
+    runToken: string;
     candidateActivityId: string;
     candidateActivityAt: string;
-    traces: { traceId: string; contentHash: string }[];
+    traces: {
+      traceId: string;
+      contentHash: string;
+      snapshot: EvaluatorImportTraceSnapshot;
+    }[];
   }
 ): Promise<Map<string, EvaluatorImportTraceState>> {
   const traces = [...new Map(input.traces.map((trace) => [trace.traceId, trace])).values()];
@@ -42,12 +60,23 @@ export async function stageEvaluatorImportTraces(
     activity_id: string;
     source_activity_at: Date;
   }>(
-    `insert into evaluator_import_trace_state
+    `with active_run as (
+       select 1
+         from import_checkpoints
+        where project_id = $1 and source = $2 and status = 'running'
+          and run_token = $3 and lease_expires_at > clock_timestamp()
+     ), input as (
+       select item ->> 'traceId' as trace_id,
+              item ->> 'contentHash' as content_hash,
+              item -> 'snapshot' as snapshot
+         from jsonb_array_elements($6::jsonb) as item
+     )
+     insert into evaluator_import_trace_state
        (project_id, trace_id, source, content_hash, activity_id,
-        source_activity_at, pending)
-     select $1, trace_id, $2, content_hash, $3,
-            date_trunc('milliseconds', $4::timestamptz), true
-     from unnest($5::text[], $6::text[]) as input(trace_id, content_hash)
+        source_activity_at, snapshot, run_token, pending)
+     select $1, trace_id, $2, content_hash, $4,
+            date_trunc('milliseconds', $5::timestamptz), snapshot, $3, true
+       from input cross join active_run
      on conflict (project_id, trace_id, source) do update
        set content_hash = excluded.content_hash,
            activity_id = case
@@ -63,23 +92,108 @@ export async function stageEvaluatorImportTraces(
                evaluator_import_trace_state.source_activity_at + interval '1 millisecond'
              )
            end,
+           snapshot = case
+             when evaluator_import_trace_state.content_hash = excluded.content_hash
+               and evaluator_import_trace_state.pending
+               then evaluator_import_trace_state.snapshot
+             else excluded.snapshot
+           end,
+           run_token = excluded.run_token,
            pending = true,
            staged_at = clock_timestamp()
      returning trace_id, activity_id, source_activity_at`,
     [
       input.projectId,
       input.source,
+      input.runToken,
       input.candidateActivityId,
       input.candidateActivityAt,
-      traces.map((trace) => trace.traceId),
-      traces.map((trace) => trace.contentHash)
+      JSON.stringify(traces)
     ]
   );
+  if (result.rows.length !== traces.length) throw new Error("import run lease was lost");
   return new Map(result.rows.map((row) => [row.trace_id, {
     traceId: row.trace_id,
     activityId: row.activity_id,
     sourceActivityAt: row.source_activity_at.toISOString()
   }]));
+}
+
+export async function claimPendingEvaluatorImportSnapshots(
+  pool: Pool,
+  input: {
+    projectId: string;
+    source: EvaluatorImportSource;
+    runToken: string;
+  }
+): Promise<EvaluatorPendingImportSnapshot[]> {
+  const result = await pool.query<{
+    active: boolean;
+    snapshots: Array<{
+      trace_id: string;
+      activity_id: string;
+      source_activity_at: string;
+      snapshot: EvaluatorImportTraceSnapshot;
+    }> | null;
+  }>(
+    `with active_run as (
+       select 1
+         from import_checkpoints
+        where project_id = $1 and source = $2 and status = 'running'
+          and run_token = $3 and lease_expires_at > clock_timestamp()
+     ), claimed as (
+       update evaluator_import_trace_state as state
+          set run_token = $3, staged_at = clock_timestamp()
+         from active_run
+        where state.project_id = $1 and state.source = $2 and state.pending
+       returning state.trace_id, state.activity_id,
+                 to_char(
+                   state.source_activity_at at time zone 'UTC',
+                   'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+                 ) as source_activity_at,
+                 state.snapshot
+     )
+     select exists(select 1 from active_run) as active,
+            coalesce(jsonb_agg(claimed order by trace_id), '[]'::jsonb) as snapshots
+       from claimed`,
+    [input.projectId, input.source, input.runToken]
+  );
+  const row = result.rows[0]!;
+  if (!row.active) throw new Error("import run lease was lost");
+  return (row.snapshots ?? []).map((entry) => ({
+    traceId: entry.trace_id,
+    activityId: entry.activity_id,
+    sourceActivityAt: entry.source_activity_at,
+    source: input.source,
+    snapshot: entry.snapshot
+  }));
+}
+
+export async function listEvaluatorImportRecoveryCandidates(
+  pool: Pool,
+  limit: number
+): Promise<Array<{ projectId: string; source: EvaluatorImportSource }>> {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 1_000) {
+    throw new Error("evaluator import recovery limit must be between 1 and 1000");
+  }
+  const result = await pool.query<{ project_id: string; source: EvaluatorImportSource }>(
+    `select state.project_id, state.source
+       from evaluator_import_trace_state state
+       join import_checkpoints checkpoint
+         on checkpoint.project_id = state.project_id
+        and checkpoint.source = state.source
+      where state.pending
+        and (
+          checkpoint.status != 'running'
+          or checkpoint.lease_expires_at is null
+          or checkpoint.lease_expires_at <= clock_timestamp()
+        )
+      group by state.project_id, state.source
+      order by state.project_id, state.source
+      limit $1`,
+    [limit]
+  );
+  return result.rows.map((row) => ({ projectId: row.project_id, source: row.source }));
 }
 
 export async function listPendingEvaluatorImportTraceIds(
@@ -114,13 +228,14 @@ export async function claimEvaluatorScoreReceipt(
     requestFingerprint: string;
     candidateBatchId: string;
   }
-): Promise<{ timestamp: string; batchId: string; staged: boolean }> {
+): Promise<{ timestamp: string; batchId: string; staged: boolean; materialized: boolean }> {
   const result = await pool.query<{
     trace_id: string;
     request_fingerprint: string;
     score_timestamp: Date;
     ingest_batch_id: string;
     ingest_staged_at: Date | null;
+    ingest_materialized_at: Date | null;
   }>(
     `insert into evaluator_score_receipts
        (project_id, score_id, trace_id, request_fingerprint, ingest_batch_id)
@@ -131,7 +246,7 @@ export async function claimEvaluatorScoreReceipt(
          excluded.ingest_batch_id
        )
      returning trace_id, request_fingerprint, score_timestamp,
-               ingest_batch_id, ingest_staged_at`,
+               ingest_batch_id, ingest_staged_at, ingest_materialized_at`,
     [
       input.projectId,
       input.scoreId,
@@ -150,8 +265,41 @@ export async function claimEvaluatorScoreReceipt(
   return {
     timestamp: receipt.score_timestamp.toISOString(),
     batchId: receipt.ingest_batch_id,
-    staged: receipt.ingest_staged_at !== null
+    staged: receipt.ingest_staged_at !== null,
+    materialized: receipt.ingest_materialized_at !== null
   };
+}
+
+export async function markEvaluatorScoreReceiptMaterialized(
+  pool: Pool,
+  input: { projectId: string; batchId: string }
+): Promise<boolean> {
+  const result = await pool.query(
+    `update evaluator_score_receipts
+        set ingest_materialized_at = coalesce(
+          ingest_materialized_at,
+          clock_timestamp()
+        )
+      where project_id = $1 and ingest_batch_id = $2
+        and ingest_staged_at is not null`,
+    [input.projectId, input.batchId]
+  );
+  return result.rowCount === 1;
+}
+
+export async function hasUnmaterializedEvaluatorScoreReceiptBatch(
+  pool: Pool,
+  input: { projectId: string; batchId: string }
+): Promise<boolean> {
+  const result = await pool.query(
+    `select 1
+       from evaluator_score_receipts
+      where project_id = $1 and ingest_batch_id = $2
+        and ingest_staged_at is not null
+        and ingest_materialized_at is null`,
+    [input.projectId, input.batchId]
+  );
+  return result.rowCount === 1;
 }
 
 export async function markEvaluatorScoreReceiptStaged(
@@ -184,6 +332,7 @@ export async function publishEvaluatorTraceActivities(
     sourceActivityAt: string;
     activityId: string;
     importSource?: EvaluatorImportSource;
+    importRunToken?: string;
   }
 ): Promise<void> {
   const traceIds = [...new Set(input.traceIds)].filter((traceId) => traceId.length > 0);
@@ -200,6 +349,9 @@ export async function publishEvaluatorTraceActivities(
       [input.projectId]
     );
     if (input.importSource) {
+      if (!input.importRunToken) {
+        throw new Error("imported evaluator publication requires a run token");
+      }
       if (traceIds.length !== 1) {
         throw new Error("imported evaluator publication requires exactly one trace");
       }
@@ -209,14 +361,22 @@ export async function publishEvaluatorTraceActivities(
           where project_id = $1 and trace_id = $2 and source = $3
             and activity_id = $4
             and source_activity_at = $5::timestamptz
+            and run_token = $6
             and pending
+            and exists (
+              select 1
+                from import_checkpoints
+               where project_id = $1 and source = $3 and status = 'running'
+                 and run_token = $6 and lease_expires_at > clock_timestamp()
+            )
           returning 1`,
         [
           input.projectId,
           traceIds[0],
           input.importSource,
           input.activityId,
-          input.sourceActivityAt
+          input.sourceActivityAt,
+          input.importRunToken
         ]
       );
       if (claimed.rowCount !== 1) {

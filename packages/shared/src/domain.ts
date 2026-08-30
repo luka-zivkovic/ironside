@@ -10,7 +10,16 @@ import { environmentNameSchema } from "./environment.js";
 
 /** ISO 8601 timestamp with optional offset. */
 const timestampSchema = z.iso.datetime({ offset: true });
-const identifierSchema = z.string().trim().min(1);
+const utf8 = new TextEncoder();
+export const identifierSchema = z.string()
+  .trim()
+  .min(1)
+  .max(512)
+  .refine((value) => !value.includes("\0"), "identifier must not contain NUL")
+  .refine(
+    (value) => utf8.encode(value).byteLength <= 512,
+    "identifier must not exceed 512 UTF-8 bytes"
+  );
 
 /** Arbitrary key/value metadata, values stringified. */
 export const metadataSchema = z.record(z.string(), z.string());

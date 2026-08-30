@@ -361,10 +361,13 @@ describe("runLangsmithImport", () => {
     fixtureRuns = [{ id: `run_${ulid()}`, start_time: "2026-07-12T03:00:00.000Z", name: "x" }];
 
     await pool.query(
-      `insert into import_checkpoints (id, project_id, source, status)
-       values ($1, $2, 'langsmith', 'running')
-       on conflict (project_id, source) do update set status = 'running'`,
-      [`import_${ulid()}`, projectId]
+      `insert into import_checkpoints
+         (id, project_id, source, status, run_token, lease_expires_at)
+       values ($1, $2, 'langsmith', 'running', $3, clock_timestamp() + interval '5 minutes')
+       on conflict (project_id, source) do update
+         set status = 'running', run_token = excluded.run_token,
+             lease_expires_at = excluded.lease_expires_at`,
+      [`import_${ulid()}`, projectId, `run_${ulid()}`]
     );
 
     const result = await runLangsmithImport({

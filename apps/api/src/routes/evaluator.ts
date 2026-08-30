@@ -278,9 +278,18 @@ export function evaluatorReadRoutes(deps: EvaluatorReadDeps): Hono<AuthEnv> {
         continue;
       }
       if (current.trace_version !== activity.sourceActivityAt) {
-        // ClickHouse became visible just before the worker advanced the
-        // durable feed row. Do not pass it; the idempotent retry/upsert will
-        // move this same trace forward and the next request can continue.
+        if (current.trace_version < activity.sourceActivityAt) {
+          // Row-level retention can remove the row that supplied the prior
+          // maximum activity while leaving an older trace snapshot behind.
+          // That regression cannot become visible again, so advance past the
+          // stale publication exactly like a fully retained-away trace.
+          consumed += 1;
+          next = { v: 1, kind: "live", publishedAt: activity.publishedAt, traceId: activity.traceId };
+          continue;
+        }
+        // A strictly newer ClickHouse snapshot became visible just before
+        // the worker advanced the durable feed row. Do not pass it; the
+        // idempotent retry/upsert will move this trace forward.
         blocked = true;
         break;
       }
@@ -381,7 +390,7 @@ function canonicalizeJson(value: unknown): unknown {
   if (value && typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
-        .sort(([a], [b]) => a.localeCompare(b))
+        .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
         .map(([key, entry]) => [key, canonicalizeJson(entry)])
     );
   }

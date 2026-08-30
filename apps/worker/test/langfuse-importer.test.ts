@@ -1,15 +1,21 @@
 import { createServer, type Server } from "node:http";
 import { createClickHouseClient, runMigrations as runChMigrations } from "@ironside/clickhouse";
 import {
+  claimImportRun,
   getEvaluatorTracePublications,
   getImportCheckpoint,
   listPendingEvaluatorImportTraceIds,
-  runMigrations as runPgMigrations
+  runMigrations as runPgMigrations,
+  stageEvaluatorImportTraces
 } from "@ironside/db";
 import { Pool } from "pg";
 import { ulid } from "ulid";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { runLangfuseImport } from "../src/importers/langfuse-importer.js";
+import {
+  importedTraceContentHash,
+  recoverAbandonedEvaluatorImports
+} from "../src/importers/evaluator-publication.js";
 import { loadConfig } from "../src/config.js";
 
 // Integration test against a real Postgres + ClickHouse (compose stack)
@@ -391,6 +397,84 @@ describe("runLangfuseImport", () => {
     expect(((await traceRows.json()) as { environment: string }[])[0]?.environment).toBe("production");
   });
 
+  it("tombstones observations omitted by a later full snapshot", async () => {
+    const traceId = `trace_${ulid()}`;
+    const retainedId = `obs_${ulid()}`;
+    const removedId = `obs_${ulid()}`;
+    const trace = { id: traceId, timestamp: "2026-07-12T05:30:00.000Z", name: "changing" };
+    fixtureTraces = [trace];
+    const observation = (id: string) => ({
+      id,
+      traceId,
+      type: "SPAN",
+      startTime: "2026-07-12T05:30:00.000Z",
+      level: "DEFAULT"
+    });
+    fixtureDetails = {
+      [traceId]: { observations: [observation(retainedId), observation(removedId)] }
+    };
+    await runLangfuseImport({ pool, clickhouse, projectId, client: clientConfig(), pageSize: 10 });
+
+    fixtureDetails = { [traceId]: { observations: [observation(retainedId)] } };
+    await runLangfuseImport({ pool, clickhouse, projectId, client: clientConfig(), pageSize: 10 });
+
+    const rows = await clickhouse.query({
+      query: `select id from observations final
+               where project_id = {projectId:String} and trace_id = {traceId:String}
+               order by id`,
+      query_params: { projectId, traceId },
+      format: "JSONEachRow"
+    });
+    expect(await rows.json()).toEqual([{ id: retainedId }]);
+  });
+
+  it("recovers a durable staged snapshot after its import lease expires", async () => {
+    const traceId = `trace_${ulid()}`;
+    const runToken = `import_crashed_${ulid()}`;
+    await claimImportRun(pool, projectId, "langfuse", runToken);
+    const trace = {
+      id: traceId,
+      projectId,
+      timestamp: "2026-07-12T05:45:00.000Z",
+      name: "crash-recovery",
+      tags: [],
+      metadata: {}
+    };
+    await stageEvaluatorImportTraces(pool, {
+      projectId,
+      source: "langfuse",
+      runToken,
+      candidateActivityId: `import_${ulid()}`,
+      candidateActivityAt: "2026-08-30T12:00:00.000Z",
+      traces: [{
+        traceId,
+        contentHash: importedTraceContentHash(trace, []),
+        snapshot: {
+          trace,
+          observations: [],
+          scores: [],
+          scoreActivityAt: "2026-08-30T12:00:00.000Z"
+        }
+      }]
+    });
+    await pool.query(
+      `update import_checkpoints
+          set lease_expires_at = clock_timestamp() - interval '1 second'
+        where project_id = $1 and source = 'langfuse'`,
+      [projectId]
+    );
+
+    await expect(recoverAbandonedEvaluatorImports({
+      pool,
+      clickhouse,
+      limit: 10
+    })).resolves.toBe(1);
+    expect((await listPendingEvaluatorImportTraceIds(pool, projectId, [traceId])).has(traceId))
+      .toBe(false);
+    expect((await getEvaluatorTracePublications(pool, projectId, [traceId])).has(traceId))
+      .toBe(true);
+  });
+
   it("a failed detail fetch fails the run without advancing the checkpoint past that page", async () => {
     // Two traces on one page; the second's detail endpoint returns 500.
     // The run must fail (not silently import a partial page), and the
@@ -426,10 +510,13 @@ describe("runLangfuseImport", () => {
     // Manually put the checkpoint into a running state to simulate an
     // in-flight run without actually holding one open concurrently.
     await pool.query(
-      `insert into import_checkpoints (id, project_id, source, status)
-       values ($1, $2, 'langfuse', 'running')
-       on conflict (project_id, source) do update set status = 'running'`,
-      [`import_${ulid()}`, projectId]
+      `insert into import_checkpoints
+         (id, project_id, source, status, run_token, lease_expires_at)
+       values ($1, $2, 'langfuse', 'running', $3, clock_timestamp() + interval '5 minutes')
+       on conflict (project_id, source) do update
+         set status = 'running', run_token = excluded.run_token,
+             lease_expires_at = excluded.lease_expires_at`,
+      [`import_${ulid()}`, projectId, `run_${ulid()}`]
     );
 
     const result = await runLangfuseImport({
