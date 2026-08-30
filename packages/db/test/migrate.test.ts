@@ -42,7 +42,9 @@ describe("runMigrations (postgres)", () => {
       "raw_retention_intents"
     ]);
 
-    const applied = await pool.query("select id, checksum from ironside_migrations order by id");
+    const applied = await pool.query(
+      `select id, checksum from ironside_migrations order by id collate "C"`
+    );
     expect(applied.rows).toEqual([
       {
         id: "0001_baseline",

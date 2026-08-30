@@ -167,7 +167,10 @@ describe("ingest processor", () => {
           idempotencyKey: "hash-1",
           body: {
             id: traceId,
-            timestamp: "2026-07-12T00:00:00.000Z",
+            // Keep this integration fixture inside every concurrent retention
+            // window. A fixed historical timestamp eventually becomes a
+            // legitimate deletion target for another test file.
+            timestamp: new Date().toISOString(),
             name: "checkout",
             environment: "production",
             metadata: { plan: "pro" }
