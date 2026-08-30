@@ -20,13 +20,13 @@ export interface EvaluatorImportTraceSnapshot {
   trace: Trace;
   observations: Observation[];
   scores: Score[];
-  scoreActivityAt: string;
 }
 
 export interface EvaluatorImportTraceState {
   traceId: string;
   activityId: string;
   sourceActivityAt: string;
+  publishRequired: boolean;
 }
 
 export interface EvaluatorPendingImportSnapshot extends EvaluatorImportTraceState {
@@ -72,7 +72,27 @@ export async function recordEvaluatorImportRetentionCutoffs(
              evaluator_import_retention_cutoffs.trace_timestamp_before,
              excluded.trace_timestamp_before
            ),
-           updated_at = clock_timestamp()`,
+           updated_at = clock_timestamp()
+     where evaluator_import_retention_cutoffs.trace_timestamp_before
+           < excluded.trace_timestamp_before`,
+    [JSON.stringify(unique)]
+  );
+}
+
+export async function ensureEvaluatorImportRetentionCutoffs(
+  pool: Pool,
+  entries: Array<{ projectId: string; traceTimestampBefore: string }>
+): Promise<void> {
+  const unique = [...new Map(entries.map((entry) => [entry.projectId, entry])).values()];
+  if (unique.length === 0) return;
+  await pool.query(
+    `insert into evaluator_import_retention_cutoffs
+       (project_id, trace_timestamp_before)
+     select item ->> 'projectId',
+            (item ->> 'traceTimestampBefore')::timestamptz
+       from jsonb_array_elements($1::jsonb) as item
+       join projects on projects.id = (item ->> 'projectId')
+     on conflict (project_id) do nothing`,
     [JSON.stringify(unique)]
   );
 }
@@ -106,6 +126,7 @@ export async function stageEvaluatorImportTraces(
     traces: {
       traceId: string;
       contentHash: string;
+      evaluatorContentHash: string;
       snapshot: EvaluatorImportTraceSnapshot;
     }[];
   }
@@ -119,6 +140,7 @@ export async function stageEvaluatorImportTraces(
     trace_id: string;
     activity_id: string;
     source_activity_at: Date;
+    publish_required: boolean;
   }>(
     `with active_run as (
        select 1
@@ -128,17 +150,20 @@ export async function stageEvaluatorImportTraces(
      ), input as (
        select item ->> 'traceId' as trace_id,
               item ->> 'contentHash' as content_hash,
+              item ->> 'evaluatorContentHash' as evaluator_content_hash,
               item -> 'snapshot' as snapshot
          from jsonb_array_elements($6::jsonb) as item
      )
      insert into evaluator_import_trace_state
-       (project_id, trace_id, source, content_hash, activity_id,
-        source_activity_at, snapshot, run_token, pending)
-     select $1, trace_id, $2, content_hash, $4,
-            date_trunc('milliseconds', $5::timestamptz), snapshot, $3, true
+       (project_id, trace_id, source, content_hash, evaluator_content_hash,
+        activity_id, source_activity_at, snapshot, run_token, pending,
+        publish_required)
+     select $1, trace_id, $2, content_hash, evaluator_content_hash, $4,
+            date_trunc('milliseconds', $5::timestamptz), snapshot, $3, true, true
        from input cross join active_run
      on conflict (project_id, trace_id, source) do update
        set content_hash = excluded.content_hash,
+           evaluator_content_hash = excluded.evaluator_content_hash,
            activity_id = case
              when evaluator_import_trace_state.content_hash = excluded.content_hash
                then evaluator_import_trace_state.activity_id
@@ -169,8 +194,14 @@ export async function stageEvaluatorImportTraces(
                then false
              else true
            end,
+           publish_required = case
+             when evaluator_import_trace_state.content_hash = excluded.content_hash
+               then evaluator_import_trace_state.publish_required
+             else evaluator_import_trace_state.evaluator_content_hash
+                  is distinct from excluded.evaluator_content_hash
+           end,
            staged_at = clock_timestamp()
-     returning trace_id, activity_id, source_activity_at`,
+     returning trace_id, activity_id, source_activity_at, publish_required`,
     [
       input.projectId,
       input.source,
@@ -184,7 +215,8 @@ export async function stageEvaluatorImportTraces(
   return new Map(result.rows.map((row) => [row.trace_id, {
     traceId: row.trace_id,
     activityId: row.activity_id,
-    sourceActivityAt: row.source_activity_at.toISOString()
+    sourceActivityAt: row.source_activity_at.toISOString(),
+    publishRequired: row.publish_required
   }]));
 }
 
@@ -202,6 +234,7 @@ export async function claimPendingEvaluatorImportSnapshots(
       trace_id: string;
       activity_id: string;
       source_activity_at: string;
+      publish_required: boolean;
       snapshot: unknown;
     }> | null;
   }>(
@@ -220,6 +253,7 @@ export async function claimPendingEvaluatorImportSnapshots(
                    state.source_activity_at at time zone 'UTC',
                    'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
                  ) as source_activity_at,
+                 state.publish_required,
                  state.snapshot
      )
      select exists(select 1 from active_run) as active,
@@ -233,6 +267,7 @@ export async function claimPendingEvaluatorImportSnapshots(
     traceId: entry.trace_id,
     activityId: entry.activity_id,
     sourceActivityAt: entry.source_activity_at,
+    publishRequired: entry.publish_required,
     source: input.source,
     snapshot: decodeEvaluatorImportSnapshot(entry.snapshot)
   }));
@@ -253,7 +288,8 @@ export async function discardPendingEvaluatorImportSnapshot(
     `update evaluator_import_trace_state
         set pending = false,
             snapshot = null,
-            run_token = null
+            run_token = null,
+            publish_required = false
       where project_id = $1 and source = $2 and trace_id = $3
         and activity_id = $4 and source_activity_at = $5::timestamptz
         and run_token = $6 and pending
@@ -294,6 +330,7 @@ export async function listLegacyPendingEvaluatorImports(
     traceId: row.trace_id,
     activityId: row.activity_id,
     sourceActivityAt: row.source_activity_at.toISOString(),
+    publishRequired: true,
     source: input.source
   }));
 }
@@ -523,7 +560,7 @@ export async function publishEvaluatorTraceActivities(
       if (traceIds.length !== 1) {
         throw new Error("imported evaluator publication requires exactly one trace");
       }
-      const claimed = await client.query(
+      const claimed = await client.query<{ publish_required: boolean }>(
         `update evaluator_import_trace_state
             set pending = false,
                 snapshot = null,
@@ -545,7 +582,7 @@ export async function publishEvaluatorTraceActivities(
                where project_id = $1 and source = $3 and status = 'running'
                  and run_token = $6 and lease_expires_at > clock_timestamp()
             )
-          returning 1`,
+          returning publish_required`,
         [
           input.projectId,
           traceIds[0],
@@ -558,6 +595,24 @@ export async function publishEvaluatorTraceActivities(
       );
       if (claimed.rowCount !== 1) {
         throw new Error("stale imported evaluator materialization");
+      }
+      const publishRequired = claimed.rows[0]!.publish_required;
+      await client.query(
+        `update evaluator_import_trace_state
+            set publish_required = false
+          where project_id = $1 and trace_id = $2 and source = $3
+            and activity_id = $4 and source_activity_at = $5::timestamptz`,
+        [
+          input.projectId,
+          traceIds[0],
+          input.importSource,
+          input.activityId,
+          input.sourceActivityAt
+        ]
+      );
+      if (!publishRequired) {
+        await client.query("commit");
+        return;
       }
     }
     const inserted = await client.query<{ trace_id: string }>(

@@ -10,11 +10,12 @@ import {
 } from "@ironside/db";
 import { ulid } from "ulid";
 import type { Pool } from "pg";
-import type { Observation, Trace } from "@ironside/shared";
+import type { Trace } from "@ironside/shared";
 import { LangfuseClient, type LangfuseClientConfig, type LangfuseListTrace } from "./langfuse-client.js";
 import { mapLangfuseObservation, mapLangfuseScore, mapLangfuseTraceDetail } from "./langfuse-mapper.js";
 import {
   importedTraceContentHash,
+  importedEvaluatorTraceContentHash,
   importedTraceSnapshot,
   recoverPendingEvaluatorImportSnapshots
 } from "./evaluator-publication.js";
@@ -138,7 +139,6 @@ export async function runLangfuseImport(
         // the page and its details idempotently (ReplacingMergeTree
         // dedups re-inserts) — no partial page is ever recorded as done.
         const traces: Trace[] = [];
-        const observations: Observation[] = [];
         const candidateActivityAt = new Date().toISOString();
         const snapshots = new Map<string, ReturnType<typeof importedTraceSnapshot>>();
         for (const listTrace of response.data as LangfuseListTrace[]) {
@@ -153,11 +153,9 @@ export async function runLangfuseImport(
             const snapshot = importedTraceSnapshot(
               trace,
               traceObservations,
-              traceScores,
-              candidateActivityAt
+              traceScores
             );
             traces.push(snapshot.trace);
-            observations.push(...snapshot.observations);
             snapshots.set(snapshot.trace.id, snapshot);
           } catch (error) {
             (options.onInvalidTrace ?? ((traceId, cause) =>
@@ -175,7 +173,12 @@ export async function runLangfuseImport(
             traceId: trace.id,
             contentHash: importedTraceContentHash(
               trace,
-              observations.filter((observation) => observation.traceId === trace.id)
+              snapshots.get(trace.id)!.observations,
+              snapshots.get(trace.id)!.scores
+            ),
+            evaluatorContentHash: importedEvaluatorTraceContentHash(
+              trace,
+              snapshots.get(trace.id)!.observations
             ),
             snapshot: snapshots.get(trace.id)!
           }))

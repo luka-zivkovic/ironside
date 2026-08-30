@@ -67,6 +67,10 @@ describe("runMigrations (postgres)", () => {
       {
         id: "0005_evaluator_import_retention_cutoffs",
         checksum: "c8749c4e17c33a49b87e8ece58151757585ff5ce10bb962f9d1c8f4c5d2e40f9"
+      },
+      {
+        id: "0006_evaluator_import_publication_scope",
+        checksum: "21ee419a99401f56b56853f1393f790839abde46a224b6e0eac57b117e7a67a4"
       }
     ]);
     expect((await pool.query("select to_regclass('api_keys') as table_name")).rows).toEqual([

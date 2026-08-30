@@ -1,8 +1,14 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { createClickHouseClient } from "../src/client.js";
 import { runMigrations } from "../src/migrate.js";
-import { insertObservations, insertTraces } from "../src/rows.js";
-import { dropPartitionsOlderThan, listPartitions, markProjectDataDeletedOlderThan } from "../src/retention.js";
+import { insertObservations, insertScores, insertTraces } from "../src/rows.js";
+import {
+  dropPartitionsOlderThan,
+  listPartitions,
+  markChildrenOfExpiredTracesDeleted,
+  markProjectDataDeletedOlderThan,
+  recordExpiredEvaluatorTraceIds
+} from "../src/retention.js";
 
 const client = createClickHouseClient({
   url: process.env.CLICKHOUSE_URL ?? "http://localhost:8123",
@@ -10,6 +16,8 @@ const client = createClickHouseClient({
   password: process.env.CLICKHOUSE_PASSWORD ?? "ironside",
   database: process.env.CLICKHOUSE_DB ?? "ironside"
 });
+
+vi.setConfig({ testTimeout: 15_000 });
 
 describe("retention", () => {
   afterAll(() => client.close());
@@ -261,6 +269,99 @@ describe("retention", () => {
     });
     expect(await remaining.json()).toHaveLength(1);
     expect(dropped).not.toContain("202001");
+  });
+
+  it("deletes recent observations and scores when their parent trace expires", async () => {
+    const projectId = `proj_retention_expired_tree_${crypto.randomUUID()}`;
+    const traceId = `trace_${crypto.randomUUID()}`;
+    const observationId = `obs_${crypto.randomUUID()}`;
+    const scoreId = `score_${crypto.randomUUID()}`;
+    const eventTs = new Date().toISOString();
+    const recent = new Date().toISOString();
+    await insertTraces(client, [{
+      id: traceId,
+      projectId,
+      timestamp: "2020-01-15T00:00:00.000Z",
+      tags: [],
+      metadata: {}
+    }], { eventTs });
+    await insertObservations(client, [{
+      id: observationId,
+      traceId,
+      projectId,
+      type: "span",
+      startTime: recent,
+      level: "default",
+      metadata: {}
+    }], { eventTs });
+    await insertScores(client, [{
+      id: scoreId,
+      traceId,
+      projectId,
+      name: "recent-assessment",
+      dataType: "numeric",
+      value: 1,
+      source: "eval",
+      timestamp: recent,
+      metadata: {}
+    }], { eventTs });
+
+    const cutoffs = [
+      { projectId, traceOlderThan: new Date("2024-01-01T00:00:00.000Z") }
+    ];
+    await recordExpiredEvaluatorTraceIds(client, cutoffs);
+    await markChildrenOfExpiredTracesDeleted(client, [projectId]);
+
+    // A policy-expired marker does not mutate the tree while partition grace
+    // or a global floor still leaves the parent visible.
+    for (const [table, id] of [["observations", observationId], ["scores", scoreId]] as const) {
+      const retained = await client.query({
+        query: `select id from ${table} final
+                 where project_id = {projectId:String} and id = {id:String}`,
+        query_params: { projectId, id },
+        format: "JSONEachRow"
+      });
+      expect(await retained.json()).toHaveLength(1);
+    }
+
+    await markProjectDataDeletedOlderThan(
+      client,
+      "traces",
+      projectId,
+      new Date("2024-01-01T00:00:00.000Z")
+    );
+    await markChildrenOfExpiredTracesDeleted(client, [projectId]);
+
+    for (const [table, id] of [["observations", observationId], ["scores", scoreId]] as const) {
+      const remaining = await client.query({
+        query: `select id from ${table} final
+                 where project_id = {projectId:String} and id = {id:String}`,
+        query_params: { projectId, id },
+        format: "JSONEachRow"
+      });
+      expect(await remaining.json()).toHaveLength(0);
+    }
+
+    // The parent identity remains durable after its live row disappears. A
+    // delayed recent child is removed on the next pass too.
+    const delayedObservationId = `obs_${crypto.randomUUID()}`;
+    await insertObservations(client, [{
+      id: delayedObservationId,
+      traceId,
+      projectId,
+      type: "span",
+      startTime: recent,
+      level: "default",
+      metadata: {}
+    }], { eventTs: new Date().toISOString() });
+    await markChildrenOfExpiredTracesDeleted(client, [projectId]);
+    const delayed = await client.query({
+      query: `select id from observations final
+               where project_id = {projectId:String} and id = {id:String}`,
+      query_params: { projectId, id: delayedObservationId },
+      format: "JSONEachRow"
+    });
+    expect(await delayed.json()).toHaveLength(0);
   });
 
   it("listPartitions returns partitions oldest-first with their actual min timestamp", async () => {

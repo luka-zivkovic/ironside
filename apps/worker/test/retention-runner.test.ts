@@ -1,4 +1,9 @@
-import { createClickHouseClient, insertTraces, runMigrations as runChMigrations } from "@ironside/clickhouse";
+import {
+  createClickHouseClient,
+  insertObservations,
+  insertTraces,
+  runMigrations as runChMigrations
+} from "@ironside/clickhouse";
 import {
   publishEvaluatorTraceActivities,
   runMigrations as runPgMigrations,
@@ -6,13 +11,18 @@ import {
 } from "@ironside/db";
 import { Pool } from "pg";
 import { ulid } from "ulid";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { runRetention } from "../src/retention/retention-runner.js";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  runRetention,
+  seedEvaluatorImportRetentionCutoffs
+} from "../src/retention/retention-runner.js";
 import { loadConfig } from "../src/config.js";
 
 const config = loadConfig();
 const pool = new Pool({ connectionString: config.databaseUrl });
 const clickhouse = createClickHouseClient(config.clickhouse);
+
+vi.setConfig({ testTimeout: 15_000 });
 
 let organizationId: string;
 
@@ -43,6 +53,44 @@ afterAll(async () => {
 });
 
 describe("runRetention", () => {
+  it("seeds import cutoffs independently before the destructive retention sweep", async () => {
+    const projectId = await seedProject("retention-runner-startup-cutoff", 30);
+    const now = new Date("2026-08-30T12:00:00.000Z");
+    await pool.query(
+      "delete from evaluator_import_retention_cutoffs where project_id = $1",
+      [projectId]
+    );
+
+    await seedEvaluatorImportRetentionCutoffs({
+      pool,
+      defaultRetentionDays: 90,
+      now
+    });
+
+    const result = await pool.query<{ trace_timestamp_before: Date }>(
+      `select trace_timestamp_before
+         from evaluator_import_retention_cutoffs
+        where project_id = $1`,
+      [projectId]
+    );
+    expect(result.rows[0]?.trace_timestamp_before.toISOString())
+      .toBe("2026-07-31T12:00:00.000Z");
+
+    await seedEvaluatorImportRetentionCutoffs({
+      pool,
+      defaultRetentionDays: 90,
+      now: new Date("2026-08-31T12:00:00.000Z")
+    });
+    const unchanged = await pool.query<{ trace_timestamp_before: Date }>(
+      `select trace_timestamp_before
+         from evaluator_import_retention_cutoffs
+        where project_id = $1`,
+      [projectId]
+    );
+    expect(unchanged.rows[0]?.trace_timestamp_before.toISOString())
+      .toBe("2026-07-31T12:00:00.000Z");
+  });
+
   it("drops a whole old partition at the global default when no project has a longer override", async () => {
     const projectId = await seedProject("retention-runner-default", null);
     const oldTraceId = `trace_${ulid()}`;
@@ -98,6 +146,46 @@ describe("runRetention", () => {
       format: "JSONEachRow"
     });
     expect((await check.json()).length).toBe(1);
+  });
+
+  it("keeps a default-retention trace tree intact while a longer override raises the global floor", async () => {
+    const defaultProject = await seedProject("retention-runner-default-under-raised-floor", null);
+    await seedProject("retention-runner-floor-raising-neighbor", 365);
+    const traceId = `trace_${ulid()}`;
+    const observationId = `obs_${ulid()}`;
+    const now = new Date("2026-08-30T12:00:00.000Z");
+    const traceTimestamp = new Date(now);
+    traceTimestamp.setUTCDate(traceTimestamp.getUTCDate() - 100);
+    const eventTs = now.toISOString();
+
+    await insertTraces(clickhouse, [{
+      id: traceId,
+      projectId: defaultProject,
+      timestamp: traceTimestamp.toISOString(),
+      tags: [],
+      metadata: {}
+    }], { eventTs });
+    await insertObservations(clickhouse, [{
+      id: observationId,
+      traceId,
+      projectId: defaultProject,
+      type: "span",
+      startTime: traceTimestamp.toISOString(),
+      level: "default",
+      metadata: {}
+    }], { eventTs });
+
+    await runRetention({ pool, clickhouse, defaultRetentionDays: 90, now });
+
+    for (const [table, id] of [["traces", traceId], ["observations", observationId]] as const) {
+      const remaining = await clickhouse.query({
+        query: `select id from ${table} final
+                 where project_id = {projectId:String} and id = {id:String}`,
+        query_params: { projectId: defaultProject, id },
+        format: "JSONEachRow"
+      });
+      expect(await remaining.json()).toHaveLength(1);
+    }
   });
 
   it("applies row-level deletion for a project whose retention is SHORTER than the global floor, without touching other projects in the same partition", async () => {

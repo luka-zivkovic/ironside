@@ -5,6 +5,7 @@ export {
   insertObservations,
   insertScores,
   tombstoneImportedTraceSnapshot,
+  tombstoneImportedScores,
   tombstoneExpiredImportedTraceSnapshot,
   type InsertOptions
 } from "./rows.js";
@@ -65,7 +66,9 @@ export {
 export {
   listPartitions,
   dropPartitionsOlderThan,
+  markChildrenOfExpiredTracesDeleted,
   markProjectDataDeletedOlderThan,
+  recordExpiredEvaluatorTraceIds,
   type RetainedTable
 } from "./retention.js";
 export {

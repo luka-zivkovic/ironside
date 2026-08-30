@@ -1,16 +1,20 @@
 import {
   dropPartitionsOlderThan,
   listExistingTraceIds,
+  markChildrenOfExpiredTracesDeleted,
   markProjectDataDeletedOlderThan,
+  recordExpiredEvaluatorTraceIds,
   type ClickHouseClient,
   type RetainedTable
 } from "@ironside/clickhouse";
 import {
   deleteEvaluatorTraceFeedEntries,
+  ensureEvaluatorImportRetentionCutoffs,
   listAllProjects,
   listEvaluatorTraceFeedKeys,
   purgeIngestFailuresOlderThan,
-  recordEvaluatorImportRetentionCutoffs
+  recordEvaluatorImportRetentionCutoffs,
+  withEvaluatorRetentionFence
 } from "@ironside/db";
 import type { Pool } from "pg";
 
@@ -37,6 +41,51 @@ export interface RetentionRunResult {
 }
 
 /**
+ * Establishes the durable import cutoff before scheduled pull imports are
+ * allowed to run. This is deliberately separate from the destructive
+ * retention sweep: after an upgrade, the cutoff table starts empty while the
+ * provider checkpoint can still point at an already-retained boundary row.
+ */
+export async function seedEvaluatorImportRetentionCutoffs(options: {
+  pool: Pool;
+  defaultRetentionDays: number;
+  now?: Date;
+}): Promise<void> {
+  const projects = await listAllProjects(options.pool);
+  await ensureEvaluatorImportRetentionCutoffs(
+    options.pool,
+    cutoffEntries(
+      projects,
+      options.defaultRetentionDays,
+      options.now ?? new Date()
+    )
+  );
+}
+
+async function recordCutoffsForProjects(
+  pool: Pool,
+  projects: Awaited<ReturnType<typeof listAllProjects>>,
+  defaultRetentionDays: number,
+  now: Date
+): Promise<void> {
+  await recordEvaluatorImportRetentionCutoffs(pool, cutoffEntries(projects, defaultRetentionDays, now));
+}
+
+function cutoffEntries(
+  projects: Awaited<ReturnType<typeof listAllProjects>>,
+  defaultRetentionDays: number,
+  now: Date
+): Array<{ projectId: string; traceTimestampBefore: string }> {
+  return projects.map((project) => ({
+    projectId: project.id,
+    traceTimestampBefore: daysAgo(
+      project.retentionDays ?? defaultRetentionDays,
+      now
+    ).toISOString()
+  }));
+}
+
+/**
  * Runs one retention pass: drops whole ClickHouse partitions older than
  * the LOOSEST retention window in effect (the platform default, or any
  * project's override if longer — see below for why), then applies
@@ -55,6 +104,10 @@ export interface RetentionRunResult {
  * precision via row-level markProjectDataDeletedOlderThan instead.
  */
 export async function runRetention(options: RunRetentionOptions): Promise<RetentionRunResult> {
+  return withEvaluatorRetentionFence(options.pool, () => runRetentionFenced(options));
+}
+
+async function runRetentionFenced(options: RunRetentionOptions): Promise<RetentionRunResult> {
   const { pool, clickhouse } = options;
 
   const projects = await listAllProjects(pool);
@@ -69,16 +122,19 @@ export async function runRetention(options: RunRetentionOptions): Promise<Retent
   // provider checkpoints can otherwise reinsert an expired trace between the
   // delete and the next poll. Import materialization rechecks this ledger
   // after its writes, so either side of the race converges to deletion.
-  await recordEvaluatorImportRetentionCutoffs(
-    pool,
-    projects.map((project) => ({
+  await recordCutoffsForProjects(pool, projects, options.defaultRetentionDays, now);
+
+  // Whole-trace retention is parent-owned. Remove every child of an expired
+  // parent before any trace partition/drop or row tombstone makes the parent
+  // identity unavailable; a recent assessment must not outlive its trace.
+  const traceCutoffs = projects.map((project) => ({
       projectId: project.id,
-      traceTimestampBefore: daysAgo(
+      traceOlderThan: daysAgo(
         project.retentionDays ?? options.defaultRetentionDays,
         now
-      ).toISOString()
-    }))
-  );
+      )
+    }));
+  await recordExpiredEvaluatorTraceIds(clickhouse, traceCutoffs);
 
   const droppedPartitions: Record<RetainedTable, string[]> = { traces: [], observations: [], scores: [] };
   for (const table of RETAINED_TABLES) {
@@ -110,6 +166,15 @@ export async function runRetention(options: RunRetentionOptions): Promise<Retent
     }
     projectDeletes.push({ projectId: project.id, retentionDays: project.retentionDays });
   }
+
+  // Markers are policy candidates, while partition grace/global-floor rules
+  // decide whether a parent was actually removed in this pass. Only after all
+  // trace deletion paths complete do we remove children whose parent is no
+  // longer live; still-visible trees remain immutable.
+  await markChildrenOfExpiredTracesDeleted(
+    clickhouse,
+    projects.map((project) => project.id)
+  );
 
   // Dead-letter rows are diagnostics, not trace data — a fixed 30-day
   // window (not the per-project retention settings) keeps the table

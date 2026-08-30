@@ -16,7 +16,10 @@ import { forwardOtlpTraces } from "./forwarders/otlp-forwarder.js";
 import { runLangfuseImport } from "./importers/langfuse-importer.js";
 import { runLangsmithImport } from "./importers/langsmith-importer.js";
 import { recoverAbandonedEvaluatorImports } from "./importers/evaluator-publication.js";
-import { runRetention } from "./retention/retention-runner.js";
+import {
+  runRetention,
+  seedEvaluatorImportRetentionCutoffs
+} from "./retention/retention-runner.js";
 import { runWebhooks } from "./webhooks/webhook-runner.js";
 import { runEnvironmentRegistryRebuildChunk } from "./environments/environment-registry.js";
 
@@ -324,7 +327,18 @@ export function startScheduler(options: SchedulerOptions): Scheduler {
     if (stopped || importTicking) return;
     importTicking = true;
     try {
+      // Fail closed until every existing project has a durable cutoff. The
+      // first retention sweep runs on another timer and may lose this race
+      // during an upgrade, otherwise resurrecting an expired inclusive
+      // provider-checkpoint row before the cutoff ledger is initialized.
+      await seedEvaluatorImportRetentionCutoffs({
+        pool: options.pool,
+        defaultRetentionDays: options.defaultRetentionDays
+      });
       await tickImports();
+    } catch (error) {
+      onError("import", error);
+      onRunOutcome("import", "error");
     } finally {
       importTicking = false;
     }

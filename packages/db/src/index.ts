@@ -1,5 +1,10 @@
 export { runMigrations } from "./migrate.js";
 export {
+  closeEvaluatorLifecycleFence,
+  withEvaluatorDataWriteFence,
+  withEvaluatorRetentionFence
+} from "./evaluator-lifecycle-fence.js";
+export {
   getOwnerAuthState,
   issueSetupChallenge,
   issueRecoveryChallenge,
@@ -151,6 +156,7 @@ export {
   claimPendingEvaluatorImportSnapshots,
   discardPendingEvaluatorImportSnapshot,
   deleteLegacyPendingEvaluatorImport,
+  ensureEvaluatorImportRetentionCutoffs,
   getEvaluatorImportRetentionCutoff,
   listLegacyPendingEvaluatorImports,
   recordEvaluatorImportRetentionCutoffs,

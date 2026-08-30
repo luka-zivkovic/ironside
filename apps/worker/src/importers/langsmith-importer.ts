@@ -10,11 +10,12 @@ import {
 } from "@ironside/db";
 import { ulid } from "ulid";
 import type { Pool } from "pg";
-import type { Observation, Trace } from "@ironside/shared";
+import type { Trace } from "@ironside/shared";
 import { LangsmithClient, type LangsmithClientConfig, type LangsmithRun } from "./langsmith-client.js";
 import { mapLangsmithFeedback, mapLangsmithObservation, mapLangsmithRun } from "./langsmith-mapper.js";
 import {
   importedTraceContentHash,
+  importedEvaluatorTraceContentHash,
   importedTraceSnapshot,
   recoverPendingEvaluatorImportSnapshots
 } from "./evaluator-publication.js";
@@ -116,7 +117,6 @@ export async function runLangsmithImport(
         // the page and its trees idempotently, no partial page is ever
         // recorded as done.
         const traces: Trace[] = [];
-        const observations: Observation[] = [];
         const candidateActivityAt = new Date().toISOString();
         const snapshots = new Map<string, ReturnType<typeof importedTraceSnapshot>>();
         for (const rootRun of response.runs as LangsmithRun[]) {
@@ -140,11 +140,9 @@ export async function runLangsmithImport(
             const snapshot = importedTraceSnapshot(
               trace,
               traceObservations,
-              traceScores,
-              candidateActivityAt
+              traceScores
             );
             traces.push(snapshot.trace);
-            observations.push(...snapshot.observations);
             snapshots.set(snapshot.trace.id, snapshot);
           } catch (error) {
             (options.onInvalidTrace ?? ((id, cause) =>
@@ -162,7 +160,12 @@ export async function runLangsmithImport(
             traceId: trace.id,
             contentHash: importedTraceContentHash(
               trace,
-              observations.filter((observation) => observation.traceId === trace.id)
+              snapshots.get(trace.id)!.observations,
+              snapshots.get(trace.id)!.scores
+            ),
+            evaluatorContentHash: importedEvaluatorTraceContentHash(
+              trace,
+              snapshots.get(trace.id)!.observations
             ),
             snapshot: snapshots.get(trace.id)!
           }))

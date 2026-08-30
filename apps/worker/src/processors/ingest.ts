@@ -13,6 +13,7 @@ import {
   markEvaluatorScoreReceiptMaterialized,
   publishEvaluatorTraceActivities,
   recordIngestFailures,
+  withEvaluatorDataWriteFence,
   withRawRetentionObjectLock,
   type RecordIngestFailureInput
 } from "@ironside/db";
@@ -217,63 +218,65 @@ export function createIngestProcessor(deps: IngestProcessorDeps) {
     const snapshotRawRefs = rawRefs.filter((ref) => snapshotTraceIds.has(ref.traceId));
     const annotationOnlyRawRefs = rawRefs.filter((ref) => !snapshotTraceIds.has(ref.traceId));
 
-    // Mark only snapshot-affecting refs pending before domain rows become
-    // visible. Existing complete traces therefore become conservatively
-    // incomplete during the short write window. Score-only refs start applied
-    // because annotations never alter evaluator snapshots.
-    await Promise.all([
-      insertRawEventRefs(deps.clickhouse, snapshotRawRefs, batch.receivedAt, false),
-      // Annotation-only rows never affect a trace snapshot, so their raw
-      // references can be retention-visible immediately without making
-      // evaluator reads wait for score materialization.
-      insertRawEventRefs(deps.clickhouse, annotationOnlyRawRefs, batch.receivedAt, true)
-    ]);
+    await withEvaluatorDataWriteFence(deps.pool, async () => {
+      // Mark only snapshot-affecting refs pending before domain rows become
+      // visible. Existing complete traces therefore become conservatively
+      // incomplete during the short write window. Score-only refs start applied
+      // because annotations never alter evaluator snapshots.
+      await Promise.all([
+        insertRawEventRefs(deps.clickhouse, snapshotRawRefs, batch.receivedAt, false),
+        // Annotation-only rows never affect a trace snapshot, so their raw
+        // references can be retention-visible immediately without making
+        // evaluator reads wait for score materialization.
+        insertRawEventRefs(deps.clickhouse, annotationOnlyRawRefs, batch.receivedAt, true)
+      ]);
 
-    const insertOptions = { eventTs: batch.receivedAt };
-    await Promise.all([
-      insertTraces(deps.clickhouse, traces, insertOptions),
-      insertObservations(deps.clickhouse, observations, insertOptions),
-      insertScores(deps.clickhouse, scores, insertOptions)
-    ]);
-    // Evaluator score receipts suppress later HTTP retries only after the
-    // durable ingest intent exists. Record the second commit point once its
-    // ClickHouse score row is actually present; terminal recovery keeps an
-    // unmaterialized staged batch retryable.
-    await markEvaluatorScoreReceiptMaterialized(deps.pool, {
-      projectId,
-      batchId: batch.batchId
+      const insertOptions = { eventTs: batch.receivedAt };
+      await Promise.all([
+        insertTraces(deps.clickhouse, traces, insertOptions),
+        insertObservations(deps.clickhouse, observations, insertOptions),
+        insertScores(deps.clickhouse, scores, insertOptions)
+      ]);
+      // Evaluator score receipts suppress later HTTP retries only after the
+      // durable ingest intent exists. Record the second commit point once its
+      // ClickHouse score row is actually present; terminal recovery keeps an
+      // unmaterialized staged batch retryable.
+      await markEvaluatorScoreReceiptMaterialized(deps.pool, {
+        projectId,
+        batchId: batch.batchId
+      });
+
+      // Discovery is derived, but it is part of this job's durable materialize
+      // step: a failure retries the idempotent ClickHouse writes rather than
+      // silently leaving the picker stale until a future rebuild.
+      await observeTraceEnvironments(
+        deps.pool,
+        projectId,
+        traces,
+        deps.onEnvironmentRegistryOverflow
+      );
+
+      // Publish only trace/observation activity after every ClickHouse row and
+      // its pending raw reference is durable. Scores are downstream annotations
+      // and must never reopen or republish an evaluator snapshot. The batch id
+      // makes this publication idempotent if final cleanup later makes the job
+      // retry. Keep the raw reference pending until after publication so exact
+      // evaluator reads cannot observe changed ClickHouse rows under the prior
+      // snapshot version.
+      await publishEvaluatorTraceActivities(deps.pool, {
+        projectId,
+        traceIds: [
+          ...snapshotTraceIds
+        ],
+        sourceActivityAt: batch.receivedAt,
+        activityId: batch.batchId
+      });
+
+      // Applied refs are written last. Until this succeeds evaluator detail
+      // reads return 409 and the feed cursor remains retryable. A retry repeats
+      // ClickHouse writes but does not mint another feed version.
+      await insertRawEventRefs(deps.clickhouse, snapshotRawRefs, batch.receivedAt, true);
     });
-
-    // Discovery is derived, but it is part of this job's durable materialize
-    // step: a failure retries the idempotent ClickHouse writes rather than
-    // silently leaving the picker stale until a future rebuild.
-    await observeTraceEnvironments(
-      deps.pool,
-      projectId,
-      traces,
-      deps.onEnvironmentRegistryOverflow
-    );
-
-    // Publish only trace/observation activity after every ClickHouse row and
-    // its pending raw reference is durable. Scores are downstream annotations
-    // and must never reopen or republish an evaluator snapshot. The batch id
-    // makes this publication idempotent if final cleanup later makes the job
-    // retry. Keep the raw reference pending until after publication so exact
-    // evaluator reads cannot observe changed ClickHouse rows under the prior
-    // snapshot version.
-    await publishEvaluatorTraceActivities(deps.pool, {
-      projectId,
-      traceIds: [
-        ...snapshotTraceIds
-      ],
-      sourceActivityAt: batch.receivedAt,
-      activityId: batch.batchId
-    });
-
-    // Applied refs are written last. Until this succeeds evaluator detail
-    // reads return 409 and the feed cursor remains retryable. A retry repeats
-    // ClickHouse writes but does not mint another feed version.
-    await insertRawEventRefs(deps.clickhouse, snapshotRawRefs, batch.receivedAt, true);
 
     if (failures.length > 0) {
       deps.onDeadLetter?.(failures.length);

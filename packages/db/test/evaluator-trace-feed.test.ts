@@ -295,6 +295,7 @@ describe("evaluator trace feed (postgres)", () => {
         traces: [{
           traceId,
           contentHash,
+          evaluatorContentHash: contentHash,
           snapshot: {
             trace: {
               id: traceId,
@@ -305,8 +306,7 @@ describe("evaluator trace feed (postgres)", () => {
               input: { prompt: "contains\0nul" }
             },
             observations: [],
-            scores: [],
-            scoreActivityAt: candidateActivityAt
+            scores: []
           }
         }]
       });
@@ -339,7 +339,7 @@ describe("evaluator trace feed (postgres)", () => {
 
     const retry = (await stage("a".repeat(64), "import_a_retry", "2026-08-30T12:01:00.000Z"))
       .get(traceId)!;
-    expect(retry).toEqual(first);
+    expect(retry).toEqual({ ...first, publishRequired: false });
     await expect(claimPendingEvaluatorImportSnapshots(pool, {
       projectId,
       source: "langfuse",

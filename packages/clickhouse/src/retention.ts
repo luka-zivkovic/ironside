@@ -165,7 +165,7 @@ const TABLE_COLUMNS: Record<RetainedTable, readonly string[]> = {
   ],
   scores: [
     "project_id", "id", "trace_id", "observation_id", "name", "data_type",
-    "value", "string_value", "source", "comment", "metadata", "timestamp"
+    "value", "string_value", "source", "import_source", "comment", "metadata", "timestamp"
   ]
 };
 
@@ -218,4 +218,92 @@ export async function markProjectDataDeletedOlderThan(
     `,
     query_params: { projectId, olderThan: toClickHouseDateTime(olderThan.toISOString()) }
   });
+}
+
+/**
+ * Whole-trace retention: once a durably marked parent is actually absent,
+ * remove every child even if that child carries a newer source timestamp.
+ * Policy-expired parents still preserved by partition grace/global floors keep
+ * their complete tree.
+ */
+export async function markChildrenOfExpiredTracesDeleted(
+  client: ClickHouseClient,
+  projectIdsInput: string[]
+): Promise<void> {
+  const projectIds = [...new Set(projectIdsInput)];
+  if (projectIds.length === 0) return;
+  for (const projectChunk of chunksOf(projectIds, LIFECYCLE_PROJECT_BATCH_SIZE)) {
+    await Promise.all(
+      (["observations", "scores"] as const).map((table) => {
+        const columns = TABLE_COLUMNS[table];
+        return client.exec({
+          query: `
+            insert into ${table} (${columns.join(", ")}, is_deleted, event_ts)
+            select ${columns.join(", ")}, 1, now64(6)
+              from ${table} final
+             where project_id in {projectIds:Array(String)}
+               and is_deleted = 0
+               and (project_id, trace_id) in (
+                 select project_id, trace_id
+                   from evaluator_trace_retention final
+                  where project_id in {projectIds:Array(String)}
+               )
+               and (project_id, trace_id) not in (
+                 select project_id, id
+                   from traces final
+                  where project_id in {projectIds:Array(String)}
+               )
+          `,
+          query_params: { projectIds: projectChunk },
+          clickhouse_settings: LIFECYCLE_QUERY_SETTINGS
+        });
+      })
+    );
+  }
+}
+
+/** Stage durable parent identities before trace deletion makes them invisible. */
+export async function recordExpiredEvaluatorTraceIds(
+  client: ClickHouseClient,
+  entries: Array<{ projectId: string; traceOlderThan: Date }>
+): Promise<void> {
+  const unique = [...new Map(entries.map((entry) => [entry.projectId, entry])).values()];
+  if (unique.length === 0) return;
+  for (const entryChunk of chunksOf(unique, LIFECYCLE_PROJECT_BATCH_SIZE)) {
+    const projectIds = entryChunk.map((entry) => entry.projectId);
+    const cutoffs = entryChunk.map((entry) =>
+      toClickHouseDateTime(entry.traceOlderThan.toISOString())
+    );
+    await client.exec({
+      query: `
+        insert into evaluator_trace_retention (project_id, trace_id, expired_at)
+        select project_id, id, now64(6)
+          from traces final
+         where project_id in {projectIds:Array(String)}
+           and timestamp < arrayElement(
+             {cutoffs:Array(DateTime64(3))},
+             indexOf({projectIds:Array(String)}, project_id)
+           )
+      `,
+      query_params: { projectIds, cutoffs },
+      clickhouse_settings: LIFECYCLE_QUERY_SETTINGS
+    });
+  }
+}
+
+const LIFECYCLE_PROJECT_BATCH_SIZE = 100;
+const LIFECYCLE_QUERY_SETTINGS = {
+  max_execution_time: 60,
+  max_threads: 4,
+  max_memory_usage: String(512 * 1024 * 1024),
+  max_rows_to_read: "10000000",
+  read_overflow_mode: "throw" as const
+};
+
+function chunksOf<T>(values: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let offset = 0; offset < values.length; offset += size) {
+    chunks.push(values.slice(offset, offset + size));
+  }
+  return chunks;
 }

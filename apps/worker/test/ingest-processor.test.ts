@@ -571,6 +571,7 @@ describe("ingest processor dead-lettering (M9-03)", () => {
     // the best-effort diagnostic insert.
     const brokenPool = {
       connect: pool.connect.bind(pool),
+      options: pool.options,
       query: (text: string, params?: unknown[]) =>
         text.includes("insert into ingest_event_failures")
           ? Promise.reject(new Error("postgres unavailable"))
