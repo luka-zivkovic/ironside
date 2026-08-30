@@ -148,8 +148,12 @@ export {
 export {
   publishEvaluatorTraceActivities,
   listEvaluatorTraceActivities,
+  getEvaluatorTracePublications,
+  deleteEvaluatorTraceFeedEntries,
+  listEvaluatorTraceFeedKeys,
   type EvaluatorTraceActivity,
-  type EvaluatorTraceFeedCursor
+  type EvaluatorTraceFeedCursor,
+  type EvaluatorTracePublication
 } from "./evaluator-trace-feed.js";
 export {
   createMediaAsset,

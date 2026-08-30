@@ -1,5 +1,9 @@
 import { createClickHouseClient, insertTraces, runMigrations as runChMigrations } from "@ironside/clickhouse";
-import { runMigrations as runPgMigrations, setProjectQuotas } from "@ironside/db";
+import {
+  publishEvaluatorTraceActivities,
+  runMigrations as runPgMigrations,
+  setProjectQuotas
+} from "@ironside/db";
 import { Pool } from "pg";
 import { ulid } from "ulid";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -47,9 +51,16 @@ describe("runRetention", () => {
       [{ id: oldTraceId, projectId, timestamp: "2020-03-10T00:00:00.000Z", tags: [], metadata: {} }],
       { eventTs: new Date().toISOString() }
     );
+    await publishEvaluatorTraceActivities(pool, {
+      projectId,
+      traceIds: [oldTraceId],
+      sourceActivityAt: new Date().toISOString(),
+      activityId: `batch_${ulid()}`
+    });
 
     const result = await runRetention({ pool, clickhouse, defaultRetentionDays: 90 });
     expect(result.droppedPartitions.traces).toContain("202003");
+    expect(result.prunedEvaluatorTraceFeed).toBeGreaterThanOrEqual(1);
 
     const check = await clickhouse.query({
       query: "select id from traces where id = {id:String}",
@@ -57,6 +68,10 @@ describe("runRetention", () => {
       format: "JSONEachRow"
     });
     expect((await check.json()).length).toBe(0);
+    expect((await pool.query(
+      "select 1 from evaluator_trace_feed where project_id = $1 and trace_id = $2",
+      [projectId, oldTraceId]
+    )).rowCount).toBe(0);
   });
 
   it("does not drop the global floor's partition when a project override needs LONGER retention than the default", async () => {

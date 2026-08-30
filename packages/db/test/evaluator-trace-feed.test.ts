@@ -1,0 +1,195 @@
+import { Pool } from "pg";
+import { ulid } from "ulid";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import {
+  deleteEvaluatorTraceFeedEntries,
+  listEvaluatorTraceFeedKeys,
+  listEvaluatorTraceActivities,
+  publishEvaluatorTraceActivities
+} from "../src/evaluator-trace-feed.js";
+import { runMigrations } from "../src/migrate.js";
+
+const connectionString =
+  process.env.DATABASE_URL ??
+  "postgres://ironside:ironside@localhost:5433/ironside";
+
+describe("evaluator trace feed (postgres)", () => {
+  const pool = new Pool({ connectionString });
+  const organizationId = `org_eval_feed_${ulid()}`;
+  const projectId = `proj_eval_feed_${ulid()}`;
+
+  beforeAll(async () => {
+    await runMigrations(pool);
+    await pool.query("insert into organizations (id, name) values ($1, $2)", [
+      organizationId,
+      "evaluator trace feed"
+    ]);
+    await pool.query(
+      "insert into projects (id, organization_id, name) values ($1, $2, $3)",
+      [projectId, organizationId, "evaluator trace feed"]
+    );
+  });
+
+  afterAll(async () => {
+    await pool.query("delete from organizations where id = $1", [organizationId]);
+    await pool.end();
+  });
+
+  it("preserves microsecond cursors, deduplicates retries, and republishes late older activity", async () => {
+    const traceId = `trace_${ulid()}`;
+    const newerSourceActivity = "2026-08-20T12:00:00.000Z";
+    await publishEvaluatorTraceActivities(pool, {
+      projectId,
+      traceIds: [traceId],
+      sourceActivityAt: newerSourceActivity,
+      activityId: "batch-newer"
+    });
+
+    await pool.query(
+      `update evaluator_trace_feed
+          set trace_version = '2026-08-30T12:00:00.123456Z'::timestamptz,
+              published_at = '2026-08-30T12:00:00.123456Z'::timestamptz
+        where project_id = $1 and trace_id = $2`,
+      [projectId, traceId]
+    );
+    await pool.query(
+      `update evaluator_trace_feed_watermarks
+          set published_at = '2026-08-30T12:00:00.123456Z'::timestamptz
+        where project_id = $1`,
+      [projectId]
+    );
+    const first = await listEvaluatorTraceActivities(pool, { projectId, limit: 1 });
+    expect(first).toEqual([{
+      traceId,
+      traceVersion: "2026-08-30T12:00:00.123456Z",
+      sourceActivityAt: "2026-08-20T12:00:00.000Z",
+      publishedAt: "2026-08-30T12:00:00.123456Z"
+    }]);
+    expect(await listEvaluatorTraceActivities(pool, {
+      projectId,
+      cursor: { publishedAt: first[0]!.publishedAt, traceId },
+      limit: 1
+    })).toEqual([]);
+
+    await publishEvaluatorTraceActivities(pool, {
+      projectId,
+      traceIds: [traceId],
+      sourceActivityAt: newerSourceActivity,
+      activityId: "batch-newer"
+    });
+    expect(await listEvaluatorTraceActivities(pool, {
+      projectId,
+      cursor: { publishedAt: first[0]!.publishedAt, traceId },
+      limit: 1
+    })).toEqual([]);
+
+    await publishEvaluatorTraceActivities(pool, {
+      projectId,
+      traceIds: [traceId],
+      sourceActivityAt: "2026-08-19T12:00:00.000Z",
+      activityId: "batch-late-older"
+    });
+    const reopened = await listEvaluatorTraceActivities(pool, {
+      projectId,
+      cursor: { publishedAt: first[0]!.publishedAt, traceId },
+      limit: 1
+    });
+    expect(reopened).toHaveLength(1);
+    expect(reopened[0]!.traceVersion).toBe(reopened[0]!.publishedAt);
+    expect(reopened[0]!.sourceActivityAt).toBe("2026-08-20T12:00:00.000Z");
+    expect(reopened[0]!.publishedAt > first[0]!.publishedAt).toBe(true);
+  });
+
+  it("serializes concurrent project publications into a fully pageable order", async () => {
+    const traceA = `trace_${ulid()}`;
+    const traceB = `trace_${ulid()}`;
+    const blocker = await pool.connect();
+    await blocker.query("begin");
+    await blocker.query(
+      "select pg_advisory_xact_lock(hashtextextended($1::text, 72819463))",
+      [projectId]
+    );
+    const firstPublish = publishEvaluatorTraceActivities(pool, {
+      projectId,
+      traceIds: [traceA],
+      sourceActivityAt: "2026-08-21T12:00:00.000Z",
+      activityId: "batch-concurrent-a"
+    });
+    const secondPublish = publishEvaluatorTraceActivities(pool, {
+      projectId,
+      traceIds: [traceB],
+      sourceActivityAt: "2026-08-21T12:00:01.000Z",
+      activityId: "batch-concurrent-b"
+    });
+    await blocker.query("commit");
+    blocker.release();
+    await Promise.all([firstPublish, secondPublish]);
+
+    const all = (await listEvaluatorTraceActivities(pool, { projectId, limit: 20 }))
+      .filter((row) => row.traceId === traceA || row.traceId === traceB);
+    expect(all).toHaveLength(2);
+    expect(all[0]!.publishedAt < all[1]!.publishedAt).toBe(true);
+    const afterFirst = await listEvaluatorTraceActivities(pool, {
+      projectId,
+      cursor: { publishedAt: all[0]!.publishedAt, traceId: all[0]!.traceId },
+      limit: 20
+    });
+    expect(afterFirst.map((row) => row.traceId)).toContain(all[1]!.traceId);
+
+    // The project high-water mark also survives clock rollback or equal clock
+    // ticks across two separately committed trace publications.
+    await pool.query(
+      `update evaluator_trace_feed_watermarks
+          set published_at = '2036-08-30T12:00:00.123456Z'::timestamptz
+        where project_id = $1`,
+      [projectId]
+    );
+    await pool.query(
+      "delete from evaluator_trace_feed where project_id = $1 and trace_id = $2",
+      [projectId, traceA]
+    );
+    const traceAfterRollback = `trace_${ulid()}`;
+    await publishEvaluatorTraceActivities(pool, {
+      projectId,
+      traceIds: [traceAfterRollback],
+      sourceActivityAt: "2026-08-21T12:00:02.000Z",
+      activityId: "batch-after-clock-rollback"
+    });
+    const afterRollback = (await listEvaluatorTraceActivities(pool, {
+      projectId,
+      cursor: {
+        publishedAt: "2036-08-30T12:00:00.123456Z",
+        traceId: traceA
+      },
+      limit: 20
+    })).find((row) => row.traceId === traceAfterRollback);
+    expect(afterRollback?.publishedAt).toBe("2036-08-30T12:00:00.123457Z");
+  });
+
+  it("does not prune a trace that was republished after retention inspected it", async () => {
+    const traceId = `trace_${ulid()}`;
+    await publishEvaluatorTraceActivities(pool, {
+      projectId,
+      traceIds: [traceId],
+      sourceActivityAt: "2026-08-22T12:00:00.000Z",
+      activityId: "batch-prune-before"
+    });
+    const inspected = (await listEvaluatorTraceFeedKeys(pool, { limit: 100 }))
+      .find((row) => row.traceId === traceId)!;
+
+    await publishEvaluatorTraceActivities(pool, {
+      projectId,
+      traceIds: [traceId],
+      sourceActivityAt: "2026-08-22T12:00:01.000Z",
+      activityId: "batch-prune-after"
+    });
+    expect(await deleteEvaluatorTraceFeedEntries(pool, [inspected])).toBe(0);
+    const current = (await listEvaluatorTraceFeedKeys(pool, { limit: 100 }))
+      .find((row) => row.traceId === traceId)!;
+    expect(current.traceVersion).not.toBe(inspected.traceVersion);
+
+    expect(await deleteEvaluatorTraceFeedEntries(pool, [current])).toBe(1);
+    expect((await listEvaluatorTraceFeedKeys(pool, { limit: 100 }))
+      .some((row) => row.traceId === traceId)).toBe(false);
+  });
+});

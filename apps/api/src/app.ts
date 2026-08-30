@@ -230,13 +230,12 @@ export function createApp(deps: AppDeps): Hono<AuthEnv> {
   // only and derives the project exclusively from the Integration credential.
   const evaluatorRead = new Hono<AuthEnv>();
   const evaluatorTraceAuth = machineAuth(deps.pgPool, deps.redis, "traces:read");
-  evaluatorRead.use("/evaluator/*", async (c, next) => {
-    // This router is mounted before the score writer. Do not accidentally
-    // make POST /evaluator/scores require traces:read in addition to its own
-    // scores:write capability merely because the path shares a prefix.
-    if (c.req.method !== "GET") return next();
-    return evaluatorTraceAuth(c, next);
-  });
+  // Bind authentication to the exact read paths, for every HTTP method. Hono
+  // may dispatch HEAD through a GET handler while preserving method=HEAD, so
+  // method-gating this middleware would bypass the credential boundary.
+  evaluatorRead.use("/evaluator/context", evaluatorTraceAuth);
+  evaluatorRead.use("/evaluator/traces", evaluatorTraceAuth);
+  evaluatorRead.use("/evaluator/traces/*", evaluatorTraceAuth);
   evaluatorRead.route(
     "/",
     evaluatorReadRoutes({

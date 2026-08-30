@@ -2,10 +2,17 @@ import { createHash } from "node:crypto";
 import type { ClickHouseClient, VersionedTraceDetailRow } from "@ironside/clickhouse";
 import {
   getVersionedTrace,
+  getVersionedTraces,
+  hasPendingTraceRawRefs,
+  listPendingTraceRawRefIds,
   listObservationsForTrace,
   listSettledTraceVersions
 } from "@ironside/clickhouse";
-import { getProject, listEvaluatorTraceActivities } from "@ironside/db";
+import {
+  getEvaluatorTracePublications,
+  getProject,
+  listEvaluatorTraceActivities
+} from "@ironside/db";
 import { buildObservationTree, safeJsonParse } from "@ironside/mappers";
 import {
   EVALUATOR_PROTOCOL_VERSION,
@@ -28,7 +35,6 @@ import { z } from "zod";
 import {
   decodeEvaluatorCursor,
   encodeEvaluatorCursor,
-  initialLiveEvaluatorCursor,
   type EvaluatorCursor
 } from "../lib/evaluator-cursor.js";
 import { persistAndEnqueueIngestBatch } from "../lib/persist-ingest-batch.js";
@@ -79,10 +85,10 @@ function traceSummary(trace: {
   environment: string | null;
   tags: string[];
   metadata: Record<string, string>;
-}) {
+}, traceVersion = trace.trace_version) {
   return {
     traceId: trace.id,
-    traceVersion: trace.trace_version,
+    traceVersion,
     timestamp: trace.timestamp,
     name: trace.name,
     userId: trace.user_id,
@@ -93,10 +99,14 @@ function traceSummary(trace: {
   };
 }
 
-function traceDetail(trace: VersionedTraceDetailRow, observations: Awaited<ReturnType<typeof listObservationsForTrace>>): EvaluatorTraceResponse {
+function traceDetail(
+  trace: VersionedTraceDetailRow,
+  observations: Awaited<ReturnType<typeof listObservationsForTrace>>,
+  traceVersion = trace.trace_version
+): EvaluatorTraceResponse {
   return {
     id: trace.id,
-    traceVersion: trace.trace_version,
+    traceVersion,
     timestamp: trace.timestamp,
     name: trace.name,
     userId: trace.user_id,
@@ -165,6 +175,11 @@ export function evaluatorReadRoutes(deps: EvaluatorReadDeps): Hono<AuthEnv> {
       });
       const hasMore = rows.length > parsed.data.limit;
       const page = hasMore ? rows.slice(0, parsed.data.limit) : rows;
+      const publications = await getEvaluatorTracePublications(
+        deps.pool,
+        projectId,
+        page.map((row) => row.id)
+      );
       const last = page.at(-1);
       const nextCursor = hasMore && last
         ? encodeEvaluatorCursor({
@@ -182,10 +197,26 @@ export function evaluatorReadRoutes(deps: EvaluatorReadDeps): Hono<AuthEnv> {
               afterVersion: last?.trace_version ?? windowTo,
               afterTraceId: last?.id ?? "\uffff"
             })
-          : encodeEvaluatorCursor(initialLiveEvaluatorCursor());
+          : encodeEvaluatorCursor({
+              v: 1,
+              kind: "live",
+              // Bootstrap covered every source activity through this horizon.
+              // Begin live publication strictly after it so pre-existing feed
+              // rows are not emitted a second time with publication versions.
+              publishedAt: cursor.through,
+              traceId: "\uffff"
+            });
       const response: EvaluatorTraceFeedResponse = {
         protocolVersion: EVALUATOR_PROTOCOL_VERSION,
-        traces: page.map(traceSummary),
+        traces: page.map((row) => {
+          const publication = publications.get(row.id);
+          return traceSummary(
+            row,
+            publication?.sourceActivityAt === row.trace_version
+              ? publication.traceVersion
+              : row.trace_version
+          );
+        }),
         nextCursor,
         hasMore
       };
@@ -203,13 +234,25 @@ export function evaluatorReadRoutes(deps: EvaluatorReadDeps): Hono<AuthEnv> {
     let consumed = 0;
     let next: EvaluatorCursor = cursor;
     let blocked = false;
+    const activityTraceIds = activities.map((activity) => activity.traceId);
+    const [currentByTraceId, pendingTraceIds] = await Promise.all([
+      getVersionedTraces(deps.clickhouse, projectId, activityTraceIds),
+      listPendingTraceRawRefIds(deps.clickhouse, projectId, activityTraceIds)
+    ]);
 
     for (const activity of activities) {
-      if (activity.traceVersion > settledBefore) {
+      if (activity.sourceActivityAt > settledBefore) {
         blocked = true;
         break;
       }
-      const current = await getVersionedTrace(deps.clickhouse, projectId, activity.traceId);
+      if (pendingTraceIds.has(activity.traceId)) {
+        // Publication happens before the worker clears the durable pending
+        // reference. Keep the cursor before this item so it becomes visible
+        // after materialization completes instead of being skipped on 409.
+        blocked = true;
+        break;
+      }
+      const current = currentByTraceId.get(activity.traceId);
       if (!current) {
         // Retention may remove the trace after its feed row was published.
         // Advancing past the orphan prevents one deleted trace from blocking
@@ -218,20 +261,24 @@ export function evaluatorReadRoutes(deps: EvaluatorReadDeps): Hono<AuthEnv> {
         next = { v: 1, kind: "live", publishedAt: activity.publishedAt, traceId: activity.traceId };
         continue;
       }
-      if (current.trace_version !== activity.traceVersion) {
+      if (current.trace_version !== activity.sourceActivityAt) {
         // ClickHouse became visible just before the worker advanced the
         // durable feed row. Do not pass it; the idempotent retry/upsert will
         // move this same trace forward and the next request can continue.
         blocked = true;
         break;
       }
-      traces.push(traceSummary(current));
+      traces.push(traceSummary(current, activity.traceVersion));
       consumed += 1;
       next = { v: 1, kind: "live", publishedAt: activity.publishedAt, traceId: activity.traceId };
       if (traces.length >= parsed.data.limit) break;
     }
 
-    const hasMore = !blocked && activities.length > consumed;
+    // If every fetched row was an orphan, consumed === activities.length. A
+    // full limit+1 window is still evidence that another page may exist.
+    const hasMore = !blocked && (
+      activities.length > consumed || activities.length === parsed.data.limit + 1
+    );
     const response: EvaluatorTraceFeedResponse = {
       protocolVersion: EVALUATOR_PROTOCOL_VERSION,
       traces,
@@ -248,18 +295,43 @@ export function evaluatorReadRoutes(deps: EvaluatorReadDeps): Hono<AuthEnv> {
     const projectId = c.get("projectId");
     const traceId = c.req.param("id");
     const { settledBefore } = await projectSettlement(deps, projectId);
+    const publicationBefore = (await getEvaluatorTracePublications(
+      deps.pool,
+      projectId,
+      [traceId]
+    )).get(traceId);
+    if (await hasPendingTraceRawRefs(deps.clickhouse, projectId, traceId)) {
+      return c.json({ error: "trace is still materializing", code: "trace_version_changed" }, 409);
+    }
     const before = await getVersionedTrace(deps.clickhouse, projectId, traceId);
     if (!before) return c.json({ error: "trace not found" }, 404);
-    if (before.trace_version !== parsed.data.version || before.trace_version > settledBefore) {
+    const expectedVersion = publicationBefore?.traceVersion ?? before.trace_version;
+    const expectedSourceActivity = publicationBefore?.sourceActivityAt ?? before.trace_version;
+    if (
+      expectedVersion !== parsed.data.version ||
+      before.trace_version !== expectedSourceActivity ||
+      before.trace_version > settledBefore
+    ) {
       return c.json({ error: "trace version changed or is no longer settled", code: "trace_version_changed" }, 409);
     }
 
     const observations = await listObservationsForTrace(deps.clickhouse, projectId, traceId);
-    const after = await getVersionedTrace(deps.clickhouse, projectId, traceId);
-    if (!after || after.trace_version !== before.trace_version) {
+    const [after, pendingAfter, publicationAfterMap] = await Promise.all([
+      getVersionedTrace(deps.clickhouse, projectId, traceId),
+      hasPendingTraceRawRefs(deps.clickhouse, projectId, traceId),
+      getEvaluatorTracePublications(deps.pool, projectId, [traceId])
+    ]);
+    const publicationAfter = publicationAfterMap.get(traceId);
+    if (
+      pendingAfter ||
+      !after ||
+      after.trace_version !== before.trace_version ||
+      publicationAfter?.traceVersion !== publicationBefore?.traceVersion ||
+      publicationAfter?.sourceActivityAt !== publicationBefore?.sourceActivityAt
+    ) {
       return c.json({ error: "trace version changed while reading", code: "trace_version_changed" }, 409);
     }
-    return c.json(traceDetail(before, observations), 200);
+    return c.json(traceDetail(before, observations, expectedVersion), 200);
   });
 
   return app;

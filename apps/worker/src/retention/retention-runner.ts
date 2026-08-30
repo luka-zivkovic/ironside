@@ -1,10 +1,16 @@
 import {
   dropPartitionsOlderThan,
+  listExistingTraceIds,
   markProjectDataDeletedOlderThan,
   type ClickHouseClient,
   type RetainedTable
 } from "@ironside/clickhouse";
-import { listAllProjects, purgeIngestFailuresOlderThan } from "@ironside/db";
+import {
+  deleteEvaluatorTraceFeedEntries,
+  listAllProjects,
+  listEvaluatorTraceFeedKeys,
+  purgeIngestFailuresOlderThan
+} from "@ironside/db";
 import type { Pool } from "pg";
 
 const RETAINED_TABLES: readonly RetainedTable[] = ["traces", "observations", "scores"];
@@ -25,6 +31,8 @@ export interface RetentionRunResult {
   projectDeletes: { projectId: string; retentionDays: number }[];
   /** Dead-letter diagnostics rows purged from ingest_event_failures (M9-03) — fixed 30-day window, so the table can't grow unbounded. */
   purgedIngestFailures: number;
+  /** Durable evaluator rows whose ClickHouse trace was removed by retention. */
+  prunedEvaluatorTraceFeed: number;
 }
 
 /**
@@ -91,8 +99,47 @@ export async function runRetention(options: RunRetentionOptions): Promise<Retent
   // window (not the per-project retention settings) keeps the table
   // bounded without inventing a separate config knob for it.
   const purgedIngestFailures = await purgeIngestFailuresOlderThan(pool, 30);
+  const prunedEvaluatorTraceFeed = await pruneOrphanedEvaluatorTraceFeed(pool, clickhouse);
 
-  return { droppedPartitions, projectDeletes, purgedIngestFailures };
+  return { droppedPartitions, projectDeletes, purgedIngestFailures, prunedEvaluatorTraceFeed };
+}
+
+const EVALUATOR_FEED_PRUNE_BATCH_SIZE = 500;
+
+async function pruneOrphanedEvaluatorTraceFeed(
+  pool: Pool,
+  clickhouse: ClickHouseClient
+): Promise<number> {
+  let after: { projectId: string; traceId: string } | undefined;
+  let pruned = 0;
+  while (true) {
+    const page = await listEvaluatorTraceFeedKeys(pool, {
+      ...(after ? { after } : {}),
+      limit: EVALUATOR_FEED_PRUNE_BATCH_SIZE
+    });
+    if (page.length === 0) break;
+
+    const byProject = new Map<string, typeof page>();
+    for (const entry of page) {
+      const entries = byProject.get(entry.projectId) ?? [];
+      entries.push(entry);
+      byProject.set(entry.projectId, entries);
+    }
+    const orphaned: typeof page = [];
+    for (const [projectId, entries] of byProject) {
+      const traceIds = entries.map((entry) => entry.traceId);
+      const existing = await listExistingTraceIds(clickhouse, projectId, traceIds);
+      for (const entry of entries) {
+        if (!existing.has(entry.traceId)) orphaned.push(entry);
+      }
+    }
+    // Deletion is version-guarded. If an ingest republishes between the
+    // ClickHouse existence check and this write, the fresh feed row wins.
+    pruned += await deleteEvaluatorTraceFeedEntries(pool, orphaned);
+    after = page.at(-1);
+    if (page.length < EVALUATOR_FEED_PRUNE_BATCH_SIZE) break;
+  }
+  return pruned;
 }
 
 function daysAgo(days: number, now: Date): Date {

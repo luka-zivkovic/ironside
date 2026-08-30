@@ -276,6 +276,42 @@ export interface TraceRawIndex {
   retentionExpired: boolean;
 }
 
+/** Fast exact guard for evaluator snapshot reads during ingest materialization. */
+export async function hasPendingTraceRawRefs(
+  client: ClickHouseClient,
+  projectId: string,
+  traceId: string
+): Promise<boolean> {
+  return (await listPendingTraceRawRefIds(client, projectId, [traceId])).has(traceId);
+}
+
+/** Bounded batch guard used by evaluator feed pages during materialization. */
+export async function listPendingTraceRawRefIds(
+  client: ClickHouseClient,
+  projectId: string,
+  traceIds: string[]
+): Promise<Set<string>> {
+  const uniqueTraceIds = [...new Set(traceIds)].filter(Boolean);
+  if (uniqueTraceIds.length === 0) return new Set();
+  const result = await client.query({
+    query: `
+      select distinct trace_id
+      from (
+        select trace_id, object_key
+        from raw_event_refs
+        where project_id = {projectId:String}
+          and trace_id in {traceIds:Array(String)}
+        group by trace_id, object_key
+        having max(applied) = 0
+      )
+    `,
+    query_params: { projectId, traceIds: uniqueTraceIds },
+    format: "JSONEachRow"
+  });
+  const rows = await result.json<{ trace_id: string }>();
+  return new Set(rows.map((row) => row.trace_id));
+}
+
 /**
  * Exact raw object keys known for a trace. `limit + 1` keys are returned so
  * the caller can distinguish exactly-at-limit from truncated-by-limit.

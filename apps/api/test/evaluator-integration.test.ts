@@ -1,5 +1,6 @@
 import {
   createClickHouseClient,
+  insertRawEventRefs,
   insertObservations,
   insertTraces,
   runMigrations as runChMigrations
@@ -125,14 +126,70 @@ describe("native evaluator integration", () => {
     await publishEvaluatorTraceActivities(pool, {
       projectId,
       traceIds: [trace.id],
-      traceVersion: firstVersion
+      sourceActivityAt: firstVersion,
+      activityId: "batch_first"
     });
     const liveResponse = await app.request(
       `/api/v1/evaluator/traces?limit=10&cursor=${encodeURIComponent(bootstrap.nextCursor)}`,
       { headers: headers() }
     );
     const live = evaluatorTraceFeedResponseSchema.parse(await liveResponse.json());
-    expect(live.traces).toEqual([expect.objectContaining({ traceId: trace.id, traceVersion: firstVersion })]);
+    expect(live.traces).toEqual([expect.objectContaining({ traceId: trace.id })]);
+    const liveVersion = live.traces[0]!.traceVersion;
+    expect(liveVersion).not.toBe(firstVersion);
+
+    // Publication precedes final raw-ref acknowledgement. The feed must keep
+    // its cursor before the pending snapshot, then expose that same version
+    // once materialization is fully acknowledged.
+    const pendingTrace: Trace = {
+      ...trace,
+      id: `trace_${ulid()}`,
+      name: "pending-materialization"
+    };
+    const pendingAt = new Date().toISOString();
+    const pendingRef = {
+      projectId,
+      traceId: pendingTrace.id,
+      objectKey: `raw/${ulid()}.json`,
+      receivedAt: pendingAt
+    };
+    await insertTraces(clickhouse, [pendingTrace], { eventTs: pendingAt });
+    await insertRawEventRefs(clickhouse, [pendingRef], pendingAt, false);
+    await publishEvaluatorTraceActivities(pool, {
+      projectId,
+      traceIds: [pendingTrace.id],
+      sourceActivityAt: pendingAt,
+      activityId: "batch_pending"
+    });
+    const pendingResponse = await app.request(
+      `/api/v1/evaluator/traces?limit=10&cursor=${encodeURIComponent(live.nextCursor)}`,
+      { headers: headers() }
+    );
+    const pending = evaluatorTraceFeedResponseSchema.parse(await pendingResponse.json());
+    expect(pending).toMatchObject({ traces: [], hasMore: false, nextCursor: live.nextCursor });
+    await insertRawEventRefs(clickhouse, [pendingRef], pendingAt, true);
+    const appliedResponse = await app.request(
+      `/api/v1/evaluator/traces?limit=10&cursor=${encodeURIComponent(live.nextCursor)}`,
+      { headers: headers() }
+    );
+    const applied = evaluatorTraceFeedResponseSchema.parse(await appliedResponse.json());
+    expect(applied.traces).toEqual([
+      expect.objectContaining({ traceId: pendingTrace.id })
+    ]);
+
+    // Retrying the same durable batch does not mint another snapshot version.
+    await publishEvaluatorTraceActivities(pool, {
+      projectId,
+      traceIds: [trace.id],
+      sourceActivityAt: firstVersion,
+      activityId: "batch_first"
+    });
+    const quiescentResponse = await app.request(
+      `/api/v1/evaluator/traces?limit=1&cursor=${encodeURIComponent(applied.nextCursor)}`,
+      { headers: headers() }
+    );
+    const quiescent = evaluatorTraceFeedResponseSchema.parse(await quiescentResponse.json());
+    expect(quiescent).toMatchObject({ traces: [], hasMore: false });
 
     const secondVersion = new Date().toISOString();
     const observation: Observation = {
@@ -152,29 +209,76 @@ describe("native evaluator integration", () => {
     await publishEvaluatorTraceActivities(pool, {
       projectId,
       traceIds: [trace.id],
-      traceVersion: secondVersion
+      sourceActivityAt: secondVersion,
+      activityId: "batch_second"
     });
 
     const staleDetail = await app.request(
-      `/api/v1/evaluator/traces/${trace.id}?version=${encodeURIComponent(firstVersion)}`,
+      `/api/v1/evaluator/traces/${trace.id}?version=${encodeURIComponent(liveVersion)}`,
       { headers: headers() }
     );
     expect(staleDetail.status).toBe(409);
     expect(await staleDetail.json()).toMatchObject({ code: "trace_version_changed" });
 
     const reopenedResponse = await app.request(
-      `/api/v1/evaluator/traces?limit=10&cursor=${encodeURIComponent(live.nextCursor)}`,
+      `/api/v1/evaluator/traces?limit=10&cursor=${encodeURIComponent(applied.nextCursor)}`,
       { headers: headers() }
     );
     const reopened = evaluatorTraceFeedResponseSchema.parse(await reopenedResponse.json());
-    expect(reopened.traces).toEqual([expect.objectContaining({ traceId: trace.id, traceVersion: secondVersion })]);
+    expect(reopened.traces).toEqual([expect.objectContaining({ traceId: trace.id })]);
+    const reopenedVersion = reopened.traces[0]!.traceVersion;
+    expect(reopenedVersion).not.toBe(liveVersion);
 
     const versionedDetail = await app.request(
-      `/api/v1/evaluator/traces/${trace.id}?version=${encodeURIComponent(secondVersion)}`,
+      `/api/v1/evaluator/traces/${trace.id}?version=${encodeURIComponent(reopenedVersion)}`,
       { headers: headers() }
     );
     expect(evaluatorTraceResponseSchema.parse(await versionedDetail.json()).observations)
       .toEqual([expect.objectContaining({ id: observation.id, children: [] })]);
+
+    // A late older batch still changes the materialized tree and therefore
+    // publishes a fresh snapshot version while retaining the newer source
+    // activity as the settlement watermark.
+    const lateObservation: Observation = {
+      ...observation,
+      id: `obs_${ulid()}`,
+      name: "late-older-batch"
+    };
+    await insertObservations(clickhouse, [lateObservation], { eventTs: firstVersion });
+    await publishEvaluatorTraceActivities(pool, {
+      projectId,
+      traceIds: [trace.id],
+      sourceActivityAt: firstVersion,
+      activityId: "batch_late_older"
+    });
+    const lateResponse = await app.request(
+      `/api/v1/evaluator/traces?limit=10&cursor=${encodeURIComponent(reopened.nextCursor)}`,
+      { headers: headers() }
+    );
+    const late = evaluatorTraceFeedResponseSchema.parse(await lateResponse.json());
+    expect(late.traces).toHaveLength(1);
+    expect(late.traces[0]!.traceVersion).not.toBe(reopenedVersion);
+    const lateDetail = await app.request(
+      `/api/v1/evaluator/traces/${trace.id}?version=${encodeURIComponent(late.traces[0]!.traceVersion)}`,
+      { headers: headers() }
+    );
+    expect(evaluatorTraceResponseSchema.parse(await lateDetail.json()).observations)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ id: lateObservation.id })]));
+
+    // A full page of retention orphans must still advertise another page;
+    // otherwise a consumer can mistake the empty payload for quiescence.
+    await publishEvaluatorTraceActivities(pool, {
+      projectId,
+      traceIds: [`trace_missing_${ulid()}`, `trace_missing_${ulid()}`],
+      sourceActivityAt: firstVersion,
+      activityId: "batch_missing_traces"
+    });
+    const orphanResponse = await app.request(
+      `/api/v1/evaluator/traces?limit=1&cursor=${encodeURIComponent(late.nextCursor)}`,
+      { headers: headers() }
+    );
+    expect(evaluatorTraceFeedResponseSchema.parse(await orphanResponse.json()))
+      .toMatchObject({ traces: [], hasMore: true });
 
     const scoreId = `score_${ulid()}`;
     const scoreResponse = await app.request("/api/v1/evaluator/scores", {

@@ -202,6 +202,14 @@ const traceRoutes: RouteCase[] = [
     request: (token) => app.request("/api/v1/evaluator/traces?limit=1", { headers: bearer(token) })
   },
   {
+    name: "native evaluator trace detail",
+    allowedStatus: 404,
+    request: (token) => app.request(
+      `/api/v1/evaluator/traces/trace_${ulid()}?version=${encodeURIComponent(new Date().toISOString())}`,
+      { headers: bearer(token) }
+    )
+  },
+  {
     name: "trace list",
     allowedStatus: 200,
     request: (token) => app.request("/api/public/traces?limit=1", { headers: bearer(token) })
@@ -269,6 +277,18 @@ describe("machine route capability matrix", () => {
     });
     expect(inline.status).toBe(202);
     expect((await scoreRoute.request(ingestToken)).status).toBe(403);
+  });
+
+  it("authenticates HEAD before Hono dispatches it through evaluator GET handlers", async () => {
+    expect((await app.request("/api/v1/evaluator/context", { method: "HEAD" })).status).toBe(401);
+    expect((await app.request("/api/v1/evaluator/context", {
+      method: "HEAD",
+      headers: bearer(ingestToken)
+    })).status).toBe(403);
+    expect((await app.request("/api/v1/evaluator/context", {
+      method: "HEAD",
+      headers: bearer(integrationToken)
+    })).status).toBe(200);
   });
 
   it("enforces capabilities under LangFuse Basic auth too", async () => {

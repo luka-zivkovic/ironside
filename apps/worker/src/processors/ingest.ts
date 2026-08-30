@@ -175,23 +175,27 @@ export function createIngestProcessor(deps: IngestProcessorDeps) {
       deps.onEnvironmentRegistryOverflow
     );
 
-    // Applied refs are written last. If the write fails, a retry is
-    // idempotent and the pending state remains honest.
-    await insertRawEventRefs(deps.clickhouse, rawRefs, batch.receivedAt, true);
-
     // Publish only trace/observation activity after every ClickHouse row and
-    // raw reference is durable. Scores are downstream annotations and must
-    // never reopen or republish an evaluator snapshot. A Postgres failure
-    // retries the idempotent materialization before the pending intent is
-    // removed, closing the accepted-before-outage cursor gap.
+    // its pending raw reference is durable. Scores are downstream annotations
+    // and must never reopen or republish an evaluator snapshot. The batch id
+    // makes this publication idempotent if final cleanup later makes the job
+    // retry. Keep the raw reference pending until after publication so exact
+    // evaluator reads cannot observe changed ClickHouse rows under the prior
+    // snapshot version.
     await publishEvaluatorTraceActivities(deps.pool, {
       projectId,
       traceIds: [
         ...traces.map((trace) => trace.id),
         ...observations.map((observation) => observation.traceId)
       ],
-      traceVersion: batch.receivedAt
+      sourceActivityAt: batch.receivedAt,
+      activityId: batch.batchId
     });
+
+    // Applied refs are written last. Until this succeeds evaluator detail
+    // reads return 409 and the feed cursor remains retryable. A retry repeats
+    // ClickHouse writes but does not mint another feed version.
+    await insertRawEventRefs(deps.clickhouse, rawRefs, batch.receivedAt, true);
 
     if (failures.length > 0) {
       deps.onDeadLetter?.(failures.length);
