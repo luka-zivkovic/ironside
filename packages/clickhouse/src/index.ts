@@ -5,6 +5,7 @@ export {
   insertObservations,
   insertScores,
   tombstoneImportedTraceSnapshot,
+  tombstoneExpiredImportedTraceSnapshot,
   type InsertOptions
 } from "./rows.js";
 export {

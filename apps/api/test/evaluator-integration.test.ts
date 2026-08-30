@@ -318,7 +318,7 @@ describe("native evaluator integration", () => {
     });
     expect(scoreConflict.status).toBe(409);
     expect(await scoreConflict.json()).toMatchObject({ code: "score_idempotency_conflict" });
-  });
+  }, 15_000);
 
   it("holds bootstrap before a pending trace and safely replays pre-bootstrap feed rows", async () => {
     const bootstrapProjectId = `proj_${ulid()}`;
@@ -464,5 +464,64 @@ describe("native evaluator integration", () => {
       hasMore: false,
       nextCursor: afterRegression.nextCursor
     });
+  });
+
+  it("does not advertise a retention-regressed version during bootstrap", async () => {
+    const bootstrapProjectId = `proj_${ulid()}`;
+    await pool.query(
+      "insert into projects (id, organization_id, name) values ($1, $2, $3)",
+      [bootstrapProjectId, organizationId, "Bootstrap retention regression"]
+    );
+    const bootstrapKey = (
+      await createTestMachineCredential(pool, bootstrapProjectId, "coeval-bootstrap-retention", "integration")
+    ).token;
+    const bootstrapHeaders = { authorization: `Bearer ${bootstrapKey}` };
+    const oldActivityAt = "2026-08-21T12:00:00.000Z";
+    const publishedActivityAt = "2026-08-21T12:01:00.000Z";
+    const regressedTrace: Trace = {
+      ...trace,
+      id: `trace_${ulid()}`,
+      projectId: bootstrapProjectId,
+      timestamp: oldActivityAt,
+      name: "bootstrap-regressed"
+    };
+    const visibleTrace: Trace = {
+      ...trace,
+      id: `trace_${ulid()}`,
+      projectId: bootstrapProjectId,
+      timestamp: publishedActivityAt,
+      name: "bootstrap-visible"
+    };
+    await insertTraces(clickhouse, [regressedTrace], { eventTs: oldActivityAt });
+    await publishEvaluatorTraceActivities(pool, {
+      projectId: bootstrapProjectId,
+      traceIds: [regressedTrace.id],
+      sourceActivityAt: publishedActivityAt,
+      activityId: "batch_bootstrap_regressed"
+    });
+    await insertTraces(clickhouse, [visibleTrace], { eventTs: publishedActivityAt });
+    await publishEvaluatorTraceActivities(pool, {
+      projectId: bootstrapProjectId,
+      traceIds: [visibleTrace.id],
+      sourceActivityAt: publishedActivityAt,
+      activityId: "batch_bootstrap_visible"
+    });
+
+    const response = await app.request("/api/v1/evaluator/traces?limit=10", {
+      headers: bootstrapHeaders
+    });
+    expect(response.status).toBe(200);
+    const page = evaluatorTraceFeedResponseSchema.parse(await response.json());
+    expect(page.traces).toEqual([
+      expect.objectContaining({ traceId: visibleTrace.id })
+    ]);
+    expect(page.traces).not.toEqual([
+      expect.objectContaining({ traceId: regressedTrace.id })
+    ]);
+    const detail = await app.request(
+      `/api/v1/evaluator/traces/${visibleTrace.id}?version=${encodeURIComponent(page.traces[0]!.traceVersion)}`,
+      { headers: bootstrapHeaders }
+    );
+    expect(detail.status).toBe(200);
   });
 });

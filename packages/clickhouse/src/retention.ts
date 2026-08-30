@@ -90,11 +90,55 @@ export async function dropPartitionsOlderThan(
     const maxTs = new Date(fromClickHouseDateTime(row.max_ts));
     if (maxTs >= effectiveCutoff) continue; // has data within the retention window (plus grace period) — never drop
 
+    // Observations and scores are part of a trace snapshot. An old child can
+    // legitimately belong to a recent trace (late import/backfill). Dropping
+    // that child's monthly partition would change the evaluator-visible tree
+    // without changing the trace's activity/version, so retain the whole
+    // partition while any row in it belongs to a trace still in-window.
+    if (
+      table !== "traces" &&
+      await partitionHasChildOfRetainedTrace(
+        client,
+        table,
+        partition.partition,
+        effectiveCutoff
+      )
+    ) {
+      continue;
+    }
+
     await client.exec({ query: `alter table ${table} drop partition ${partition.partition}` });
     dropped.push(partition.partition);
   }
 
   return dropped;
+}
+
+async function partitionHasChildOfRetainedTrace(
+  client: ClickHouseClient,
+  table: Exclude<RetainedTable, "traces">,
+  partition: string,
+  cutoff: Date
+): Promise<boolean> {
+  const result = await client.query({
+    query: `
+      select count() as count
+        from ${table} final
+       where _partition_id = {partition:String}
+         and (project_id, trace_id) in (
+           select project_id, id
+             from traces final
+            where timestamp >= {cutoff:DateTime64(3)}
+         )
+    `,
+    query_params: {
+      partition,
+      cutoff: toClickHouseDateTime(cutoff.toISOString())
+    },
+    format: "JSONEachRow"
+  });
+  const [row] = await result.json<{ count: string }>();
+  return Number(row?.count ?? 0) > 0;
 }
 
 function timestampColumn(table: RetainedTable): string {
@@ -154,12 +198,23 @@ export async function markProjectDataDeletedOlderThan(
 ): Promise<void> {
   const column = timestampColumn(table);
   const columns = TABLE_COLUMNS[table];
+  const retainedParentGuard = table === "traces"
+    ? ""
+    : `and (project_id, trace_id) not in (
+         select project_id, id
+           from traces final
+          where project_id = {projectId:String}
+            and timestamp >= {olderThan:DateTime64(3)}
+       )`;
   await client.exec({
     query: `
       insert into ${table} (${columns.join(", ")}, is_deleted, event_ts)
       select ${columns.join(", ")}, 1, now64(6)
       from ${table} final
-      where project_id = {projectId:String} and ${column} < {olderThan:DateTime64(3)} and is_deleted = 0
+      where project_id = {projectId:String}
+        and ${column} < {olderThan:DateTime64(3)}
+        and is_deleted = 0
+        ${retainedParentGuard}
     `,
     query_params: { projectId, olderThan: toClickHouseDateTime(olderThan.toISOString()) }
   });

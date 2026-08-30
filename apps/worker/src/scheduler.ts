@@ -214,7 +214,9 @@ export function startScheduler(options: SchedulerOptions): Scheduler {
               secretKey: credentials.secretKey
             },
             onEnvironmentRegistryOverflow: (count) =>
-              options.onEnvironmentRegistryOverflow?.("live", count)
+              options.onEnvironmentRegistryOverflow?.("live", count),
+            onInvalidTrace: (traceId, error) =>
+              onError(`import:langfuse:${traceId}`, error)
           });
         } else {
           const credentials = parsed as unknown as {
@@ -227,7 +229,9 @@ export function startScheduler(options: SchedulerOptions): Scheduler {
             clickhouse: options.clickhouse,
             projectId: source.projectId,
             client: { apiKey: credentials.apiKey, ...(credentials.baseUrl && { baseUrl: credentials.baseUrl }) },
-            sessionIds: credentials.sessionIds
+            sessionIds: credentials.sessionIds,
+            onInvalidTrace: (traceId, error) =>
+              onError(`import:langsmith:${traceId}`, error)
           });
         }
         onRunOutcome("import", "success");

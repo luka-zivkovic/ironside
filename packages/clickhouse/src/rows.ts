@@ -63,6 +63,75 @@ export async function tombstoneImportedTraceSnapshot(
       `,
       query_params: { projectId, traceId, eventTs: toClickHouseDateTime(eventTs) },
       clickhouse_settings: settings
+    }),
+    client.command({
+      query: `
+        insert into scores
+          (project_id, id, trace_id, timestamp, event_ts, is_deleted)
+        select project_id, id, trace_id, timestamp,
+               subtractMicroseconds({eventTs:DateTime64(6)}, 1), 1
+          from scores final
+         where project_id = {projectId:String} and trace_id = {traceId:String}
+      `,
+      query_params: { projectId, traceId, eventTs: toClickHouseDateTime(eventTs) },
+      clickhouse_settings: settings
+    })
+  ]);
+}
+
+/**
+ * A retention cutoff can advance while a staged import is writing. In that
+ * race, write tombstones one microsecond after the attempted generation so
+ * the just-restored rows cannot survive the cutoff that already won in PG.
+ */
+export async function tombstoneExpiredImportedTraceSnapshot(
+  client: ClickHouseClient,
+  projectId: string,
+  traceId: string,
+  eventTs: string
+): Promise<void> {
+  const settings = {
+    max_execution_time: 30,
+    max_threads: 2,
+    max_memory_usage: String(256 * 1024 * 1024),
+    max_rows_to_read: "5000000",
+    read_overflow_mode: "throw" as const
+  };
+  await Promise.all([
+    client.command({
+      query: `
+        insert into traces (project_id, id, timestamp, event_ts, is_deleted)
+        select project_id, id, timestamp,
+               addMicroseconds({eventTs:DateTime64(6)}, 1), 1
+          from traces final
+         where project_id = {projectId:String} and id = {traceId:String}
+      `,
+      query_params: { projectId, traceId, eventTs: toClickHouseDateTime(eventTs) },
+      clickhouse_settings: settings
+    }),
+    client.command({
+      query: `
+        insert into observations
+          (project_id, id, trace_id, start_time, event_ts, is_deleted)
+        select project_id, id, trace_id, start_time,
+               addMicroseconds({eventTs:DateTime64(6)}, 1), 1
+          from observations final
+         where project_id = {projectId:String} and trace_id = {traceId:String}
+      `,
+      query_params: { projectId, traceId, eventTs: toClickHouseDateTime(eventTs) },
+      clickhouse_settings: settings
+    }),
+    client.command({
+      query: `
+        insert into scores
+          (project_id, id, trace_id, timestamp, event_ts, is_deleted)
+        select project_id, id, trace_id, timestamp,
+               addMicroseconds({eventTs:DateTime64(6)}, 1), 1
+          from scores final
+         where project_id = {projectId:String} and trace_id = {traceId:String}
+      `,
+      query_params: { projectId, traceId, eventTs: toClickHouseDateTime(eventTs) },
+      clickhouse_settings: settings
     })
   ]);
 }

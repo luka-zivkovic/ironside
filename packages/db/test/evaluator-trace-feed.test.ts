@@ -301,7 +301,8 @@ describe("evaluator trace feed (postgres)", () => {
               projectId,
               timestamp: "2026-08-30T09:00:00.000Z",
               tags: [],
-              metadata: {}
+              metadata: {},
+              input: { prompt: "contains\0nul" }
             },
             observations: [],
             scores: [],
@@ -313,26 +314,37 @@ describe("evaluator trace feed (postgres)", () => {
       .get(traceId)!;
     expect((await listPendingEvaluatorImportTraceIds(pool, projectId, [traceId])).has(traceId))
       .toBe(true);
+    await expect(claimPendingEvaluatorImportSnapshots(pool, {
+      projectId,
+      source: "langfuse",
+      runToken
+    })).resolves.toMatchObject([{ snapshot: { trace: { input: { prompt: "contains\0nul" } } } }]);
     await publishEvaluatorTraceActivities(pool, {
       projectId,
       traceIds: [traceId],
       sourceActivityAt: first.sourceActivityAt,
       activityId: first.activityId,
       importSource: "langfuse",
-      importRunToken: runToken
+      importRunToken: runToken,
+      importTraceTimestamp: "2026-08-30T09:00:00.000Z"
+    });
+    await expect(pool.query(
+      `select pending, snapshot, run_token
+         from evaluator_import_trace_state
+        where project_id = $1 and trace_id = $2 and source = 'langfuse'`,
+      [projectId, traceId]
+    )).resolves.toMatchObject({
+      rows: [{ pending: false, snapshot: null, run_token: null }]
     });
 
     const retry = (await stage("a".repeat(64), "import_a_retry", "2026-08-30T12:01:00.000Z"))
       .get(traceId)!;
     expect(retry).toEqual(first);
-    await publishEvaluatorTraceActivities(pool, {
+    await expect(claimPendingEvaluatorImportSnapshots(pool, {
       projectId,
-      traceIds: [traceId],
-      sourceActivityAt: retry.sourceActivityAt,
-      activityId: retry.activityId,
-      importSource: "langfuse",
-      importRunToken: runToken
-    });
+      source: "langfuse",
+      runToken
+    })).resolves.toEqual([]);
 
     const changed = (await stage("b".repeat(64), "import_b", "2026-08-30T11:00:00.000Z"))
       .get(traceId)!;
@@ -344,7 +356,8 @@ describe("evaluator trace feed (postgres)", () => {
       sourceActivityAt: first.sourceActivityAt,
       activityId: first.activityId,
       importSource: "langfuse",
-      importRunToken: runToken
+      importRunToken: runToken,
+      importTraceTimestamp: "2026-08-30T09:00:00.000Z"
     })).rejects.toThrow("stale imported evaluator materialization");
     expect((await listPendingEvaluatorImportTraceIds(pool, projectId, [traceId])).has(traceId))
       .toBe(true);
@@ -354,7 +367,8 @@ describe("evaluator trace feed (postgres)", () => {
       sourceActivityAt: changed.sourceActivityAt,
       activityId: changed.activityId,
       importSource: "langfuse",
-      importRunToken: runToken
+      importRunToken: runToken,
+      importTraceTimestamp: "2026-08-30T09:00:00.000Z"
     });
 
     const reverted = (await stage("a".repeat(64), "import_a2", "2026-08-30T10:00:00.000Z"))

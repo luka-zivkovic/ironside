@@ -68,18 +68,26 @@ recovery continues replaying that batch until the worker marks the score
 materialized; acknowledgement never turns a failed score into silent loss.
 
 Pull-import runs use renewable five-minute leases and fencing tokens. Their
-exact pending snapshots live in PostgreSQL, so a crashed, disabled, or deleted
-source cannot strand an evaluator trace: the independent recovery pass takes
-over an expired lease and completes materialization. A stale worker cannot save
-progress or publish after takeover.
+exact pending snapshots live as base64-encoded JSON recovery envelopes in
+PostgreSQL (so valid U+0000 payload content cannot poison `jsonb`), so a crashed,
+disabled, or deleted source cannot strand an evaluator trace: the independent
+recovery pass takes over an expired lease and completes materialization. A stale
+worker cannot save progress or publish after takeover. Invalid provider
+identifiers are skipped per trace before staging and surfaced to the scheduler
+error hook, allowing the source checkpoint to advance. Successful publication
+clears the staged snapshot and run token, retaining only compact generation
+identity; imported trace payloads therefore do not outlive their ClickHouse
+retention in Postgres.
 
 If retention removes a trace after publication, the feed cursor advances past
-that orphan. If row-level retention leaves the trace but removes the row that
-supplied its maximum source activity, live delivery also advances past that
-strictly older snapshot; a strictly newer ClickHouse snapshot still blocks
-until its matching publication arrives. Retention reconciles and prunes the
-corresponding feed and batch ledger rows; deletion is version-guarded so a
-concurrent republish wins.
+that orphan. Observation and score rows belonging to an in-window trace are
+retained with their parent even when their own timestamps are older; retention
+therefore cannot silently mutate an evaluator tree under an unchanged trace
+version. Retention reconciles and prunes the corresponding feed and batch
+ledger rows; deletion is version-guarded so a concurrent republish wins. A
+durable monotonic per-project import cutoff also fences pull materialization
+before and after ClickHouse writes, preventing inclusive provider checkpoints
+from resurrecting expired traces.
 Consumers deduplicate by `(remote project, traceId, traceVersion)`.
 
 Identifiers accepted by the native ingest contract are trimmed, reject NUL,
@@ -89,9 +97,12 @@ deterministic PostgreSQL publication poison.
 
 ## Upgrade order
 
-Migrations `0002_evaluator_trace_feed` and
-`0003_evaluator_import_materialization` plus
-`0004_evaluator_recovery_leases` must be applied before the API or
+Migrations `0002_evaluator_trace_feed`,
+`0003_evaluator_import_materialization`,
+`0003a_evaluator_import_pending_handoff`,
+`0004_evaluator_recovery_leases`, and
+`0005_evaluator_import_retention_cutoffs`, plus ClickHouse migration
+`0003_traces_id_skip_index`, must be applied before the API or
 worker that serves this protocol. Stop the old worker fleet, drain or reconcile
 its durable pending-ingest intents, and complete deployment of the feed-writing
 worker before exposing the evaluator API. Merely overlapping old and new

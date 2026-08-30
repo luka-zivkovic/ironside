@@ -5,6 +5,7 @@ import {
   getEvaluatorTracePublications,
   getImportCheckpoint,
   listPendingEvaluatorImportTraceIds,
+  recordEvaluatorImportRetentionCutoffs,
   runMigrations as runPgMigrations,
   stageEvaluatorImportTraces
 } from "@ironside/db";
@@ -124,7 +125,7 @@ describe("runLangfuseImport", () => {
   it("imports all traces across multiple pages and marks the checkpoint idle with page reset", async () => {
     fixtureTraces = Array.from({ length: 5 }, (_, i) => ({
       id: `trace_${ulid()}`,
-      timestamp: `2026-07-12T00:00:0${i}.000Z`,
+      timestamp: `2026-08-12T00:00:0${i}.000Z`,
       name: `trace-${i}`
     }));
 
@@ -143,7 +144,7 @@ describe("runLangfuseImport", () => {
     expect(checkpoint?.status).toBe("idle");
     expect(checkpoint?.importedCount).toBe(5);
     expect(checkpoint?.checkpoint.page).toBe(1); // reset after exhausting all pages
-    expect(checkpoint?.checkpoint.lastTimestamp).toBe("2026-07-12T00:00:04.000Z");
+    expect(checkpoint?.checkpoint.lastTimestamp).toBe("2026-08-12T00:00:04.000Z");
 
     const ids = fixtureTraces.map((t) => t.id);
     const rows = await clickhouse.query({
@@ -157,7 +158,7 @@ describe("runLangfuseImport", () => {
   it("resumes from the saved checkpoint instead of re-importing from scratch (fromTimestamp is used on the next run)", async () => {
     fixtureTraces = Array.from({ length: 3 }, (_, i) => ({
       id: `trace_${ulid()}`,
-      timestamp: `2026-07-12T01:00:0${i}.000Z`,
+      timestamp: `2026-08-12T01:00:0${i}.000Z`,
       name: `trace-${i}`
     }));
 
@@ -166,7 +167,7 @@ describe("runLangfuseImport", () => {
 
     // Add more traces "created after" the first run and rerun — should
     // only fetch from the checkpointed lastTimestamp forward.
-    const newer = { id: `trace_${ulid()}`, timestamp: "2026-07-12T01:00:05.000Z", name: "new" };
+    const newer = { id: `trace_${ulid()}`, timestamp: "2026-08-12T01:00:05.000Z", name: "new" };
     fixtureTraces.push(newer);
 
     const result = await runLangfuseImport({
@@ -177,7 +178,7 @@ describe("runLangfuseImport", () => {
       pageSize: 10
     });
 
-    expect(requestLog[0]?.fromTimestamp).toBe("2026-07-12T01:00:02.000Z");
+    expect(requestLog[0]?.fromTimestamp).toBe("2026-08-12T01:00:02.000Z");
     // The last-seen trace from the prior run is re-fetched too (>= boundary
     // is inclusive), so imported count on the resume run is 2 (last-seen +
     // new), not just the 1 new trace — a real re-insert, not a bug, since
@@ -195,7 +196,7 @@ describe("runLangfuseImport", () => {
   it("stops after maxPagesPerRun and reports resumable=true, without losing progress", async () => {
     fixtureTraces = Array.from({ length: 6 }, (_, i) => ({
       id: `trace_${ulid()}`,
-      timestamp: `2026-07-12T02:00:0${i}.000Z`,
+      timestamp: `2026-08-12T02:00:0${i}.000Z`,
       name: `trace-${i}`
     }));
 
@@ -230,7 +231,7 @@ describe("runLangfuseImport", () => {
     // exactly the missing assertion.
     fixtureTraces = Array.from({ length: 7 }, (_, i) => ({
       id: `trace_${ulid()}`,
-      timestamp: `2026-07-12T04:00:0${i}.000Z`,
+      timestamp: `2026-08-12T04:00:0${i}.000Z`,
       name: `capped-resume-${i}`
     }));
 
@@ -270,7 +271,7 @@ describe("runLangfuseImport", () => {
     const obsId = `obs_${ulid()}`;
     const childObsId = `obs_${ulid()}`;
     const scoreId = `score_${ulid()}`;
-    fixtureTraces = [{ id: traceId, timestamp: "2026-07-12T05:00:00.000Z", name: "full-data" }];
+    fixtureTraces = [{ id: traceId, timestamp: "2026-08-12T05:00:00.000Z", name: "full-data" }];
     fixtureDetails = {
       [traceId]: {
         environment: "production",
@@ -281,8 +282,8 @@ describe("runLangfuseImport", () => {
             parentObservationId: null,
             type: "SPAN", // uppercase, as the real API returns
             name: "handler",
-            startTime: "2026-07-12T05:00:00.000Z",
-            endTime: "2026-07-12T05:00:01.000Z",
+            startTime: "2026-08-12T05:00:00.000Z",
+            endTime: "2026-08-12T05:00:01.000Z",
             level: "DEFAULT"
           },
           {
@@ -291,9 +292,9 @@ describe("runLangfuseImport", () => {
             parentObservationId: obsId,
             type: "GENERATION",
             name: "llm-call",
-            startTime: "2026-07-12T05:00:00.100Z",
-            endTime: "2026-07-12T05:00:00.900Z",
-            completionStartTime: "2026-07-12T05:00:00.300Z",
+            startTime: "2026-08-12T05:00:00.100Z",
+            endTime: "2026-08-12T05:00:00.900Z",
+            completionStartTime: "2026-08-12T05:00:00.300Z",
             level: "WARNING",
             statusMessage: "slow response",
             model: "gpt-4o",
@@ -318,7 +319,7 @@ describe("runLangfuseImport", () => {
             dataType: "CATEGORICAL",
             source: "API",
             comment: "too slow",
-            timestamp: "2026-07-11T09:30:00.000Z" // the ORIGINAL score time, well before import time
+            timestamp: "2026-08-11T09:30:00.000Z" // the ORIGINAL score time, well before import time
           }
         ]
       }
@@ -381,7 +382,7 @@ describe("runLangfuseImport", () => {
     expect(score.comment).toBe("too slow");
     // The ORIGINAL score timestamp survives the import — without the new
     // Score.timestamp field, ClickHouse would default this to insert time.
-    expect(score.timestamp.startsWith("2026-07-11")).toBe(true);
+    expect(score.timestamp.startsWith("2026-08-11")).toBe(true);
     const publication = (await getEvaluatorTracePublications(pool, projectId, [traceId]))
       .get(traceId);
     expect(publication).toBeDefined();
@@ -397,21 +398,33 @@ describe("runLangfuseImport", () => {
     expect(((await traceRows.json()) as { environment: string }[])[0]?.environment).toBe("production");
   });
 
-  it("tombstones observations omitted by a later full snapshot", async () => {
+  it("tombstones observations and scores omitted by a later full snapshot", async () => {
     const traceId = `trace_${ulid()}`;
     const retainedId = `obs_${ulid()}`;
     const removedId = `obs_${ulid()}`;
-    const trace = { id: traceId, timestamp: "2026-07-12T05:30:00.000Z", name: "changing" };
+    const removedScoreId = `score_${ulid()}`;
+    const trace = { id: traceId, timestamp: "2026-08-12T05:30:00.000Z", name: "changing" };
     fixtureTraces = [trace];
     const observation = (id: string) => ({
       id,
       traceId,
       type: "SPAN",
-      startTime: "2026-07-12T05:30:00.000Z",
+      startTime: "2026-08-12T05:30:00.000Z",
       level: "DEFAULT"
     });
     fixtureDetails = {
-      [traceId]: { observations: [observation(retainedId), observation(removedId)] }
+      [traceId]: {
+        observations: [observation(retainedId), observation(removedId)],
+        scores: [{
+          id: removedScoreId,
+          traceId,
+          name: "removed-score",
+          value: 1,
+          dataType: "NUMERIC",
+          source: "API",
+          timestamp: "2026-08-12T05:30:00.000Z"
+        }]
+      }
     };
     await runLangfuseImport({ pool, clickhouse, projectId, client: clientConfig(), pageSize: 10 });
 
@@ -426,6 +439,13 @@ describe("runLangfuseImport", () => {
       format: "JSONEachRow"
     });
     expect(await rows.json()).toEqual([{ id: retainedId }]);
+    const scoreRows = await clickhouse.query({
+      query: `select id from scores final
+               where project_id = {projectId:String} and trace_id = {traceId:String}`,
+      query_params: { projectId, traceId },
+      format: "JSONEachRow"
+    });
+    expect(await scoreRows.json()).toEqual([]);
   });
 
   it("recovers a durable staged snapshot after its import lease expires", async () => {
@@ -435,7 +455,7 @@ describe("runLangfuseImport", () => {
     const trace = {
       id: traceId,
       projectId,
-      timestamp: "2026-07-12T05:45:00.000Z",
+      timestamp: "2026-08-12T05:45:00.000Z",
       name: "crash-recovery",
       tags: [],
       metadata: {}
@@ -483,8 +503,8 @@ describe("runLangfuseImport", () => {
     const okId = `trace_${ulid()}`;
     const brokenId = `trace_${ulid()}`;
     fixtureTraces = [
-      { id: okId, timestamp: "2026-07-12T06:00:00.000Z", name: "ok" },
-      { id: brokenId, timestamp: "2026-07-12T06:00:01.000Z", name: "broken-detail" }
+      { id: okId, timestamp: "2026-08-12T06:00:00.000Z", name: "ok" },
+      { id: brokenId, timestamp: "2026-08-12T06:00:01.000Z", name: "broken-detail" }
     ];
     fixtureDetails = { [brokenId]: { failWith: 500 } };
 
@@ -504,8 +524,63 @@ describe("runLangfuseImport", () => {
     expect(retry?.imported).toBe(2);
   });
 
+  it("skips an invalid provider identifier per trace and advances the page", async () => {
+    const invalidId = "x".repeat(513);
+    fixtureTraces = [{
+      id: invalidId,
+      timestamp: "2026-08-12T06:30:00.000Z",
+      name: "invalid-id"
+    }];
+    const invalid: Array<{ traceId: string; error: unknown }> = [];
+
+    await expect(runLangfuseImport({
+      pool,
+      clickhouse,
+      projectId,
+      client: clientConfig(),
+      pageSize: 10,
+      onInvalidTrace: (traceId, error) => invalid.push({ traceId, error })
+    })).resolves.toMatchObject({ imported: 0, resumable: false });
+
+    expect(invalid).toHaveLength(1);
+    expect(invalid[0]?.traceId).toBe(invalidId);
+    await expect(getImportCheckpoint(pool, projectId, "langfuse"))
+      .resolves.toMatchObject({ status: "idle", checkpoint: { page: 1 } });
+  });
+
+  it("does not resurrect an expired inclusive-boundary trace", async () => {
+    const traceId = `trace_${ulid()}`;
+    fixtureTraces = [{
+      id: traceId,
+      timestamp: "2020-07-12T00:00:00.000Z",
+      name: "expired-boundary"
+    }];
+    await recordEvaluatorImportRetentionCutoffs(pool, [{
+      projectId,
+      traceTimestampBefore: "2024-01-01T00:00:00.000Z"
+    }]);
+    try {
+      await runLangfuseImport({ pool, clickhouse, projectId, client: clientConfig(), pageSize: 10 });
+      await runLangfuseImport({ pool, clickhouse, projectId, client: clientConfig(), pageSize: 10 });
+
+      const rows = await clickhouse.query({
+        query: "select id from traces final where project_id = {projectId:String} and id = {traceId:String}",
+        query_params: { projectId, traceId },
+        format: "JSONEachRow"
+      });
+      expect(await rows.json()).toEqual([]);
+      expect((await getEvaluatorTracePublications(pool, projectId, [traceId])).has(traceId))
+        .toBe(false);
+    } finally {
+      await pool.query(
+        "delete from evaluator_import_retention_cutoffs where project_id = $1",
+        [projectId]
+      );
+    }
+  });
+
   it("a concurrent call while a run is already 'running' returns null instead of racing the checkpoint", async () => {
-    fixtureTraces = [{ id: `trace_${ulid()}`, timestamp: "2026-07-12T03:00:00.000Z", name: "x" }];
+    fixtureTraces = [{ id: `trace_${ulid()}`, timestamp: "2026-08-12T03:00:00.000Z", name: "x" }];
 
     // Manually put the checkpoint into a running state to simulate an
     // in-flight run without actually holding one open concurrently.

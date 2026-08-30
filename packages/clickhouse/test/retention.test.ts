@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { createClickHouseClient } from "../src/client.js";
 import { runMigrations } from "../src/migrate.js";
-import { insertTraces } from "../src/rows.js";
+import { insertObservations, insertTraces } from "../src/rows.js";
 import { dropPartitionsOlderThan, listPartitions, markProjectDataDeletedOlderThan } from "../src/retention.js";
 
 const client = createClickHouseClient({
@@ -135,6 +135,13 @@ describe("retention", () => {
     const oldTraceId = `trace_${crypto.randomUUID()}`;
     const recentTraceId = `trace_${crypto.randomUUID()}`;
     const otherOldTraceId = `trace_${crypto.randomUUID()}`;
+    // Keep fixtures in current/future physical partitions so another test
+    // file's legitimate global partition drop cannot erase the physical
+    // tombstone this assertion inspects. They are old/recent relative to this
+    // test's advanced logical cutoff, not an ancient shared partition.
+    const oldTimestamp = new Date();
+    const cutoff = new Date(oldTimestamp.getTime() + 24 * 60 * 60 * 1000);
+    const recentTimestamp = new Date(cutoff.getTime() + 24 * 60 * 60 * 1000);
 
     await insertTraces(
       client,
@@ -142,7 +149,7 @@ describe("retention", () => {
         {
           id: oldTraceId,
           projectId: targetProject,
-          timestamp: "2023-06-01T00:00:00.000Z",
+          timestamp: oldTimestamp.toISOString(),
           name: "old-trace",
           userId: "user_123",
           tags: ["a", "b"],
@@ -153,7 +160,7 @@ describe("retention", () => {
         {
           id: recentTraceId,
           projectId: targetProject,
-          timestamp: new Date().toISOString(),
+          timestamp: recentTimestamp.toISOString(),
           name: "recent-trace",
           tags: [],
           metadata: {}
@@ -161,7 +168,7 @@ describe("retention", () => {
         {
           id: otherOldTraceId,
           projectId: otherProject,
-          timestamp: "2023-06-01T00:00:00.000Z",
+          timestamp: oldTimestamp.toISOString(),
           name: "other-project-old-trace",
           tags: [],
           metadata: {}
@@ -170,7 +177,7 @@ describe("retention", () => {
       { eventTs: new Date().toISOString() }
     );
 
-    await markProjectDataDeletedOlderThan(client, "traces", targetProject, new Date("2024-01-01T00:00:00Z"));
+    await markProjectDataDeletedOlderThan(client, "traces", targetProject, cutoff);
 
     // ReplacingMergeTree(event_ts, is_deleted)'s is_deleted is the
     // engine's own tombstone marker: FINAL doesn't just dedup to the
@@ -219,6 +226,41 @@ describe("retention", () => {
     expect(latestVersion?.metadata).toEqual({ key: "value" });
     expect(JSON.parse(latestVersion?.input ?? "null")).toEqual({ q: "hello" });
     expect(JSON.parse(latestVersion?.output ?? "null")).toEqual({ a: "world" });
+  });
+
+  it("retains old observations while their parent trace remains in-window", async () => {
+    const projectId = `proj_retention_tree_${crypto.randomUUID()}`;
+    const traceId = `trace_${crypto.randomUUID()}`;
+    const observationId = `obs_${crypto.randomUUID()}`;
+    const eventTs = new Date().toISOString();
+    await insertTraces(client, [{
+      id: traceId,
+      projectId,
+      timestamp: new Date().toISOString(),
+      tags: [],
+      metadata: {}
+    }], { eventTs });
+    await insertObservations(client, [{
+      id: observationId,
+      traceId,
+      projectId,
+      type: "span",
+      startTime: "2020-01-15T00:00:00.000Z",
+      level: "default",
+      metadata: {}
+    }], { eventTs });
+
+    const cutoff = new Date("2024-01-01T00:00:00.000Z");
+    await markProjectDataDeletedOlderThan(client, "observations", projectId, cutoff);
+    const dropped = await dropPartitionsOlderThan(client, "observations", cutoff);
+
+    const remaining = await client.query({
+      query: "select id from observations final where project_id = {projectId:String} and id = {observationId:String}",
+      query_params: { projectId, observationId },
+      format: "JSONEachRow"
+    });
+    expect(await remaining.json()).toHaveLength(1);
+    expect(dropped).not.toContain("202001");
   });
 
   it("listPartitions returns partitions oldest-first with their actual min timestamp", async () => {

@@ -10,7 +10,7 @@ import {
 } from "@ironside/db";
 import { ulid } from "ulid";
 import type { Pool } from "pg";
-import type { Observation, Score, Trace } from "@ironside/shared";
+import type { Observation, Trace } from "@ironside/shared";
 import { LangfuseClient, type LangfuseClientConfig, type LangfuseListTrace } from "./langfuse-client.js";
 import { mapLangfuseObservation, mapLangfuseScore, mapLangfuseTraceDetail } from "./langfuse-mapper.js";
 import {
@@ -36,6 +36,8 @@ export interface RunLangfuseImportOptions {
   /** Safety cap on pages per invocation, so one call can't run unbounded against a huge account. Resumes on the next call via the saved checkpoint. */
   maxPagesPerRun?: number;
   onEnvironmentRegistryOverflow?: (count: number) => void;
+  /** Invalid provider rows are skipped so one poison trace cannot pin the source checkpoint. */
+  onInvalidTrace?: (traceId: string, error: unknown) => void;
 }
 
 export interface LangfuseImportResult {
@@ -137,25 +139,32 @@ export async function runLangfuseImport(
         // dedups re-inserts) — no partial page is ever recorded as done.
         const traces: Trace[] = [];
         const observations: Observation[] = [];
-        const scores: Score[] = [];
+        const candidateActivityAt = new Date().toISOString();
+        const snapshots = new Map<string, ReturnType<typeof importedTraceSnapshot>>();
         for (const listTrace of response.data as LangfuseListTrace[]) {
           await renewImportRunLease(pool, projectId, "langfuse", runToken);
           const detail = await client.getTraceDetail(listTrace.id);
-          traces.push(mapLangfuseTraceDetail(projectId, detail));
-          for (const obs of detail.observations) {
-            observations.push(mapLangfuseObservation(projectId, detail.id, obs));
-          }
-          for (const score of detail.scores) {
-            scores.push(mapLangfuseScore(projectId, score));
+          try {
+            const trace = mapLangfuseTraceDetail(projectId, detail);
+            const traceObservations = detail.observations.map((observation) =>
+              mapLangfuseObservation(projectId, detail.id, observation)
+            );
+            const traceScores = detail.scores.map((score) => mapLangfuseScore(projectId, score));
+            const snapshot = importedTraceSnapshot(
+              trace,
+              traceObservations,
+              traceScores,
+              candidateActivityAt
+            );
+            traces.push(snapshot.trace);
+            observations.push(...snapshot.observations);
+            snapshots.set(snapshot.trace.id, snapshot);
+          } catch (error) {
+            (options.onInvalidTrace ?? ((traceId, cause) =>
+              console.error(`[import:langfuse] skipping invalid trace ${traceId}`, cause)
+            ))(listTrace.id, error);
           }
         }
-        const candidateActivityAt = new Date().toISOString();
-        const snapshots = new Map(traces.map((trace) => [trace.id, importedTraceSnapshot(
-          trace,
-          observations,
-          scores,
-          candidateActivityAt
-        )]));
         const staged = await stageEvaluatorImportTraces(pool, {
           projectId,
           source: "langfuse",

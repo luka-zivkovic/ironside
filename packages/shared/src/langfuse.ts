@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { identifierSchema } from "./domain.js";
 
 // LangFuse /api/public/ingestion compat — verified against LangFuse's Fern
 // API definition (github.com/langfuse/langfuse fern/apis/server/definition/
@@ -67,7 +68,7 @@ export type LangfuseIngestionResponse = z.infer<typeof langfuseIngestionResponse
 const opt = <T extends z.ZodTypeAny>(schema: T) => schema.nullable().optional();
 
 export const langfuseTraceBodySchema = z.object({
-  id: opt(z.string()),
+  id: opt(identifierSchema),
   timestamp: opt(z.string()),
   name: opt(z.string()),
   userId: opt(z.string()),
@@ -99,9 +100,9 @@ const langfuseUsageDetailsShape = z.union([
 ]);
 
 export const langfuseObservationBodySchema = z.object({
-  id: opt(z.string()),
-  traceId: opt(z.string()),
-  parentObservationId: opt(z.string()),
+  id: opt(identifierSchema),
+  traceId: opt(identifierSchema),
+  parentObservationId: opt(identifierSchema),
   name: opt(z.string()),
   startTime: opt(z.string()),
   endTime: opt(z.string()),
@@ -118,9 +119,9 @@ export const langfuseObservationBodySchema = z.object({
 });
 
 export const langfuseScoreBodySchema = z.object({
-  id: opt(z.string()),
-  traceId: z.string(),
-  observationId: opt(z.string()),
+  id: opt(identifierSchema),
+  traceId: identifierSchema,
+  observationId: opt(identifierSchema),
   name: z.string(),
   value: opt(z.union([z.number(), z.string()])),
   dataType: opt(z.enum(["NUMERIC", "CATEGORICAL", "BOOLEAN"])),

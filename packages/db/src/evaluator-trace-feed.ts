@@ -1,4 +1,5 @@
 import type { Observation, Score, Trace } from "@ironside/shared";
+import { Buffer } from "node:buffer";
 import type { Pool } from "pg";
 
 export interface EvaluatorTraceActivity {
@@ -33,6 +34,62 @@ export interface EvaluatorPendingImportSnapshot extends EvaluatorImportTraceStat
   snapshot: EvaluatorImportTraceSnapshot;
 }
 
+export interface EvaluatorLegacyPendingImport extends EvaluatorImportTraceState {
+  source: EvaluatorImportSource;
+}
+
+function encodeEvaluatorImportSnapshot(snapshot: EvaluatorImportTraceSnapshot): string {
+  // PostgreSQL jsonb rejects U+0000 even though it is legal inside a JSON
+  // string. Store the recovery envelope as base64 JSON inside jsonb so the
+  // durable snapshot can preserve the provider payload byte-for-byte without
+  // letting one valid payload poison the source checkpoint.
+  return Buffer.from(JSON.stringify(snapshot), "utf8").toString("base64");
+}
+
+function decodeEvaluatorImportSnapshot(value: unknown): EvaluatorImportTraceSnapshot {
+  if (typeof value === "string") {
+    return JSON.parse(Buffer.from(value, "base64").toString("utf8")) as EvaluatorImportTraceSnapshot;
+  }
+  // Compatibility with recovery rows staged by the pre-base64 PR revision.
+  return value as EvaluatorImportTraceSnapshot;
+}
+
+export async function recordEvaluatorImportRetentionCutoffs(
+  pool: Pool,
+  entries: Array<{ projectId: string; traceTimestampBefore: string }>
+): Promise<void> {
+  const unique = [...new Map(entries.map((entry) => [entry.projectId, entry])).values()];
+  if (unique.length === 0) return;
+  await pool.query(
+    `insert into evaluator_import_retention_cutoffs
+       (project_id, trace_timestamp_before)
+     select item ->> 'projectId',
+            (item ->> 'traceTimestampBefore')::timestamptz
+       from jsonb_array_elements($1::jsonb) as item
+       join projects on projects.id = (item ->> 'projectId')
+     on conflict (project_id) do update
+       set trace_timestamp_before = greatest(
+             evaluator_import_retention_cutoffs.trace_timestamp_before,
+             excluded.trace_timestamp_before
+           ),
+           updated_at = clock_timestamp()`,
+    [JSON.stringify(unique)]
+  );
+}
+
+export async function getEvaluatorImportRetentionCutoff(
+  pool: Pool,
+  projectId: string
+): Promise<string | null> {
+  const result = await pool.query<{ trace_timestamp_before: Date }>(
+    `select trace_timestamp_before
+       from evaluator_import_retention_cutoffs
+      where project_id = $1`,
+    [projectId]
+  );
+  return result.rows[0]?.trace_timestamp_before.toISOString() ?? null;
+}
+
 /**
  * Marks pull-imported snapshots pending before any ClickHouse write. Exact
  * current-content retries reuse their activity generation; a changed or
@@ -53,7 +110,10 @@ export async function stageEvaluatorImportTraces(
     }[];
   }
 ): Promise<Map<string, EvaluatorImportTraceState>> {
-  const traces = [...new Map(input.traces.map((trace) => [trace.traceId, trace])).values()];
+  const traces = [...new Map(input.traces.map((trace) => [trace.traceId, {
+    ...trace,
+    snapshot: encodeEvaluatorImportSnapshot(trace.snapshot)
+  }])).values()];
   if (traces.length === 0) return new Map();
   const result = await pool.query<{
     trace_id: string;
@@ -94,12 +154,21 @@ export async function stageEvaluatorImportTraces(
            end,
            snapshot = case
              when evaluator_import_trace_state.content_hash = excluded.content_hash
-               and evaluator_import_trace_state.pending
                then evaluator_import_trace_state.snapshot
              else excluded.snapshot
            end,
-           run_token = excluded.run_token,
-           pending = true,
+           run_token = case
+             when evaluator_import_trace_state.content_hash = excluded.content_hash
+               and not evaluator_import_trace_state.pending
+               then evaluator_import_trace_state.run_token
+             else excluded.run_token
+           end,
+           pending = case
+             when evaluator_import_trace_state.content_hash = excluded.content_hash
+               and not evaluator_import_trace_state.pending
+               then false
+             else true
+           end,
            staged_at = clock_timestamp()
      returning trace_id, activity_id, source_activity_at`,
     [
@@ -133,7 +202,7 @@ export async function claimPendingEvaluatorImportSnapshots(
       trace_id: string;
       activity_id: string;
       source_activity_at: string;
-      snapshot: EvaluatorImportTraceSnapshot;
+      snapshot: unknown;
     }> | null;
   }>(
     `with active_run as (
@@ -165,8 +234,93 @@ export async function claimPendingEvaluatorImportSnapshots(
     activityId: entry.activity_id,
     sourceActivityAt: entry.source_activity_at,
     source: input.source,
-    snapshot: entry.snapshot
+    snapshot: decodeEvaluatorImportSnapshot(entry.snapshot)
   }));
+}
+
+export async function discardPendingEvaluatorImportSnapshot(
+  pool: Pool,
+  input: {
+    projectId: string;
+    source: EvaluatorImportSource;
+    traceId: string;
+    activityId: string;
+    sourceActivityAt: string;
+    runToken: string;
+  }
+): Promise<void> {
+  const result = await pool.query(
+    `update evaluator_import_trace_state
+        set pending = false,
+            snapshot = null,
+            run_token = null
+      where project_id = $1 and source = $2 and trace_id = $3
+        and activity_id = $4 and source_activity_at = $5::timestamptz
+        and run_token = $6 and pending
+        and exists (
+          select 1
+            from import_checkpoints
+           where project_id = $1 and source = $2 and status = 'running'
+             and run_token = $6 and lease_expires_at > clock_timestamp()
+        )`,
+    [
+      input.projectId,
+      input.source,
+      input.traceId,
+      input.activityId,
+      input.sourceActivityAt,
+      input.runToken
+    ]
+  );
+  if (result.rowCount !== 1) throw new Error("stale imported evaluator materialization");
+}
+
+export async function listLegacyPendingEvaluatorImports(
+  pool: Pool,
+  input: { projectId: string; source: EvaluatorImportSource }
+): Promise<EvaluatorLegacyPendingImport[]> {
+  const result = await pool.query<{
+    trace_id: string;
+    activity_id: string;
+    source_activity_at: Date;
+  }>(
+    `select trace_id, activity_id, source_activity_at
+       from evaluator_import_legacy_pending_recovery
+      where project_id = $1 and source = $2
+      order by trace_id`,
+    [input.projectId, input.source]
+  );
+  return result.rows.map((row) => ({
+    traceId: row.trace_id,
+    activityId: row.activity_id,
+    sourceActivityAt: row.source_activity_at.toISOString(),
+    source: input.source
+  }));
+}
+
+export async function deleteLegacyPendingEvaluatorImport(
+  pool: Pool,
+  input: {
+    projectId: string;
+    source: EvaluatorImportSource;
+    traceId: string;
+    activityId: string;
+    runToken: string;
+  }
+): Promise<void> {
+  const result = await pool.query(
+    `delete from evaluator_import_legacy_pending_recovery legacy
+      where project_id = $1 and source = $2 and trace_id = $3
+        and activity_id = $4
+        and exists (
+          select 1
+            from import_checkpoints
+           where project_id = $1 and source = $2 and status = 'running'
+             and run_token = $5 and lease_expires_at > clock_timestamp()
+        )`,
+    [input.projectId, input.source, input.traceId, input.activityId, input.runToken]
+  );
+  if (result.rowCount !== 1) throw new Error("legacy import recovery lease was lost");
 }
 
 export async function listEvaluatorImportRecoveryCandidates(
@@ -177,19 +331,25 @@ export async function listEvaluatorImportRecoveryCandidates(
     throw new Error("evaluator import recovery limit must be between 1 and 1000");
   }
   const result = await pool.query<{ project_id: string; source: EvaluatorImportSource }>(
-    `select state.project_id, state.source
-       from evaluator_import_trace_state state
+    `select pending.project_id, pending.source
+       from (
+         select project_id, source
+           from evaluator_import_trace_state
+          where pending
+         union
+         select project_id, source
+           from evaluator_import_legacy_pending_recovery
+       ) pending
        join import_checkpoints checkpoint
-         on checkpoint.project_id = state.project_id
-        and checkpoint.source = state.source
-      where state.pending
-        and (
+         on checkpoint.project_id = pending.project_id
+        and checkpoint.source = pending.source
+      where (
           checkpoint.status != 'running'
           or checkpoint.lease_expires_at is null
           or checkpoint.lease_expires_at <= clock_timestamp()
         )
-      group by state.project_id, state.source
-      order by state.project_id, state.source
+      group by pending.project_id, pending.source
+      order by pending.project_id, pending.source
       limit $1`,
     [limit]
   );
@@ -204,9 +364,13 @@ export async function listPendingEvaluatorImportTraceIds(
   const uniqueTraceIds = [...new Set(traceIds)].filter(Boolean);
   if (uniqueTraceIds.length === 0) return new Set();
   const result = await pool.query<{ trace_id: string }>(
-    `select distinct trace_id
+    `select trace_id
        from evaluator_import_trace_state
-      where project_id = $1 and trace_id = any($2::text[]) and pending`,
+      where project_id = $1 and trace_id = any($2::text[]) and pending
+     union
+     select trace_id
+       from evaluator_import_legacy_pending_recovery
+      where project_id = $1 and trace_id = any($2::text[])`,
     [projectId, uniqueTraceIds]
   );
   return new Set(result.rows.map((row) => row.trace_id));
@@ -333,6 +497,7 @@ export async function publishEvaluatorTraceActivities(
     activityId: string;
     importSource?: EvaluatorImportSource;
     importRunToken?: string;
+    importTraceTimestamp?: string;
   }
 ): Promise<void> {
   const traceIds = [...new Set(input.traceIds)].filter((traceId) => traceId.length > 0);
@@ -352,17 +517,28 @@ export async function publishEvaluatorTraceActivities(
       if (!input.importRunToken) {
         throw new Error("imported evaluator publication requires a run token");
       }
+      if (!input.importTraceTimestamp) {
+        throw new Error("imported evaluator publication requires a trace timestamp");
+      }
       if (traceIds.length !== 1) {
         throw new Error("imported evaluator publication requires exactly one trace");
       }
       const claimed = await client.query(
         `update evaluator_import_trace_state
-            set pending = false
+            set pending = false,
+                snapshot = null,
+                run_token = null
           where project_id = $1 and trace_id = $2 and source = $3
             and activity_id = $4
             and source_activity_at = $5::timestamptz
             and run_token = $6
             and pending
+            and not exists (
+              select 1
+                from evaluator_import_retention_cutoffs cutoff
+               where cutoff.project_id = $1
+                 and cutoff.trace_timestamp_before > $7::timestamptz
+            )
             and exists (
               select 1
                 from import_checkpoints
@@ -376,7 +552,8 @@ export async function publishEvaluatorTraceActivities(
           input.importSource,
           input.activityId,
           input.sourceActivityAt,
-          input.importRunToken
+          input.importRunToken,
+          input.importTraceTimestamp
         ]
       );
       if (claimed.rowCount !== 1) {

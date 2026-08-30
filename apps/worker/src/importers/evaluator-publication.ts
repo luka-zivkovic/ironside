@@ -3,13 +3,18 @@ import {
   insertObservations,
   insertScores,
   insertTraces,
+  tombstoneExpiredImportedTraceSnapshot,
   tombstoneImportedTraceSnapshot,
   type ClickHouseClient
 } from "@ironside/clickhouse";
 import {
   claimImportRun,
   claimPendingEvaluatorImportSnapshots,
+  deleteLegacyPendingEvaluatorImport,
+  discardPendingEvaluatorImportSnapshot,
+  getEvaluatorImportRetentionCutoff,
   listEvaluatorImportRecoveryCandidates,
+  listLegacyPendingEvaluatorImports,
   markImportRunFailed,
   markImportRunIdle,
   publishEvaluatorTraceActivities,
@@ -61,21 +66,27 @@ export function importedTraceSnapshot(
   scores: EvaluatorImportTraceSnapshot["scores"],
   scoreActivityAt: string
 ): EvaluatorImportTraceSnapshot {
-  return {
+  return validateSnapshot({
     trace,
     observations: observations.filter((observation) => observation.traceId === trace.id),
     scores: scores.filter((score) => score.traceId === trace.id),
     scoreActivityAt
-  };
+  });
 }
 
-function validateSnapshot(snapshot: EvaluatorImportTraceSnapshot): EvaluatorImportTraceSnapshot {
+function validateSnapshot(
+  snapshot: EvaluatorImportTraceSnapshot,
+  expected?: { projectId: string; traceId: string }
+): EvaluatorImportTraceSnapshot {
   const trace = traceSchema.parse(snapshot.trace);
   const observations = snapshot.observations.map((observation) => observationSchema.parse(observation));
   const scores = snapshot.scores.map((score) => scoreSchema.parse(score));
   if (
+    (expected && (trace.id !== expected.traceId || trace.projectId !== expected.projectId)) ||
     observations.some((observation) => observation.traceId !== trace.id) ||
-    scores.some((score) => score.traceId !== trace.id)
+    scores.some((score) => score.traceId !== trace.id) ||
+    observations.some((observation) => observation.projectId !== trace.projectId) ||
+    scores.some((score) => score.projectId !== trace.projectId)
   ) {
     throw new Error(`imported evaluator snapshot mixes trace identities: ${trace.id}`);
   }
@@ -96,7 +107,34 @@ export async function materializeEvaluatorImportSnapshot(
   state: EvaluatorPendingImportSnapshot
 ): Promise<void> {
   await renewImportRunLease(options.pool, options.projectId, state.source, options.runToken);
-  const snapshot = validateSnapshot(state.snapshot);
+  const snapshot = validateSnapshot(state.snapshot, {
+    projectId: options.projectId,
+    traceId: state.traceId
+  });
+  const discardIfExpired = async (): Promise<boolean> => {
+    const cutoff = await getEvaluatorImportRetentionCutoff(options.pool, options.projectId);
+    if (!cutoff || Date.parse(snapshot.trace.timestamp) >= Date.parse(cutoff)) return false;
+    // A prior attempt may have written ClickHouse and then lost the cutoff
+    // race at the fenced PG publication. Tombstone idempotently before
+    // clearing the durable recovery barrier even when this attempt itself has
+    // not written yet.
+    await tombstoneExpiredImportedTraceSnapshot(
+      options.clickhouse,
+      options.projectId,
+      state.traceId,
+      state.sourceActivityAt
+    );
+    await discardPendingEvaluatorImportSnapshot(options.pool, {
+      projectId: options.projectId,
+      source: state.source,
+      traceId: state.traceId,
+      activityId: state.activityId,
+      sourceActivityAt: state.sourceActivityAt,
+      runToken: options.runToken
+    });
+    return true;
+  };
+  if (await discardIfExpired()) return;
   await tombstoneImportedTraceSnapshot(
     options.clickhouse,
     options.projectId,
@@ -112,6 +150,30 @@ export async function materializeEvaluatorImportSnapshot(
       eventTs: snapshot.scoreActivityAt
     })
   ]);
+  const cutoffAfterWrite = await getEvaluatorImportRetentionCutoff(
+    options.pool,
+    options.projectId
+  );
+  if (
+    cutoffAfterWrite &&
+    Date.parse(snapshot.trace.timestamp) < Date.parse(cutoffAfterWrite)
+  ) {
+    await tombstoneExpiredImportedTraceSnapshot(
+      options.clickhouse,
+      options.projectId,
+      state.traceId,
+      state.sourceActivityAt
+    );
+    await discardPendingEvaluatorImportSnapshot(options.pool, {
+      projectId: options.projectId,
+      source: state.source,
+      traceId: state.traceId,
+      activityId: state.activityId,
+      sourceActivityAt: state.sourceActivityAt,
+      runToken: options.runToken
+    });
+    return;
+  }
   await observeTraceEnvironments(
     options.pool,
     options.projectId,
@@ -124,7 +186,8 @@ export async function materializeEvaluatorImportSnapshot(
     sourceActivityAt: state.sourceActivityAt,
     activityId: state.activityId,
     importSource: state.source,
-    importRunToken: options.runToken
+    importRunToken: options.runToken,
+    importTraceTimestamp: snapshot.trace.timestamp
   });
 }
 
@@ -137,11 +200,28 @@ export async function recoverPendingEvaluatorImportSnapshots(options: {
   runToken: string;
   onEnvironmentRegistryOverflow?: ((count: number) => void) | undefined;
 }): Promise<number> {
+  const legacy = await listLegacyPendingEvaluatorImports(options.pool, options);
+  for (const state of legacy) {
+    await renewImportRunLease(options.pool, options.projectId, state.source, options.runToken);
+    await tombstoneExpiredImportedTraceSnapshot(
+      options.clickhouse,
+      options.projectId,
+      state.traceId,
+      state.sourceActivityAt
+    );
+    await deleteLegacyPendingEvaluatorImport(options.pool, {
+      projectId: options.projectId,
+      source: state.source,
+      traceId: state.traceId,
+      activityId: state.activityId,
+      runToken: options.runToken
+    });
+  }
   const pending = await claimPendingEvaluatorImportSnapshots(options.pool, options);
   for (const snapshot of pending) {
     await materializeEvaluatorImportSnapshot(options, snapshot);
   }
-  return pending.length;
+  return legacy.length + pending.length;
 }
 
 /**

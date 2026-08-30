@@ -187,24 +187,43 @@ export function evaluatorReadRoutes(deps: EvaluatorReadDeps): Hono<AuthEnv> {
         listPendingEvaluatorImportTraceIds(deps.pool, projectId, candidateTraceIds)
       ]);
       const pendingTraceIds = new Set([...pendingRawTraceIds, ...pendingImportTraceIds]);
-      const firstPendingIndex = candidatePage.findIndex((row) => pendingTraceIds.has(row.id));
-      const page = firstPendingIndex === -1
-        ? candidatePage
-        : candidatePage.slice(0, firstPendingIndex);
-      const blocked = firstPendingIndex !== -1;
       const publications = await getEvaluatorTracePublications(
         deps.pool,
         projectId,
-        page.map((row) => row.id)
+        candidateTraceIds
       );
-      const last = page.at(-1);
-      const nextCursor = (hasMore || blocked) && last
+      const page: typeof candidatePage = [];
+      let lastConsumed: (typeof candidatePage)[number] | undefined;
+      let blocked = false;
+      for (const row of candidatePage) {
+        if (pendingTraceIds.has(row.id)) {
+          blocked = true;
+          break;
+        }
+        const publication = publications.get(row.id);
+        if (publication && row.trace_version !== publication.sourceActivityAt) {
+          if (row.trace_version < publication.sourceActivityAt) {
+            // Row-level retention removed the activity that supplied the
+            // published snapshot. Advance without advertising a detail
+            // version that the exact-version endpoint must reject.
+            lastConsumed = row;
+            continue;
+          }
+          // A newer ClickHouse generation is not yet matched by a durable
+          // publication. Keep this bootstrap cursor before it.
+          blocked = true;
+          break;
+        }
+        page.push(row);
+        lastConsumed = row;
+      }
+      const nextCursor = (hasMore || blocked) && lastConsumed
         ? encodeEvaluatorCursor({
             v: 1,
             kind: "bootstrap",
             through: cursor.through,
-            afterVersion: last.trace_version,
-            afterTraceId: last.id
+            afterVersion: lastConsumed.trace_version,
+            afterTraceId: lastConsumed.id
           })
         : blocked
           ? encodeEvaluatorCursor(cursor)
@@ -213,8 +232,8 @@ export function evaluatorReadRoutes(deps: EvaluatorReadDeps): Hono<AuthEnv> {
               v: 1,
               kind: "bootstrap",
               through: cursor.through,
-              afterVersion: last?.trace_version ?? windowTo,
-              afterTraceId: last?.id ?? "\uffff"
+              afterVersion: lastConsumed?.trace_version ?? windowTo,
+              afterTraceId: lastConsumed?.id ?? "\uffff"
             })
           : encodeEvaluatorCursor(initialLiveEvaluatorCursor());
       const response: EvaluatorTraceFeedResponse = {
@@ -229,10 +248,10 @@ export function evaluatorReadRoutes(deps: EvaluatorReadDeps): Hono<AuthEnv> {
           );
         }),
         nextCursor,
-        // A pending first row returns an unchanged cursor and false so a
-        // consumer yields instead of spinning. A safe prefix advertises the
-        // blocked remainder and the next request stops on that first row.
-        hasMore: blocked ? page.length > 0 : hasMore
+        // A blocked first row returns an unchanged cursor and false so a
+        // consumer yields instead of spinning. Any consumed safe prefix
+        // advertises the blocked remainder once, then stops on that row.
+        hasMore: blocked ? lastConsumed !== undefined : hasMore
       };
       return c.json(response, 200);
     }
@@ -268,7 +287,36 @@ export function evaluatorReadRoutes(deps: EvaluatorReadDeps): Hono<AuthEnv> {
         blocked = true;
         break;
       }
-      const current = currentByTraceId.get(activity.traceId);
+      let current = currentByTraceId.get(activity.traceId);
+      if (!current || current.trace_version < activity.sourceActivityAt) {
+        // Seqlock the destructive-looking state. A pull import stages its
+        // durable pending row before tombstoning ClickHouse; the initial
+        // Promise.all above can observe those two stores in the opposite
+        // order. Re-read pending after the CH read, then CH again, then
+        // pending once more. Never consume an orphan/regression while either
+        // pending guard is visible.
+        const [rawPendingAfter, importPendingAfter] = await Promise.all([
+          listPendingTraceRawRefIds(deps.clickhouse, projectId, [activity.traceId]),
+          listPendingEvaluatorImportTraceIds(deps.pool, projectId, [activity.traceId])
+        ]);
+        if (rawPendingAfter.has(activity.traceId) || importPendingAfter.has(activity.traceId)) {
+          blocked = true;
+          break;
+        }
+        current = (await getVersionedTraceSummaries(
+          deps.clickhouse,
+          projectId,
+          [activity.traceId]
+        )).get(activity.traceId);
+        const [rawPendingFinal, importPendingFinal] = await Promise.all([
+          listPendingTraceRawRefIds(deps.clickhouse, projectId, [activity.traceId]),
+          listPendingEvaluatorImportTraceIds(deps.pool, projectId, [activity.traceId])
+        ]);
+        if (rawPendingFinal.has(activity.traceId) || importPendingFinal.has(activity.traceId)) {
+          blocked = true;
+          break;
+        }
+      }
       if (!current) {
         // Retention may remove the trace after its feed row was published.
         // Advancing past the orphan prevents one deleted trace from blocking

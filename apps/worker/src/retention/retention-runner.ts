@@ -9,7 +9,8 @@ import {
   deleteEvaluatorTraceFeedEntries,
   listAllProjects,
   listEvaluatorTraceFeedKeys,
-  purgeIngestFailuresOlderThan
+  purgeIngestFailuresOlderThan,
+  recordEvaluatorImportRetentionCutoffs
 } from "@ironside/db";
 import type { Pool } from "pg";
 
@@ -63,6 +64,21 @@ export async function runRetention(options: RunRetentionOptions): Promise<Retent
   );
   const now = options.now ?? new Date();
   const globalCutoff = daysAgo(globalFloorDays, now);
+
+  // Publish the monotonic cutoff before deleting ClickHouse rows. Inclusive
+  // provider checkpoints can otherwise reinsert an expired trace between the
+  // delete and the next poll. Import materialization rechecks this ledger
+  // after its writes, so either side of the race converges to deletion.
+  await recordEvaluatorImportRetentionCutoffs(
+    pool,
+    projects.map((project) => ({
+      projectId: project.id,
+      traceTimestampBefore: daysAgo(
+        project.retentionDays ?? options.defaultRetentionDays,
+        now
+      ).toISOString()
+    }))
+  );
 
   const droppedPartitions: Record<RetainedTable, string[]> = { traces: [], observations: [], scores: [] };
   for (const table of RETAINED_TABLES) {

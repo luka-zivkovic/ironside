@@ -43,8 +43,23 @@ describe("runMigrations (clickhouse)", () => {
       {
         id: "0002_raw_event_refs_object_projection",
         checksum: "088767d7d215fa64cd36c5c4719053d34dc87ac2006593892af2a9a9d886e60e"
+      },
+      {
+        id: "0003_traces_id_skip_index",
+        checksum: "1605e19e1e00bceff1f8290e070f9a16f0fb1fd720bd70c018b08f72a4b2b168"
       }
     ]);
+
+    const traceIndex = await client.query({
+      query: `
+        select name
+          from system.data_skipping_indices
+         where database = currentDatabase() and table = 'traces'
+           and name = 'idx_trace_id'
+      `,
+      format: "JSONEachRow"
+    });
+    expect(await traceIndex.json()).toEqual([{ name: "idx_trace_id" }]);
   });
 
   it("round-trips a trace row through the Map metadata column", async () => {
