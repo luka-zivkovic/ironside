@@ -4,6 +4,7 @@ import {
   getEvaluatorTracePublications,
   getImportCheckpoint,
   listPendingEvaluatorImportTraceIds,
+  recordEvaluatorImportRetentionCutoffs,
   runMigrations as runPgMigrations
 } from "@ironside/db";
 import { Pool } from "pg";
@@ -50,6 +51,10 @@ beforeAll(async () => {
     "insert into projects (id, organization_id, name) values ($1, $2, $3)",
     [projectId, orgId, "langsmith-importer-test"]
   );
+  await recordEvaluatorImportRetentionCutoffs(pool, [{
+    projectId,
+    traceTimestampBefore: "1970-01-01T00:00:00.000Z"
+  }]);
 
   server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");

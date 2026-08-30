@@ -68,6 +68,7 @@ export {
   dropPartitionsOlderThan,
   markChildrenOfExpiredTracesDeleted,
   markProjectDataDeletedOlderThan,
+  recordExpiredEvaluatorTraceId,
   recordExpiredEvaluatorTraceIds,
   type RetainedTable
 } from "./retention.js";

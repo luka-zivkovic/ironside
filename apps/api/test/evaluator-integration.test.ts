@@ -381,6 +381,70 @@ describe("native evaluator integration", () => {
     ]);
   });
 
+  it("keeps score-only import reconciliation invisible to evaluator reads", async () => {
+    const scoreProjectId = `proj_${ulid()}`;
+    await pool.query(
+      "insert into projects (id, organization_id, name) values ($1, $2, $3)",
+      [scoreProjectId, organizationId, "Score-only import barrier"]
+    );
+    const scoreKey = (
+      await createTestMachineCredential(pool, scoreProjectId, "coeval-score-only", "integration")
+    ).token;
+    const scoreHeaders = { authorization: `Bearer ${scoreKey}` };
+    const version = "2026-08-16T12:00:00.000Z";
+    const scoreTrace: Trace = {
+      ...trace,
+      id: `trace_${ulid()}`,
+      projectId: scoreProjectId,
+      timestamp: "2026-08-16T11:59:00.000Z",
+      name: "score-only-visible"
+    };
+    await insertTraces(clickhouse, [scoreTrace], { eventTs: version });
+    await publishEvaluatorTraceActivities(pool, {
+      projectId: scoreProjectId,
+      traceIds: [scoreTrace.id],
+      sourceActivityAt: version,
+      activityId: "batch_score_only_visible"
+    });
+    const beforePendingResponse = await app.request("/api/v1/evaluator/traces?limit=10", {
+      headers: scoreHeaders
+    });
+    const beforePending = evaluatorTraceFeedResponseSchema.parse(
+      await beforePendingResponse.json()
+    );
+    const stableVersion = beforePending.traces[0]!.traceVersion;
+    await pool.query(
+      `insert into evaluator_import_trace_state
+         (project_id, trace_id, source, content_hash, evaluator_content_hash,
+          activity_id, source_activity_at, snapshot, run_token, pending,
+          publish_required)
+       values ($1, $2, 'langfuse', $3, $4, $5, $6, '"snapshot"'::jsonb,
+               'run_score_only', true, false)`,
+      [
+        scoreProjectId,
+        scoreTrace.id,
+        "a".repeat(64),
+        "b".repeat(64),
+        `import_${ulid()}`,
+        "2026-08-16T12:01:00.000Z"
+      ]
+    );
+
+    const pageResponse = await app.request("/api/v1/evaluator/traces?limit=10", {
+      headers: scoreHeaders
+    });
+    expect(pageResponse.status).toBe(200);
+    const page = evaluatorTraceFeedResponseSchema.parse(await pageResponse.json());
+    expect(page.traces).toEqual([
+      expect.objectContaining({ traceId: scoreTrace.id, traceVersion: stableVersion })
+    ]);
+    const detail = await app.request(
+      `/api/v1/evaluator/traces/${scoreTrace.id}?version=${encodeURIComponent(stableVersion)}`,
+      { headers: scoreHeaders }
+    );
+    expect(detail.status).toBe(200);
+  });
+
   it("advances past retention-regressed activity but blocks unpublished newer materialization", async () => {
     const retentionProjectId = `proj_${ulid()}`;
     await pool.query(

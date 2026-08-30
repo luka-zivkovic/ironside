@@ -3,6 +3,7 @@ import {
   insertObservations,
   insertScores,
   insertTraces,
+  recordExpiredEvaluatorTraceId,
   tombstoneImportedScores,
   tombstoneExpiredImportedTraceSnapshot,
   tombstoneImportedTraceSnapshot,
@@ -140,17 +141,27 @@ export async function materializeEvaluatorImportSnapshot(
     });
     const discardIfExpired = async (): Promise<boolean> => {
       const cutoff = await getEvaluatorImportRetentionCutoff(options.pool, options.projectId);
-      if (!cutoff || Date.parse(snapshot.trace.timestamp) >= Date.parse(cutoff)) return false;
+      if (!cutoff) {
+        throw new Error(`evaluator import retention cutoff is not initialized: ${options.projectId}`);
+      }
+      if (Date.parse(snapshot.trace.timestamp) >= Date.parse(cutoff)) return false;
       // A prior attempt may have written ClickHouse and then lost the cutoff
       // race at the fenced PG publication. Tombstone idempotently before
       // clearing the durable recovery barrier even when this attempt itself has
       // not written yet.
+      // Persist the exact expired parent first. A concurrent/delayed score can
+      // arrive after this tombstone; the retention marker lets every later
+      // sweep remove such orphan children even though the parent is gone.
+      await recordExpiredEvaluatorTraceId(
+        options.clickhouse,
+        options.projectId,
+        state.traceId
+      );
       await tombstoneExpiredImportedTraceSnapshot(
         options.clickhouse,
         options.projectId,
         state.traceId,
-        state.sourceActivityAt,
-        state.source
+        state.sourceActivityAt
       );
       await discardPendingEvaluatorImportSnapshot(options.pool, {
         projectId: options.projectId,
@@ -215,16 +226,22 @@ export async function materializeEvaluatorImportSnapshot(
       options.pool,
       options.projectId
     );
+    if (!cutoffAfterWrite) {
+      throw new Error(`evaluator import retention cutoff disappeared: ${options.projectId}`);
+    }
     if (
-      cutoffAfterWrite &&
       Date.parse(snapshot.trace.timestamp) < Date.parse(cutoffAfterWrite)
     ) {
+      await recordExpiredEvaluatorTraceId(
+        options.clickhouse,
+        options.projectId,
+        state.traceId
+      );
       await tombstoneExpiredImportedTraceSnapshot(
         options.clickhouse,
         options.projectId,
         state.traceId,
-        state.sourceActivityAt,
-        state.source
+        state.sourceActivityAt
       );
       await discardPendingEvaluatorImportSnapshot(options.pool, {
         projectId: options.projectId,

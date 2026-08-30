@@ -403,7 +403,8 @@ export async function listPendingEvaluatorImportTraceIds(
   const result = await pool.query<{ trace_id: string }>(
     `select trace_id
        from evaluator_import_trace_state
-      where project_id = $1 and trace_id = any($2::text[]) and pending
+      where project_id = $1 and trace_id = any($2::text[])
+        and pending and publish_required
      union
      select trace_id
        from evaluator_import_legacy_pending_recovery

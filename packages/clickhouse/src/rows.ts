@@ -108,7 +108,7 @@ export async function tombstoneExpiredImportedTraceSnapshot(
   projectId: string,
   traceId: string,
   eventTs: string,
-  importSource: "langfuse" | "langsmith"
+  importSource?: "langfuse" | "langsmith"
 ): Promise<void> {
   const settings = {
     max_execution_time: 30,
@@ -147,11 +147,16 @@ export async function tombstoneExpiredImportedTraceSnapshot(
           (project_id, id, trace_id, timestamp, import_source, event_ts, is_deleted)
         select project_id, id, trace_id, timestamp, import_source,
                addMicroseconds({eventTs:DateTime64(6)}, 1), 1
-          from scores final
+         from scores final
          where project_id = {projectId:String} and trace_id = {traceId:String}
-           and import_source = {importSource:String}
+           ${importSource ? "and import_source = {importSource:String}" : ""}
       `,
-      query_params: { projectId, traceId, eventTs: toClickHouseDateTime(eventTs), importSource },
+      query_params: {
+        projectId,
+        traceId,
+        eventTs: toClickHouseDateTime(eventTs),
+        ...(importSource ? { importSource } : {})
+      },
       clickhouse_settings: settings
     })
   ]);

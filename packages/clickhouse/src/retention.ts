@@ -94,14 +94,16 @@ export async function dropPartitionsOlderThan(
     // legitimately belong to a recent trace (late import/backfill). Dropping
     // that child's monthly partition would change the evaluator-visible tree
     // without changing the trace's activity/version, so retain the whole
-    // partition while any row in it belongs to a trace still in-window.
+    // partition while any row in it belongs to a trace that is still live.
+    // The parent can remain visible even when its own timestamp is before the
+    // effective cutoff because its monthly partition contains a newer trace
+    // or is protected by the partition grace period.
     if (
       table !== "traces" &&
       await partitionHasChildOfRetainedTrace(
         client,
         table,
-        partition.partition,
-        effectiveCutoff
+        partition.partition
       )
     ) {
       continue;
@@ -117,8 +119,7 @@ export async function dropPartitionsOlderThan(
 async function partitionHasChildOfRetainedTrace(
   client: ClickHouseClient,
   table: Exclude<RetainedTable, "traces">,
-  partition: string,
-  cutoff: Date
+  partition: string
 ): Promise<boolean> {
   const result = await client.query({
     query: `
@@ -128,12 +129,10 @@ async function partitionHasChildOfRetainedTrace(
          and (project_id, trace_id) in (
            select project_id, id
              from traces final
-            where timestamp >= {cutoff:DateTime64(3)}
          )
     `,
     query_params: {
-      partition,
-      cutoff: toClickHouseDateTime(cutoff.toISOString())
+      partition
     },
     format: "JSONEachRow"
   });
@@ -289,6 +288,23 @@ export async function recordExpiredEvaluatorTraceIds(
       clickhouse_settings: LIFECYCLE_QUERY_SETTINGS
     });
   }
+}
+
+/** Persist one exact expired parent before an import-side tombstone hides it. */
+export async function recordExpiredEvaluatorTraceId(
+  client: ClickHouseClient,
+  projectId: string,
+  traceId: string
+): Promise<void> {
+  await client.insert({
+    table: "evaluator_trace_retention",
+    values: [{
+      project_id: projectId,
+      trace_id: traceId,
+      expired_at: toClickHouseDateTime(new Date().toISOString())
+    }],
+    format: "JSONEachRow"
+  });
 }
 
 const LIFECYCLE_PROJECT_BATCH_SIZE = 100;

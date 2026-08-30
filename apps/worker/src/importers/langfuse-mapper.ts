@@ -1,5 +1,11 @@
 import { canonicalizeUsageKeys } from "@ironside/mappers";
-import { normalizeEnvironment, type Observation, type Score, type Trace } from "@ironside/shared";
+import {
+  normalizeEnvironment,
+  scoreSchema,
+  type Observation,
+  type Score,
+  type Trace
+} from "@ironside/shared";
 import type {
   LangfuseListTrace,
   LangfuseObservation,
@@ -90,7 +96,7 @@ export function mapLangfuseObservation(
   };
 }
 
-export function mapLangfuseScore(projectId: string, source: LangfuseScore): Score {
+export function mapLangfuseScore(projectId: string, source: LangfuseScore): Score | null {
   const rawDataType = (source.dataType ?? "").toLowerCase();
   const dataType = (
     ["numeric", "categorical", "boolean"].includes(rawDataType)
@@ -107,7 +113,7 @@ export function mapLangfuseScore(projectId: string, source: LangfuseScore): Scor
     ["api", "eval", "annotation"].includes(rawSource) ? rawSource : "api"
   ) as Score["source"];
 
-  return {
+  const candidate = {
     id: source.id,
     projectId,
     traceId: source.traceId,
@@ -123,6 +129,8 @@ export function mapLangfuseScore(projectId: string, source: LangfuseScore): Scor
     ...(source.comment && { comment: source.comment }),
     ...(source.timestamp && { timestamp: source.timestamp })
   };
+  const parsed = scoreSchema.safeParse(candidate);
+  return parsed.success ? parsed.data : null;
 }
 
 function normalizeUsageDetails(

@@ -180,10 +180,10 @@ async function runRetentionFenced(options: RunRetentionOptions): Promise<Retenti
   // window (not the per-project retention settings) keeps the table
   // bounded without inventing a separate config knob for it.
   const purgedIngestFailures = await purgeIngestFailuresOlderThan(pool, 30);
-  const traceRetentionRan = droppedPartitions.traces.length > 0 || projectDeletes.length > 0;
-  const prunedEvaluatorTraceFeed = traceRetentionRan
-    ? await pruneOrphanedEvaluatorTraceFeed(pool, clickhouse)
-    : 0;
+  // Reconcile on every pass. A prior run may have deleted ClickHouse traces
+  // and then crashed before feed cleanup; conditioning this on deletions from
+  // only the current run would strand those durable orphans indefinitely.
+  const prunedEvaluatorTraceFeed = await pruneOrphanedEvaluatorTraceFeed(pool, clickhouse);
 
   return { droppedPartitions, projectDeletes, purgedIngestFailures, prunedEvaluatorTraceFeed };
 }

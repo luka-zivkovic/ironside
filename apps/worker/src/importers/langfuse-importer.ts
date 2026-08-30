@@ -149,7 +149,14 @@ export async function runLangfuseImport(
             const traceObservations = detail.observations.map((observation) =>
               mapLangfuseObservation(projectId, detail.id, observation)
             );
-            const traceScores = detail.scores.map((score) => mapLangfuseScore(projectId, score));
+            // Scores are annotations, not part of evaluator-visible trace
+            // identity. Filter malformed/valueless provider feedback per row
+            // so one unusable annotation cannot permanently skip an otherwise
+            // valid trace tree when the page checkpoint advances.
+            const traceScores = detail.scores.flatMap((score) => {
+              const mapped = mapLangfuseScore(projectId, score);
+              return mapped ? [mapped] : [];
+            });
             const snapshot = importedTraceSnapshot(
               trace,
               traceObservations,

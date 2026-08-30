@@ -150,36 +150,42 @@ function sourceScore(overrides: Partial<LangfuseScore> = {}): LangfuseScore {
 
 describe("mapLangfuseScore", () => {
   it("maps a BOOLEAN score keeping BOTH the 0/1 value and the True/False stringValue", () => {
-    const score = mapLangfuseScore("proj_x", sourceScore({ dataType: "BOOLEAN", value: 1, stringValue: "True" }));
+    const score = mapLangfuseScore("proj_x", sourceScore({ dataType: "BOOLEAN", value: 1, stringValue: "True" }))!;
     expect(score.dataType).toBe("boolean");
     expect(score.value).toBe(1);
     expect(score.stringValue).toBe("True");
   });
 
   it("keeps value 0 — meaningful data, not falsy noise", () => {
-    const score = mapLangfuseScore("proj_x", sourceScore({ dataType: "NUMERIC", value: 0 }));
+    const score = mapLangfuseScore("proj_x", sourceScore({ dataType: "NUMERIC", value: 0 }))!;
     expect(score.value).toBe(0);
   });
 
   it("falls back to a value-derived dataType and 'api' source for unknown enum values", () => {
-    const numeric = mapLangfuseScore("proj_x", sourceScore({ dataType: "FANCY_NEW", value: 3, source: "WEBHOOK" }));
+    const numeric = mapLangfuseScore("proj_x", sourceScore({ dataType: "FANCY_NEW", value: 3, source: "WEBHOOK" }))!;
     expect(numeric.dataType).toBe("numeric");
     expect(numeric.source).toBe("api");
 
-    const categorical = mapLangfuseScore("proj_x", sourceScore({ dataType: "FANCY_NEW", stringValue: "good" }));
+    const categorical = mapLangfuseScore("proj_x", sourceScore({ dataType: "FANCY_NEW", stringValue: "good" }))!;
     expect(categorical.dataType).toBe("categorical");
   });
 
   it("normalizes known source values (EVAL/ANNOTATION) to Ironside's lowercase enum", () => {
-    expect(mapLangfuseScore("proj_x", sourceScore({ value: 1, source: "EVAL" })).source).toBe("eval");
-    expect(mapLangfuseScore("proj_x", sourceScore({ value: 1, source: "ANNOTATION" })).source).toBe("annotation");
+    expect(mapLangfuseScore("proj_x", sourceScore({ value: 1, source: "EVAL" }))?.source).toBe("eval");
+    expect(mapLangfuseScore("proj_x", sourceScore({ value: 1, source: "ANNOTATION" }))?.source).toBe("annotation");
   });
 
   it("preserves the original timestamp when present and omits it when absent", () => {
-    const withTs = mapLangfuseScore("proj_x", sourceScore({ value: 1, timestamp: "2026-05-21T14:31:42.769Z" }));
+    const withTs = mapLangfuseScore("proj_x", sourceScore({ value: 1, timestamp: "2026-05-21T14:31:42.769Z" }))!;
     expect(withTs.timestamp).toBe("2026-05-21T14:31:42.769Z");
 
-    const withoutTs = mapLangfuseScore("proj_x", sourceScore({ value: 1 }));
+    const withoutTs = mapLangfuseScore("proj_x", sourceScore({ value: 1 }))!;
     expect(withoutTs.timestamp).toBeUndefined();
+  });
+
+  it("drops valueless or invalid-timestamp feedback without invalidating its trace", () => {
+    expect(mapLangfuseScore("proj_x", sourceScore({ comment: "annotation only" }))).toBeNull();
+    expect(mapLangfuseScore("proj_x", sourceScore({ value: 1, timestamp: "not-a-date" })))
+      .toBeNull();
   });
 });

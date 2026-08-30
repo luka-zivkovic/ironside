@@ -54,6 +54,10 @@ beforeAll(async () => {
     "insert into projects (id, organization_id, name) values ($1, $2, $3)",
     [projectId, orgId, "langfuse-importer-test"]
   );
+  await recordEvaluatorImportRetentionCutoffs(pool, [{
+    projectId,
+    traceTimestampBefore: "1970-01-01T00:00:00.000Z"
+  }]);
 
   server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
@@ -400,6 +404,56 @@ describe("runLangfuseImport", () => {
     expect(((await traceRows.json()) as { environment: string }[])[0]?.environment).toBe("production");
   });
 
+  it("imports a valid trace while filtering unusable provider scores", async () => {
+    const traceId = `trace_${ulid()}`;
+    fixtureTraces = [{
+      id: traceId,
+      timestamp: "2026-08-12T05:30:00.000Z",
+      name: "valid-trace-invalid-scores"
+    }];
+    fixtureDetails = {
+      [traceId]: {
+        scores: [
+          { id: `score_${ulid()}`, traceId, name: "valueless", comment: "note only" },
+          {
+            id: `score_${ulid()}`,
+            traceId,
+            name: "bad-time",
+            value: 1,
+            timestamp: "not-a-date"
+          }
+        ]
+      }
+    };
+
+    await expect(runLangfuseImport({
+      pool,
+      clickhouse,
+      projectId,
+      client: clientConfig(),
+      pageSize: 10
+    })).resolves.toMatchObject({ imported: 1 });
+
+    const traceRows = await clickhouse.query({
+      query: `select id from traces final
+               where project_id = {projectId:String} and id = {traceId:String}`,
+      query_params: { projectId, traceId },
+      format: "JSONEachRow"
+    });
+    expect(await traceRows.json()).toEqual([{ id: traceId }]);
+    const scoreRows = await clickhouse.query({
+      query: `select id from scores final
+               where project_id = {projectId:String} and trace_id = {traceId:String}`,
+      query_params: { projectId, traceId },
+      format: "JSONEachRow"
+    });
+    expect(await scoreRows.json()).toEqual([]);
+    expect((await getEvaluatorTracePublications(pool, projectId, [traceId])).has(traceId))
+      .toBe(true);
+    await expect(getImportCheckpoint(pool, projectId, "langfuse"))
+      .resolves.toMatchObject({ status: "idle", checkpoint: { page: 1 } });
+  });
+
   it("tombstones observations and scores omitted by a later full snapshot", async () => {
     const traceId = `trace_${ulid()}`;
     const retainedId = `obs_${ulid()}`;
@@ -694,6 +748,7 @@ describe("runLangfuseImport", () => {
 
   it("does not resurrect an expired inclusive-boundary trace", async () => {
     const traceId = `trace_${ulid()}`;
+    const localScoreId = `score_${ulid()}`;
     fixtureTraces = [{
       id: traceId,
       timestamp: "2020-07-12T00:00:00.000Z",
@@ -703,6 +758,17 @@ describe("runLangfuseImport", () => {
       projectId,
       traceTimestampBefore: "2024-01-01T00:00:00.000Z"
     }]);
+    await insertScores(clickhouse, [{
+      id: localScoreId,
+      projectId,
+      traceId,
+      name: "local-assessment",
+      dataType: "numeric",
+      value: 1,
+      source: "eval",
+      timestamp: "2026-08-12T00:00:00.000Z",
+      metadata: {}
+    }], { eventTs: "2026-08-12T00:00:00.000Z" });
     try {
       await runLangfuseImport({ pool, clickhouse, projectId, client: clientConfig(), pageSize: 10 });
       await runLangfuseImport({ pool, clickhouse, projectId, client: clientConfig(), pageSize: 10 });
@@ -715,11 +781,69 @@ describe("runLangfuseImport", () => {
       expect(await rows.json()).toEqual([]);
       expect((await getEvaluatorTracePublications(pool, projectId, [traceId])).has(traceId))
         .toBe(false);
+      const scoreRows = await clickhouse.query({
+        query: `select id from scores final
+                 where project_id = {projectId:String} and trace_id = {traceId:String}`,
+        query_params: { projectId, traceId },
+        format: "JSONEachRow"
+      });
+      expect(await scoreRows.json()).toEqual([]);
+      const retentionMarker = await clickhouse.query({
+        query: `select trace_id from evaluator_trace_retention final
+                 where project_id = {projectId:String} and trace_id = {traceId:String}`,
+        query_params: { projectId, traceId },
+        format: "JSONEachRow"
+      });
+      expect(await retentionMarker.json()).toEqual([{ trace_id: traceId }]);
     } finally {
       await pool.query(
         "delete from evaluator_import_retention_cutoffs where project_id = $1",
         [projectId]
       );
+      await recordEvaluatorImportRetentionCutoffs(pool, [{
+        projectId,
+        traceTimestampBefore: "1970-01-01T00:00:00.000Z"
+      }]);
+    }
+  });
+
+  it("fails closed before ClickHouse writes when the retention cutoff is missing", async () => {
+    const traceId = `trace_${ulid()}`;
+    fixtureTraces = [{
+      id: traceId,
+      timestamp: "2026-08-12T02:00:00.000Z",
+      name: "missing-cutoff"
+    }];
+    await pool.query(
+      "delete from evaluator_import_retention_cutoffs where project_id = $1",
+      [projectId]
+    );
+    try {
+      await expect(runLangfuseImport({
+        pool,
+        clickhouse,
+        projectId,
+        client: clientConfig(),
+        pageSize: 10
+      })).rejects.toThrow("retention cutoff is not initialized");
+      const rows = await clickhouse.query({
+        query: `select id from traces final
+                 where project_id = {projectId:String} and id = {traceId:String}`,
+        query_params: { projectId, traceId },
+        format: "JSONEachRow"
+      });
+      expect(await rows.json()).toEqual([]);
+      expect((await getEvaluatorTracePublications(pool, projectId, [traceId])).has(traceId))
+        .toBe(false);
+    } finally {
+      await pool.query(
+        "delete from evaluator_import_trace_state where project_id = $1 and trace_id = $2",
+        [projectId, traceId]
+      );
+      await recordEvaluatorImportRetentionCutoffs(pool, [{
+        projectId,
+        traceTimestampBefore: "1970-01-01T00:00:00.000Z"
+      }]);
     }
   });
 

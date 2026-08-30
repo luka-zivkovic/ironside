@@ -11,11 +11,26 @@ import { environmentNameSchema } from "./environment.js";
 /** ISO 8601 timestamp with optional offset. */
 const timestampSchema = z.iso.datetime({ offset: true });
 const utf8 = new TextEncoder();
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      if (index + 1 >= value.length) return true;
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
 export const identifierSchema = z.string()
   .trim()
   .min(1)
   .max(512)
   .refine((value) => !value.includes("\0"), "identifier must not contain NUL")
+  .refine((value) => !hasUnpairedSurrogate(value), "identifier must be valid Unicode")
   .refine(
     (value) => utf8.encode(value).byteLength <= 512,
     "identifier must not exceed 512 UTF-8 bytes"

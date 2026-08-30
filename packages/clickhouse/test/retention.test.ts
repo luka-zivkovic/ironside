@@ -271,6 +271,53 @@ describe("retention", () => {
     expect(dropped).not.toContain("202001");
   });
 
+  it("retains an old child partition while its policy-expired parent is still live", async () => {
+    const projectId = `proj_retention_boundary_tree_${crypto.randomUUID()}`;
+    const traceId = `trace_${crypto.randomUUID()}`;
+    const newerTraceId = `trace_${crypto.randomUUID()}`;
+    const observationId = `obs_${crypto.randomUUID()}`;
+    const eventTs = new Date().toISOString();
+    await insertTraces(client, [
+      {
+        id: traceId,
+        projectId,
+        timestamp: "2019-02-13T00:00:00.000Z",
+        tags: [],
+        metadata: {}
+      },
+      {
+        id: newerTraceId,
+        projectId,
+        timestamp: "2019-02-20T00:00:00.000Z",
+        tags: [],
+        metadata: {}
+      }
+    ], { eventTs });
+    await insertObservations(client, [{
+      id: observationId,
+      traceId,
+      projectId,
+      type: "span",
+      startTime: "2019-01-15T00:00:00.000Z",
+      level: "default",
+      metadata: {}
+    }], { eventTs });
+
+    const cutoff = new Date("2019-02-15T00:00:00.000Z");
+    const droppedTraces = await dropPartitionsOlderThan(client, "traces", cutoff);
+    const droppedObservations = await dropPartitionsOlderThan(client, "observations", cutoff);
+
+    expect(droppedTraces).not.toContain("201902");
+    expect(droppedObservations).not.toContain("201901");
+    const remaining = await client.query({
+      query: `select id from observations final
+               where project_id = {projectId:String} and id = {observationId:String}`,
+      query_params: { projectId, observationId },
+      format: "JSONEachRow"
+    });
+    expect(await remaining.json()).toHaveLength(1);
+  });
+
   it("deletes recent observations and scores when their parent trace expires", async () => {
     const projectId = `proj_retention_expired_tree_${crypto.randomUUID()}`;
     const traceId = `trace_${crypto.randomUUID()}`;
