@@ -8,9 +8,8 @@
   becomes installable after the next release publishes public GHCR images; the
   existing `v0.1.0` predates the verified multi-architecture/public-image
   contract.
-- **CURRENT:** the first persistent external deployment on 2026-08-28 froze
-  the Postgres and ClickHouse baselines. Future schema changes are append-only
-  forward migrations.
+- **CURRENT:** founder-only deployments are disposable test instances. This
+  pre-launch release supports clean Postgres and ClickHouse installs only.
 - **ASSUMPTION:** the default stack is single-server, the nginx web component
   is the only public ingress, and Coolify terminates TLS.
 
@@ -61,43 +60,30 @@ anonymous pulls of every exact tag before announcing the release. Every release
 note must list:
 
 - required Compose and environment changes;
-- supported source versions and whether mixed-version replicas are safe;
-- Postgres and ClickHouse migrations and expected duration;
+- whether the current Postgres or ClickHouse baseline changed;
 - object-storage or queue compatibility changes;
-- backup and restore prerequisites; and
-- whether image-only rollback is safe or data restore/forward-fix is required.
+- backup prerequisites; and
+- whether the update is image-only or requires a clean test instance.
 
 Infrastructure images are pinned independently in the template. Upgrade them
 only through a documented compatibility drill. In particular, changing a
 Postgres major version is a dump/restore or `pg_upgrade` project, not an image
 tag edit.
 
-## Update an instance
+## Update a test instance
 
-1. Read every release note between the installed and target versions.
-2. Save the current Source Compose and record domains, generated secrets,
-   scheduled tasks, persistent storage, and all seven exact image versions.
-3. Clone the Coolify Service for a trial. A clone copies configuration, not
-   volumes or data; restore representative backups separately.
-4. Verify fresh Postgres, ClickHouse, and object-storage backups off-host.
-   Preserve `IRONSIDE_ENCRYPTION_SECRET` in a secret manager.
-5. Change the single `IRONSIDE_VERSION` value in the trial so API, worker, and
-   web move together. Merge any release-specific Compose changes.
-6. Deploy and verify component health, migration logs, owner sign-in, native
-   ingest, OTLP ingest, trace reads, queue processing/recovery, and scheduled
-   worker activity.
-7. During a production maintenance window, take new backups, apply the tested
-   version/configuration change, deploy, and repeat the checks.
-8. Keep the backups and previous Compose/version for the stated recovery
-   window.
+An image-only update is supported only when the release notes say both
+baselines are unchanged. Change the single `IRONSIDE_VERSION` so API, worker,
+and web move together, then verify health and the primary ingest/read paths.
+When either baseline changes, create a new clean Coolify Service and preserve
+the old disposable Service only as long as its test data is useful.
 
 Do not use **Pull Latest Images & Restart** for Ironside. Exact semantic-version
 tags are immutable, so a normal redeploy is enough. Pulling a mutable tag can
 silently combine a new app, a schema migration, and changed dependencies.
 
-Downgrade is supported only when the release note says no data migration ran.
-Once a forward migration is applied, use a tested forward fix or restore every
-affected store before starting old images. Never delete volumes to update.
+There is no supported in-place schema upgrade or downgrade during the current
+founder-only testing period.
 
 ## Backup coverage
 

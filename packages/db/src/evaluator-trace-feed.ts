@@ -34,10 +34,6 @@ export interface EvaluatorPendingImportSnapshot extends EvaluatorImportTraceStat
   snapshot: EvaluatorImportTraceSnapshot;
 }
 
-export interface EvaluatorLegacyPendingImport extends EvaluatorImportTraceState {
-  source: EvaluatorImportSource;
-}
-
 function encodeEvaluatorImportSnapshot(snapshot: EvaluatorImportTraceSnapshot): string {
   // PostgreSQL jsonb rejects U+0000 even though it is legal inside a JSON
   // string. Store the recovery envelope as base64 JSON inside jsonb so the
@@ -47,11 +43,8 @@ function encodeEvaluatorImportSnapshot(snapshot: EvaluatorImportTraceSnapshot): 
 }
 
 function decodeEvaluatorImportSnapshot(value: unknown): EvaluatorImportTraceSnapshot {
-  if (typeof value === "string") {
-    return JSON.parse(Buffer.from(value, "base64").toString("utf8")) as EvaluatorImportTraceSnapshot;
-  }
-  // Compatibility with recovery rows staged by the pre-base64 PR revision.
-  return value as EvaluatorImportTraceSnapshot;
+  if (typeof value !== "string") throw new Error("invalid evaluator import recovery snapshot");
+  return JSON.parse(Buffer.from(value, "base64").toString("utf8")) as EvaluatorImportTraceSnapshot;
 }
 
 export async function recordEvaluatorImportRetentionCutoffs(
@@ -311,55 +304,6 @@ export async function discardPendingEvaluatorImportSnapshot(
   if (result.rowCount !== 1) throw new Error("stale imported evaluator materialization");
 }
 
-export async function listLegacyPendingEvaluatorImports(
-  pool: Pool,
-  input: { projectId: string; source: EvaluatorImportSource }
-): Promise<EvaluatorLegacyPendingImport[]> {
-  const result = await pool.query<{
-    trace_id: string;
-    activity_id: string;
-    source_activity_at: Date;
-  }>(
-    `select trace_id, activity_id, source_activity_at
-       from evaluator_import_legacy_pending_recovery
-      where project_id = $1 and source = $2
-      order by trace_id`,
-    [input.projectId, input.source]
-  );
-  return result.rows.map((row) => ({
-    traceId: row.trace_id,
-    activityId: row.activity_id,
-    sourceActivityAt: row.source_activity_at.toISOString(),
-    publishRequired: true,
-    source: input.source
-  }));
-}
-
-export async function deleteLegacyPendingEvaluatorImport(
-  pool: Pool,
-  input: {
-    projectId: string;
-    source: EvaluatorImportSource;
-    traceId: string;
-    activityId: string;
-    runToken: string;
-  }
-): Promise<void> {
-  const result = await pool.query(
-    `delete from evaluator_import_legacy_pending_recovery legacy
-      where project_id = $1 and source = $2 and trace_id = $3
-        and activity_id = $4
-        and exists (
-          select 1
-            from import_checkpoints
-           where project_id = $1 and source = $2 and status = 'running'
-             and run_token = $5 and lease_expires_at > clock_timestamp()
-        )`,
-    [input.projectId, input.source, input.traceId, input.activityId, input.runToken]
-  );
-  if (result.rowCount !== 1) throw new Error("legacy import recovery lease was lost");
-}
-
 export async function listEvaluatorImportRecoveryCandidates(
   pool: Pool,
   limit: number
@@ -369,18 +313,12 @@ export async function listEvaluatorImportRecoveryCandidates(
   }
   const result = await pool.query<{ project_id: string; source: EvaluatorImportSource }>(
     `select pending.project_id, pending.source
-       from (
-         select project_id, source
-           from evaluator_import_trace_state
-          where pending
-         union
-         select project_id, source
-           from evaluator_import_legacy_pending_recovery
-       ) pending
+       from evaluator_import_trace_state pending
        join import_checkpoints checkpoint
          on checkpoint.project_id = pending.project_id
         and checkpoint.source = pending.source
-      where (
+      where pending.pending
+        and (
           checkpoint.status != 'running'
           or checkpoint.lease_expires_at is null
           or checkpoint.lease_expires_at <= clock_timestamp()
@@ -404,11 +342,7 @@ export async function listPendingEvaluatorImportTraceIds(
     `select trace_id
        from evaluator_import_trace_state
       where project_id = $1 and trace_id = any($2::text[])
-        and pending and publish_required
-     union
-     select trace_id
-       from evaluator_import_legacy_pending_recovery
-      where project_id = $1 and trace_id = any($2::text[])`,
+        and pending and publish_required`,
     [projectId, uniqueTraceIds]
   );
   return new Set(result.rows.map((row) => row.trace_id));

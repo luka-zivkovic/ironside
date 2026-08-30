@@ -46,14 +46,10 @@ durable snapshot includes rows removed by the provider: materialization
 tombstones the previous imported trace tree before writing the replacement, so
 the newly published version cannot retain stale observations. Score content is
 part of the durable import identity but not the evaluator-visible identity, so
-provider score-only changes reconcile without reopening a trace. Imported scores carry an explicit
-ClickHouse `import_source`; replacement tombstones only scores owned by that
-provider, preserving native/manual/Coeval assessments on the same trace.
-Scores written before the ownership-column migration remain deliberately
-unowned: a post-upgrade snapshot rewrites still-present provider scores with
-ownership, but an already-removed legacy score is retained rather than risking
-deletion of an indistinguishable native assessment. Operators that require a
-strict historical reset must explicitly re-import or remove that legacy data.
+provider score-only changes reconcile without reopening a trace. Imported
+scores carry an explicit ClickHouse `import_source`; replacement tombstones
+only scores owned by that provider, preserving native/manual/Coeval
+assessments on the same trace.
 All evaluator-visible writers hold the shared side of a cross-worker lifecycle
 fence from the first ClickHouse mutation through PG publication. Retention
 holds the exclusive side through ClickHouse deletion and feed reconciliation,
@@ -109,28 +105,14 @@ and are bounded to 512 UTF-8 bytes before durable raw storage or ClickHouse
 materialization. This keeps a client-supplied identifier from becoming a
 deterministic PostgreSQL publication poison.
 
-## Upgrade order
+## Installation
 
-Migrations `0002_evaluator_trace_feed`,
-`0003_evaluator_import_materialization`,
-`0003a_evaluator_import_pending_handoff`,
-`0004_evaluator_recovery_leases`,
-`0005_evaluator_import_retention_cutoffs`, and
-`0006_evaluator_import_publication_scope`, plus ClickHouse migrations
-`0003_traces_id_skip_index`, `0004_scores_import_source`, and
-`0005_evaluator_trace_retention`, must be applied before the API or
-worker that serves this protocol. Stop the old worker fleet, drain or reconcile
-its durable pending-ingest intents, and complete deployment of the feed-writing
-worker before exposing the evaluator API. On worker startup, initialize the
-durable per-project import-retention cutoff before enabling scheduled provider
-imports. The worker refreshes this monotonic ledger before every import tick,
-so projects created after startup are covered too; it fails closed and retries
-if initialization cannot complete. Merely overlapping old and new
-workers is unsafe: an old worker can materialize a queued trace without
-publishing it after a consumer has already crossed its bootstrap horizon. Only
-after every old worker is stopped should the new API be exposed and consumers
-started. Consumers upgrading from a pre-v1 cursor must reset that opaque cursor
-and perform the bounded bootstrap reconciliation before resuming live polling.
+The PostgreSQL and ClickHouse baseline migrations contain the complete
+evaluator protocol schema. Worker startup initializes the durable per-project
+import-retention cutoff before enabling scheduled provider imports. The worker
+refreshes this monotonic ledger before every import tick, so projects created
+after startup are covered too; it fails closed and retries if initialization
+cannot complete.
 
 ## Non-goals
 

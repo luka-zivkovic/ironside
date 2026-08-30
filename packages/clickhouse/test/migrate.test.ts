@@ -39,23 +39,7 @@ describe("runMigrations (clickhouse)", () => {
     expect(await applied.json()).toEqual([
       {
         id: "0001_baseline",
-        checksum: "47aa8eead3f96a6669dae8f123330ea881f08011aa5efc7d01344ff443167a80"
-      },
-      {
-        id: "0002_raw_event_refs_object_projection",
-        checksum: "088767d7d215fa64cd36c5c4719053d34dc87ac2006593892af2a9a9d886e60e"
-      },
-      {
-        id: "0003_traces_id_skip_index",
-        checksum: "1605e19e1e00bceff1f8290e070f9a16f0fb1fd720bd70c018b08f72a4b2b168"
-      },
-      {
-        id: "0004_scores_import_source",
-        checksum: "f18b3f0ac1756bab79721158d1d66c21bee2c74042377ad0df0bfbaae03e2f7e"
-      },
-      {
-        id: "0005_evaluator_trace_retention",
-        checksum: "ccd0884163d52d490edfaed5d53eafa7f79d7b9898c9d4051f3e774dd3fdd0d5"
+        checksum: "ae18071157ef24c3102aba2d89ae34df489f189f12ede77824c02d88ff8c49bc"
       }
     ]);
 

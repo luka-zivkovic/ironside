@@ -12,11 +12,9 @@ import {
 import {
   claimImportRun,
   claimPendingEvaluatorImportSnapshots,
-  deleteLegacyPendingEvaluatorImport,
   discardPendingEvaluatorImportSnapshot,
   getEvaluatorImportRetentionCutoff,
   listEvaluatorImportRecoveryCandidates,
-  listLegacyPendingEvaluatorImports,
   markImportRunFailed,
   markImportRunIdle,
   publishEvaluatorTraceActivities,
@@ -280,31 +278,11 @@ export async function recoverPendingEvaluatorImportSnapshots(options: {
   runToken: string;
   onEnvironmentRegistryOverflow?: ((count: number) => void) | undefined;
 }): Promise<number> {
-  const legacy = await listLegacyPendingEvaluatorImports(options.pool, options);
-  for (const state of legacy) {
-    await withEvaluatorDataWriteFence(options.pool, async () => {
-      await renewImportRunLease(options.pool, options.projectId, state.source, options.runToken);
-      await tombstoneExpiredImportedTraceSnapshot(
-        options.clickhouse,
-        options.projectId,
-        state.traceId,
-        state.sourceActivityAt,
-        state.source
-      );
-      await deleteLegacyPendingEvaluatorImport(options.pool, {
-        projectId: options.projectId,
-        source: state.source,
-        traceId: state.traceId,
-        activityId: state.activityId,
-        runToken: options.runToken
-      });
-    });
-  }
   const pending = await claimPendingEvaluatorImportSnapshots(options.pool, options);
   for (const snapshot of pending) {
     await materializeEvaluatorImportSnapshot(options, snapshot);
   }
-  return legacy.length + pending.length;
+  return pending.length;
 }
 
 /**
