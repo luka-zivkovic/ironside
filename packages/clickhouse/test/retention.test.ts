@@ -411,6 +411,59 @@ describe("retention", () => {
     expect(await delayed.json()).toHaveLength(0);
   });
 
+  it("pages expired-parent capture and child reconciliation without a global row ceiling", async () => {
+    const projectId = `proj_retention_paged_${crypto.randomUUID()}`;
+    const eventTs = new Date().toISOString();
+    const traceIds = [0, 1, 2].map(() => `trace_${crypto.randomUUID()}`);
+    const observationIds = traceIds.map(() => `obs_${crypto.randomUUID()}`);
+    await insertTraces(client, traceIds.map((id, index) => ({
+      id,
+      projectId,
+      timestamp: `2020-01-${String(index + 10).padStart(2, "0")}T00:00:00.000Z`,
+      tags: [],
+      metadata: {}
+    })), { eventTs });
+    await insertObservations(client, traceIds.map((traceId, index) => ({
+      id: observationIds[index]!,
+      traceId,
+      projectId,
+      type: "span" as const,
+      startTime: new Date().toISOString(),
+      level: "default" as const,
+      metadata: {}
+    })), { eventTs });
+
+    await recordExpiredEvaluatorTraceIds(
+      client,
+      [{ projectId, traceOlderThan: new Date("2024-01-01T00:00:00.000Z") }],
+      { batchSize: 1 }
+    );
+    const markers = await client.query({
+      query: `select trace_id from evaluator_trace_retention final
+              where project_id = {projectId:String} order by trace_id`,
+      query_params: { projectId },
+      format: "JSONEachRow"
+    });
+    expect((await markers.json<{ trace_id: string }>()).map((row) => row.trace_id)).toEqual(
+      [...traceIds].sort()
+    );
+
+    await markProjectDataDeletedOlderThan(
+      client,
+      "traces",
+      projectId,
+      new Date("2024-01-01T00:00:00.000Z")
+    );
+    await markChildrenOfExpiredTracesDeleted(client, [projectId], { batchSize: 1 });
+    const remaining = await client.query({
+      query: `select id from observations final
+              where project_id = {projectId:String} and id in {ids:Array(String)}`,
+      query_params: { projectId, ids: observationIds },
+      format: "JSONEachRow"
+    });
+    expect(await remaining.json()).toHaveLength(0);
+  });
+
   it("listPartitions returns partitions oldest-first with their actual min timestamp", async () => {
     const partitions = await listPartitions(client, "traces");
     expect(partitions.length).toBeGreaterThan(0);
