@@ -146,8 +146,11 @@ export {
   type ProjectQuotas
 } from "./projects.js";
 export {
+  stageEvaluatorImportTraces,
+  listPendingEvaluatorImportTraceIds,
   publishEvaluatorTraceActivities,
   claimEvaluatorScoreReceipt,
+  markEvaluatorScoreReceiptStaged,
   EvaluatorScoreIdempotencyConflictError,
   listEvaluatorTraceActivities,
   getEvaluatorTracePublications,
@@ -156,6 +159,8 @@ export {
   listEvaluatorTraceFeedKeys,
   type EvaluatorTraceActivity,
   type EvaluatorTraceFeedCursor,
+  type EvaluatorImportSource,
+  type EvaluatorImportTraceState,
   type EvaluatorTracePublication
 } from "./evaluator-trace-feed.js";
 export {

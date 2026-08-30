@@ -1,6 +1,11 @@
 import { createServer, type Server } from "node:http";
 import { createClickHouseClient, runMigrations as runChMigrations } from "@ironside/clickhouse";
-import { getImportCheckpoint, runMigrations as runPgMigrations } from "@ironside/db";
+import {
+  getEvaluatorTracePublications,
+  getImportCheckpoint,
+  listPendingEvaluatorImportTraceIds,
+  runMigrations as runPgMigrations
+} from "@ironside/db";
 import { Pool } from "pg";
 import { ulid } from "ulid";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -345,6 +350,11 @@ describe("runLangsmithImport", () => {
     expect(childFeedback.value).toBe(0); // value 0 must survive — meaningful data, not falsy noise
     expect(childFeedback.comment).toBe("rate limited, unhelpful");
     expect(childFeedback.timestamp.startsWith("2026-07-10")).toBe(true); // original feedback time, not import time
+    const publication = (await getEvaluatorTracePublications(pool, projectId, [rootId]))
+      .get(rootId);
+    expect(publication).toBeDefined();
+    expect((await listPendingEvaluatorImportTraceIds(pool, projectId, [rootId])).has(rootId))
+      .toBe(false);
   });
 
   it("a concurrent call while a run is already 'running' returns null instead of racing the checkpoint", async () => {

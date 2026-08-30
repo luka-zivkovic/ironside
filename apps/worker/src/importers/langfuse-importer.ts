@@ -4,13 +4,17 @@ import {
   getImportCheckpoint,
   markImportRunFailed,
   markImportRunIdle,
+  publishEvaluatorTraceActivities,
+  stageEvaluatorImportTraces,
   saveImportProgress
 } from "@ironside/db";
 import { ulid } from "ulid";
 import type { Pool } from "pg";
+import type { Observation, Score, Trace } from "@ironside/shared";
 import { LangfuseClient, type LangfuseClientConfig, type LangfuseListTrace } from "./langfuse-client.js";
 import { mapLangfuseObservation, mapLangfuseScore, mapLangfuseTraceDetail } from "./langfuse-mapper.js";
 import { observeTraceEnvironments } from "../environments/environment-registry.js";
+import { importedTraceContentHash } from "./evaluator-publication.js";
 
 interface LangfuseCheckpointShape {
   [key: string]: unknown;
@@ -78,14 +82,9 @@ export async function runLangfuseImport(
   // or duplicating traces. Only the NEXT run's starting fromTimestamp should
   // advance (via checkpoint.lastTimestamp), not this run's in-flight window.
   const fromTimestampForThisRun = checkpoint.lastTimestamp;
-  // Same reasoning as batch.receivedAt in apps/worker/src/processors/ingest.ts:
-  // event_ts is the ReplacingMergeTree version column and must be
-  // deterministic per logical unit of work, not wall-clock-at-insert-time,
-  // or a retried/duplicated insert becomes a new version instead of a
-  // no-op (see packages/clickhouse/src/rows.ts's InsertOptions doc). Fixed
-  // once for the whole run, not re-read per page.
-  const eventTsForThisRun = new Date().toISOString();
-
+  // Each staged trace generation below receives a stable event_ts. That makes
+  // retries idempotent while still letting an A→B→A source reversion allocate
+  // a newer generation than B.
   // The checkpoint invariant: `checkpoint.page` is the next page to fetch
   // within the window anchored at `checkpoint.lastTimestamp`. The two
   // fields must ALWAYS be saved consistently with each other. An earlier
@@ -123,9 +122,9 @@ export async function runLangfuseImport(
         // run BEFORE this page's checkpoint save, so a retry re-fetches
         // the page and its details idempotently (ReplacingMergeTree
         // dedups re-inserts) — no partial page is ever recorded as done.
-        const traces = [];
-        const observations = [];
-        const scores = [];
+        const traces: Trace[] = [];
+        const observations: Observation[] = [];
+        const scores: Score[] = [];
         for (const listTrace of response.data as LangfuseListTrace[]) {
           const detail = await client.getTraceDetail(listTrace.id);
           traces.push(mapLangfuseTraceDetail(projectId, detail));
@@ -136,15 +135,57 @@ export async function runLangfuseImport(
             scores.push(mapLangfuseScore(projectId, score));
           }
         }
-        await insertTraces(clickhouse, traces, { eventTs: eventTsForThisRun });
-        await insertObservations(clickhouse, observations, { eventTs: eventTsForThisRun });
-        await insertScores(clickhouse, scores, { eventTs: eventTsForThisRun });
+        const candidateActivityAt = new Date().toISOString();
+        const staged = await stageEvaluatorImportTraces(pool, {
+          projectId,
+          source: "langfuse",
+          candidateActivityId: `import_langfuse_${ulid()}`,
+          candidateActivityAt,
+          traces: traces.map((trace) => ({
+            traceId: trace.id,
+            contentHash: importedTraceContentHash(
+              trace,
+              observations.filter((observation) => observation.traceId === trace.id)
+            )
+          }))
+        });
+        const byActivity = new Map<string, {
+          traces: typeof traces;
+          observations: typeof observations;
+        }>();
+        for (const trace of traces) {
+          const state = staged.get(trace.id);
+          if (!state) throw new Error(`missing staged Langfuse trace: ${trace.id}`);
+          const group = byActivity.get(state.sourceActivityAt) ?? { traces: [], observations: [] };
+          group.traces.push(trace);
+          group.observations.push(
+            ...observations.filter((observation) => observation.traceId === trace.id)
+          );
+          byActivity.set(state.sourceActivityAt, group);
+        }
+        for (const [eventTs, group] of byActivity) {
+          await Promise.all([
+            insertTraces(clickhouse, group.traces, { eventTs }),
+            insertObservations(clickhouse, group.observations, { eventTs })
+          ]);
+        }
+        await insertScores(clickhouse, scores, { eventTs: candidateActivityAt });
         await observeTraceEnvironments(
           pool,
           projectId,
           traces,
           options.onEnvironmentRegistryOverflow
         );
+        for (const trace of traces) {
+          const state = staged.get(trace.id)!;
+          await publishEvaluatorTraceActivities(pool, {
+            projectId,
+            traceIds: [trace.id],
+            sourceActivityAt: state.sourceActivityAt,
+            activityId: state.activityId,
+            importSource: "langfuse"
+          });
+        }
         pageImported = traces.length;
         totalImported += pageImported;
         // Oldest-first within a page too (orderBy=timestamp.asc server-side),

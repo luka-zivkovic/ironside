@@ -19,7 +19,7 @@ export const evaluatorContextResponseSchema = z.object({
 export type EvaluatorContextResponse = z.infer<typeof evaluatorContextResponseSchema>;
 
 export const evaluatorTraceSummarySchema = z.object({
-  traceId: z.string().min(1),
+  traceId: z.string().trim().min(1),
   traceVersion: z.iso.datetime({ offset: true }),
   timestamp: z.iso.datetime({ offset: true }),
   name: z.string().nullable(),
@@ -45,8 +45,8 @@ export const evaluatorTraceResponseSchema = traceTreeResponseSchema.extend({
 export type EvaluatorTraceResponse = z.infer<typeof evaluatorTraceResponseSchema>;
 
 export const evaluatorScoreInputSchema = z.object({
-  id: z.string().min(1),
-  traceId: z.string().min(1),
+  id: z.string().trim().min(1),
+  traceId: z.string().trim().min(1),
   name: z.string().min(1),
   value: z.number(),
   assessmentLabel: z.string().min(1).max(100),

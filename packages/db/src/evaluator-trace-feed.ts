@@ -12,6 +12,92 @@ export interface EvaluatorTraceFeedCursor {
   traceId: string;
 }
 
+export type EvaluatorImportSource = "langfuse" | "langsmith";
+
+export interface EvaluatorImportTraceState {
+  traceId: string;
+  activityId: string;
+  sourceActivityAt: string;
+}
+
+/**
+ * Marks pull-imported snapshots pending before any ClickHouse write. Exact
+ * current-content retries reuse their activity generation; a changed or
+ * reverted snapshot receives a strictly newer per-trace generation.
+ */
+export async function stageEvaluatorImportTraces(
+  pool: Pool,
+  input: {
+    projectId: string;
+    source: EvaluatorImportSource;
+    candidateActivityId: string;
+    candidateActivityAt: string;
+    traces: { traceId: string; contentHash: string }[];
+  }
+): Promise<Map<string, EvaluatorImportTraceState>> {
+  const traces = [...new Map(input.traces.map((trace) => [trace.traceId, trace])).values()];
+  if (traces.length === 0) return new Map();
+  const result = await pool.query<{
+    trace_id: string;
+    activity_id: string;
+    source_activity_at: Date;
+  }>(
+    `insert into evaluator_import_trace_state
+       (project_id, trace_id, source, content_hash, activity_id,
+        source_activity_at, pending)
+     select $1, trace_id, $2, content_hash, $3,
+            date_trunc('milliseconds', $4::timestamptz), true
+     from unnest($5::text[], $6::text[]) as input(trace_id, content_hash)
+     on conflict (project_id, trace_id, source) do update
+       set content_hash = excluded.content_hash,
+           activity_id = case
+             when evaluator_import_trace_state.content_hash = excluded.content_hash
+               then evaluator_import_trace_state.activity_id
+             else excluded.activity_id
+           end,
+           source_activity_at = case
+             when evaluator_import_trace_state.content_hash = excluded.content_hash
+               then evaluator_import_trace_state.source_activity_at
+             else greatest(
+               excluded.source_activity_at,
+               evaluator_import_trace_state.source_activity_at + interval '1 millisecond'
+             )
+           end,
+           pending = true,
+           staged_at = clock_timestamp()
+     returning trace_id, activity_id, source_activity_at`,
+    [
+      input.projectId,
+      input.source,
+      input.candidateActivityId,
+      input.candidateActivityAt,
+      traces.map((trace) => trace.traceId),
+      traces.map((trace) => trace.contentHash)
+    ]
+  );
+  return new Map(result.rows.map((row) => [row.trace_id, {
+    traceId: row.trace_id,
+    activityId: row.activity_id,
+    sourceActivityAt: row.source_activity_at.toISOString()
+  }]));
+}
+
+export async function listPendingEvaluatorImportTraceIds(
+  pool: Pool,
+  projectId: string,
+  traceIds: string[]
+): Promise<Set<string>> {
+  const uniqueTraceIds = [...new Set(traceIds)].filter(Boolean);
+  if (uniqueTraceIds.length === 0) return new Set();
+  const result = await pool.query<{ trace_id: string }>(
+    `select distinct trace_id
+       from evaluator_import_trace_state
+      where project_id = $1 and trace_id = any($2::text[]) and pending`,
+    [projectId, uniqueTraceIds]
+  );
+  return new Set(result.rows.map((row) => row.trace_id));
+}
+
 export class EvaluatorScoreIdempotencyConflictError extends Error {
   constructor(readonly scoreId: string) {
     super(`Evaluator score id was already used for a different request: ${scoreId}`);
@@ -26,20 +112,33 @@ export async function claimEvaluatorScoreReceipt(
     scoreId: string;
     traceId: string;
     requestFingerprint: string;
+    candidateBatchId: string;
   }
-): Promise<{ timestamp: string }> {
+): Promise<{ timestamp: string; batchId: string; staged: boolean }> {
   const result = await pool.query<{
     trace_id: string;
     request_fingerprint: string;
     score_timestamp: Date;
+    ingest_batch_id: string;
+    ingest_staged_at: Date | null;
   }>(
     `insert into evaluator_score_receipts
-       (project_id, score_id, trace_id, request_fingerprint)
-     values ($1, $2, $3, $4)
+       (project_id, score_id, trace_id, request_fingerprint, ingest_batch_id)
+     values ($1, $2, $3, $4, $5)
      on conflict (project_id, score_id) do update
-       set score_id = excluded.score_id
-     returning trace_id, request_fingerprint, score_timestamp`,
-    [input.projectId, input.scoreId, input.traceId, input.requestFingerprint]
+       set ingest_batch_id = coalesce(
+         evaluator_score_receipts.ingest_batch_id,
+         excluded.ingest_batch_id
+       )
+     returning trace_id, request_fingerprint, score_timestamp,
+               ingest_batch_id, ingest_staged_at`,
+    [
+      input.projectId,
+      input.scoreId,
+      input.traceId,
+      input.requestFingerprint,
+      input.candidateBatchId
+    ]
   );
   const receipt = result.rows[0]!;
   if (
@@ -48,7 +147,27 @@ export async function claimEvaluatorScoreReceipt(
   ) {
     throw new EvaluatorScoreIdempotencyConflictError(input.scoreId);
   }
-  return { timestamp: receipt.score_timestamp.toISOString() };
+  return {
+    timestamp: receipt.score_timestamp.toISOString(),
+    batchId: receipt.ingest_batch_id,
+    staged: receipt.ingest_staged_at !== null
+  };
+}
+
+export async function markEvaluatorScoreReceiptStaged(
+  pool: Pool,
+  input: { projectId: string; scoreId: string; batchId: string }
+): Promise<void> {
+  const result = await pool.query(
+    `update evaluator_score_receipts
+        set ingest_staged_at = coalesce(ingest_staged_at, clock_timestamp())
+      where project_id = $1 and score_id = $2 and ingest_batch_id = $3
+      returning 1`,
+    [input.projectId, input.scoreId, input.batchId]
+  );
+  if (result.rowCount !== 1) {
+    throw new Error(`evaluator score receipt disappeared before staging: ${input.scoreId}`);
+  }
 }
 
 /**
@@ -64,6 +183,7 @@ export async function publishEvaluatorTraceActivities(
     traceIds: string[];
     sourceActivityAt: string;
     activityId: string;
+    importSource?: EvaluatorImportSource;
   }
 ): Promise<void> {
   const traceIds = [...new Set(input.traceIds)].filter((traceId) => traceId.length > 0);
@@ -79,6 +199,30 @@ export async function publishEvaluatorTraceActivities(
       "select pg_advisory_xact_lock(hashtextextended($1::text, 72819463))",
       [input.projectId]
     );
+    if (input.importSource) {
+      if (traceIds.length !== 1) {
+        throw new Error("imported evaluator publication requires exactly one trace");
+      }
+      const claimed = await client.query(
+        `update evaluator_import_trace_state
+            set pending = false
+          where project_id = $1 and trace_id = $2 and source = $3
+            and activity_id = $4
+            and source_activity_at = $5::timestamptz
+            and pending
+          returning 1`,
+        [
+          input.projectId,
+          traceIds[0],
+          input.importSource,
+          input.activityId,
+          input.sourceActivityAt
+        ]
+      );
+      if (claimed.rowCount !== 1) {
+        throw new Error("stale imported evaluator materialization");
+      }
+    }
     const inserted = await client.query<{ trace_id: string }>(
       `insert into evaluator_trace_feed_activities
          (project_id, trace_id, activity_id)
@@ -240,12 +384,6 @@ export async function deleteEvaluatorTraceFeedEntries(
        using deleted_feed
        where activity.project_id = deleted_feed.project_id
          and activity.trace_id = deleted_feed.trace_id
-       returning 1
-     ), deleted_score_receipts as (
-       delete from evaluator_score_receipts receipt
-       using deleted_feed
-       where receipt.project_id = deleted_feed.project_id
-         and receipt.trace_id = deleted_feed.trace_id
        returning 1
      )
      select count(*)::text as deleted_count from deleted_feed`,

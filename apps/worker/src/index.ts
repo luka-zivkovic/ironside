@@ -7,6 +7,7 @@ import { loadConfig } from "./config.js";
 import { createWorkerMetrics } from "./metrics.js";
 import {
   createIngestProcessor,
+  recoverTerminalEvaluatorTraceRefs,
   settlePublishedEvaluatorTraceRefs
 } from "./processors/ingest.js";
 import { startPendingIngestRecovery } from "./recovery/recovery-loop.js";
@@ -72,12 +73,11 @@ const recovery = startPendingIngestRecovery({
   retentionExecutionEnabled: config.rawRetentionExecutionEnabled,
   intervalMs: config.ingestRecoveryIntervalMs,
   batchSize: config.ingestRecoveryBatchSize,
-  beforeTerminalFailure: async (message) => {
-    await settlePublishedEvaluatorTraceRefs(
+  beforeTerminalFailure: (message) =>
+    recoverTerminalEvaluatorTraceRefs(
       { storage, clickhouse, pool: pgPool },
       message
-    );
-  },
+    ),
   onResult: (result) => {
     const recovered = result.enqueued;
     if (recovered > 0) {

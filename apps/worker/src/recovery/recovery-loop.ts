@@ -24,7 +24,9 @@ export interface RecoveryLoopOptions {
   onError?: (error: unknown) => void;
   pool?: Pool;
   retentionExecutionEnabled?: boolean;
-  beforeTerminalFailure?: (message: QueueMessage) => Promise<void>;
+  beforeTerminalFailure?: (
+    message: QueueMessage
+  ) => Promise<"quarantine" | "retry">;
 }
 
 const DEFAULT_INTERVAL_MS = 30_000;

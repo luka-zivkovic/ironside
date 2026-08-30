@@ -1,6 +1,11 @@
 import { createServer, type Server } from "node:http";
 import { createClickHouseClient, runMigrations as runChMigrations } from "@ironside/clickhouse";
-import { getImportCheckpoint, runMigrations as runPgMigrations } from "@ironside/db";
+import {
+  getEvaluatorTracePublications,
+  getImportCheckpoint,
+  listPendingEvaluatorImportTraceIds,
+  runMigrations as runPgMigrations
+} from "@ironside/db";
 import { Pool } from "pg";
 import { ulid } from "ulid";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -371,6 +376,11 @@ describe("runLangfuseImport", () => {
     // The ORIGINAL score timestamp survives the import — without the new
     // Score.timestamp field, ClickHouse would default this to insert time.
     expect(score.timestamp.startsWith("2026-07-11")).toBe(true);
+    const publication = (await getEvaluatorTracePublications(pool, projectId, [traceId]))
+      .get(traceId);
+    expect(publication).toBeDefined();
+    expect((await listPendingEvaluatorImportTraceIds(pool, projectId, [traceId])).has(traceId))
+      .toBe(false);
 
     // The trace itself carries the detail-only environment field.
     const traceRows = await clickhouse.query({

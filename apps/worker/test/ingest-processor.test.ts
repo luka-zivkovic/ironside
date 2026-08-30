@@ -28,6 +28,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.js";
 import {
   createIngestProcessor,
+  recoverTerminalEvaluatorTraceRefs,
   settlePublishedEvaluatorTraceRefs
 } from "../src/processors/ingest.js";
 
@@ -334,6 +335,10 @@ describe("ingest processor", () => {
       receivedAt: batch.receivedAt
     };
     await insertRawEventRefs(clickhouse, [ref], batch.receivedAt, false);
+    await expect(recoverTerminalEvaluatorTraceRefs(
+      { storage, clickhouse, pool },
+      job.data
+    )).resolves.toBe("retry");
     await publishEvaluatorTraceActivities(pool, {
       projectId,
       traceIds: [traceId],
@@ -347,6 +352,10 @@ describe("ingest processor", () => {
       job.data
     )).resolves.toBe(1);
     await expect(hasPendingTraceRawRefs(clickhouse, projectId, traceId)).resolves.toBe(false);
+    await expect(recoverTerminalEvaluatorTraceRefs(
+      { storage, clickhouse, pool },
+      job.data
+    )).resolves.toBe("quarantine");
     await job.remove();
   });
 });

@@ -288,6 +288,7 @@ describe("native evaluator integration", () => {
       value: 0.92,
       assessmentLabel: "pass",
       comment: "The response follows policy.",
+      metadata: { zeta: "last", alpha: "first" },
       evaluator: {
         provider: "coeval" as const,
         versionId: "skillv_1",
@@ -297,7 +298,10 @@ describe("native evaluator integration", () => {
     const scoreResponse = await app.request("/api/v1/evaluator/scores", {
       method: "POST",
       headers: { ...headers(), "content-type": "application/json" },
-      body: JSON.stringify(scoreRequestBody)
+      body: JSON.stringify({
+        ...scoreRequestBody,
+        metadata: { alpha: "first", zeta: "last" }
+      })
     });
     expect(scoreResponse.status).toBe(200);
     expect(await scoreResponse.json()).toEqual({ id: scoreId });

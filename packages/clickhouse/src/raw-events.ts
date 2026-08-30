@@ -285,6 +285,35 @@ export async function hasPendingTraceRawRefs(
   return (await listPendingTraceRawRefIds(client, projectId, [traceId])).has(traceId);
 }
 
+/** True when one exact raw object still has any snapshot-affecting pending ref. */
+export async function hasPendingRawObjectRefs(
+  client: ClickHouseClient,
+  projectId: string,
+  objectKey: string
+): Promise<boolean> {
+  const result = await client.query({
+    query: `
+      select 1 as pending
+      from raw_event_refs
+      where project_id = {projectId:String}
+        and object_key = {objectKey:String}
+      group by trace_id, object_key
+      having max(applied) = 0
+      limit 1
+    `,
+    query_params: { projectId, objectKey },
+    clickhouse_settings: {
+      max_execution_time: 30,
+      max_threads: 2,
+      max_memory_usage: String(256 * 1024 * 1024),
+      max_rows_to_read: "5000000",
+      read_overflow_mode: "throw"
+    },
+    format: "JSONEachRow"
+  });
+  return (await result.json<{ pending: number }>()).length > 0;
+}
+
 /** Bounded batch guard used by evaluator feed pages during materialization. */
 export async function listPendingTraceRawRefIds(
   client: ClickHouseClient,

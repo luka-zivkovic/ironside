@@ -30,13 +30,18 @@ writeback. Machine routes never accept a project id from the caller.
 - `POST /api/v1/evaluator/scores` records an idempotent numeric assessment.
   Reusing `id` with the same request converges on the first server timestamp
   and one score, including retries on another UTC day. Reusing the id for a
-  different request returns 409. Score writes do not reopen traces.
+  different request returns 409. Score writes do not reopen traces. Receipt
+  identity is independent of trace-feed retention and remains scoped to the
+  project, whose deletion cascades the ledger.
 
 `traceVersion` is a server-owned, commit-ordered publication version for one
 materialized trace snapshot, not the trace's client-supplied start time. The
 source activity timestamp remains the settlement watermark. Every distinct
 trace or observation ingest batch that changes the materialized tree publishes
-a fresh version after re-settlement, including a delayed older batch.
+a fresh version after re-settlement, including a delayed older batch. Scheduled
+LangFuse and LangSmith pull imports stage the full trace snapshot behind the
+same fail-closed publication barrier before writing ClickHouse; retries reuse
+the staged generation, while later content changes allocate a newer one.
 
 ## Recovery and retention
 
@@ -54,7 +59,8 @@ already returned by bootstrap retain the same publication version and are
 consumer-deduplicated, while no source and publication clocks are compared.
 If a worker attempt fails after publication, its failure hook reconciles the
 published batch ledger back to applied raw references; score-only references
-are never marked snapshot-pending.
+are never marked snapshot-pending. Exact score retries share one durable ingest
+batch and stop re-enqueuing after its raw object and recovery intent are staged.
 
 If retention removes a trace after publication, the feed cursor advances past
 that orphan. Retention reconciles and prunes the corresponding feed and batch
@@ -63,13 +69,16 @@ Consumers deduplicate by `(remote project, traceId, traceVersion)`.
 
 ## Upgrade order
 
-Migration `0002_evaluator_trace_feed` must be applied before the API or worker
-that serves this protocol. During a rolling application upgrade, deploy the
-worker before (or together with) the API so no newly materialized trace can
-fall between feed publication and API availability. Do not expose a new
-evaluator API against an old worker that does not publish the feed. Consumers
-upgrading from a pre-v1 cursor must reset that opaque cursor and perform the
-bounded bootstrap reconciliation before resuming live polling.
+Migrations `0002_evaluator_trace_feed` and
+`0003_evaluator_import_materialization` must be applied before the API or
+worker that serves this protocol. Stop the old worker fleet, drain or reconcile
+its durable pending-ingest intents, and complete deployment of the feed-writing
+worker before exposing the evaluator API. Merely overlapping old and new
+workers is unsafe: an old worker can materialize a queued trace without
+publishing it after a consumer has already crossed its bootstrap horizon. Only
+after every old worker is stopped should the new API be exposed and consumers
+started. Consumers upgrading from a pre-v1 cursor must reset that opaque cursor
+and perform the bounded bootstrap reconciliation before resuming live polling.
 
 ## Non-goals
 

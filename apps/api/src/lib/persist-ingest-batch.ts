@@ -21,7 +21,10 @@ export interface PersistIngestBatchDeps {
  */
 export async function persistAndEnqueueIngestBatch(
   deps: PersistIngestBatchDeps,
-  batch: IngestBatch
+  batch: IngestBatch,
+  options: {
+    afterIntentPersisted?: (message: QueueMessage) => Promise<void>;
+  } = {}
 ): Promise<QueueMessage> {
   const receivedAt = new Date(batch.receivedAt);
   const message: QueueMessage = {
@@ -37,6 +40,7 @@ export async function persistAndEnqueueIngestBatch(
   // refer to an absent raw object or lack its durable recovery intent.
   await deps.storage.putJson(message.objectKey, batch);
   await deps.storage.putJson(pendingKey, message);
+  await options.afterIntentPersisted?.(message);
   await enqueueBatch(deps.queue, message);
   return message;
 }

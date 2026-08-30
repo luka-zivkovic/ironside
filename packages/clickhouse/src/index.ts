@@ -9,6 +9,7 @@ export {
   recordTraceRawRetentionExpired,
   getTraceRawRetentionExpiredMap,
   getRetentionExpiredTraceIds,
+  hasPendingRawObjectRefs,
   hasPendingTraceRawRefs,
   listPendingTraceRawRefIds,
   getTraceRawIndex,

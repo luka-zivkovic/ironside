@@ -30,6 +30,33 @@ describe("mapNativeEvents", () => {
     });
   });
 
+  it("normalizes surrounding whitespace from storage and publication identifiers", () => {
+    const { rows, errors } = mapNativeEvents("proj_x", [
+      event({
+        body: {
+          id: "  trace_trimmed  ",
+          timestamp: "2026-07-12T00:00:00Z"
+        }
+      }),
+      event({
+        id: "evt_obs_trimmed",
+        type: "observation-upsert",
+        body: {
+          id: "  obs_trimmed  ",
+          traceId: "  trace_trimmed  ",
+          type: "span",
+          startTime: "2026-07-12T00:00:00Z"
+        }
+      })
+    ]);
+    expect(errors).toEqual([]);
+    expect(rows.traces[0]?.id).toBe("trace_trimmed");
+    expect(rows.observations[0]).toMatchObject({
+      id: "obs_trimmed",
+      traceId: "trace_trimmed"
+    });
+  });
+
   it("normalizes a valid environment and drops only invalid optional environment metadata", () => {
     const valid = mapNativeEvents("proj_x", [
       event({ body: { ...(event().body as object), environment: "  Produc\u0065\u0301tion  " } })

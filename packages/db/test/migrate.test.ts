@@ -22,11 +22,12 @@ describe("runMigrations (postgres)", () => {
        ('organizations', 'projects', 'ironside_migrations', 'raw_retention_intents',
         'owner_principals', 'owner_auth_challenges', 'owner_sessions', 'auth_audit_events',
         'machine_credentials', 'project_environments', 'project_environment_registry_state',
-        'evaluator_trace_feed')`
+        'evaluator_trace_feed', 'evaluator_import_trace_state')`
     );
     const names = tables.rows.map((r) => r.table_name).sort();
     expect(names).toEqual([
       "auth_audit_events",
+      "evaluator_import_trace_state",
       "evaluator_trace_feed",
       "ironside_migrations",
       "machine_credentials",
@@ -49,6 +50,10 @@ describe("runMigrations (postgres)", () => {
       {
         id: "0002_evaluator_trace_feed",
         checksum: "f7b353407f3aafb291afe18136cef499a658c8748355f13410125d5e47b184b2"
+      },
+      {
+        id: "0003_evaluator_import_materialization",
+        checksum: "2bc6bd96cef21f9536a8fad76e4d51d868e04063c93e092d82b95bf6791499ba"
       }
     ]);
     expect((await pool.query("select to_regclass('api_keys') as table_name")).rows).toEqual([

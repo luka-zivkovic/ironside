@@ -1,5 +1,6 @@
 import type { ClickHouseClient } from "@ironside/clickhouse";
 import {
+  hasPendingRawObjectRefs,
   insertObservations,
   insertRawEventRefs,
   insertScores,
@@ -66,6 +67,26 @@ export async function settlePublishedEvaluatorTraceRefs(
     true
   );
   return traceIds.length;
+}
+
+/**
+ * Terminal jobs with an evaluator publication can safely settle and move to
+ * diagnostics. A pre-publication job that already wrote a pending snapshot
+ * ref must instead be retried: quarantining its durable intent would strand
+ * the trace behind that marker forever.
+ */
+export async function recoverTerminalEvaluatorTraceRefs(
+  deps: Pick<IngestProcessorDeps, "storage" | "clickhouse" | "pool">,
+  message: QueueMessage
+): Promise<"quarantine" | "retry"> {
+  if (await settlePublishedEvaluatorTraceRefs(deps, message) > 0) {
+    return "quarantine";
+  }
+  return await hasPendingRawObjectRefs(
+    deps.clickhouse,
+    message.projectId,
+    message.objectKey
+  ) ? "retry" : "quarantine";
 }
 
 /**

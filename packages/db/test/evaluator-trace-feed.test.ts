@@ -5,9 +5,12 @@ import {
   claimEvaluatorScoreReceipt,
   deleteEvaluatorTraceFeedEntries,
   EvaluatorScoreIdempotencyConflictError,
+  listPendingEvaluatorImportTraceIds,
   listEvaluatorTraceFeedKeys,
   listEvaluatorTraceActivities,
-  publishEvaluatorTraceActivities
+  markEvaluatorScoreReceiptStaged,
+  publishEvaluatorTraceActivities,
+  stageEvaluatorImportTraces
 } from "../src/evaluator-trace-feed.js";
 import { runMigrations } from "../src/migrate.js";
 
@@ -170,6 +173,15 @@ describe("evaluator trace feed (postgres)", () => {
 
   it("does not prune a trace that was republished after retention inspected it", async () => {
     const traceId = `trace_${ulid()}`;
+    const scoreId = `score_${ulid()}`;
+    const requestFingerprint = "c".repeat(64);
+    const scoreReceipt = await claimEvaluatorScoreReceipt(pool, {
+      projectId,
+      scoreId,
+      traceId,
+      requestFingerprint,
+      candidateBatchId: "batch_prune_score"
+    });
     await publishEvaluatorTraceActivities(pool, {
       projectId,
       traceIds: [traceId],
@@ -193,6 +205,16 @@ describe("evaluator trace feed (postgres)", () => {
     expect(await deleteEvaluatorTraceFeedEntries(pool, [current])).toBe(1);
     expect((await listEvaluatorTraceFeedKeys(pool, { limit: 100 }))
       .some((row) => row.traceId === traceId)).toBe(false);
+    // Score retention is keyed to the score timestamp, not trace age. Feed
+    // pruning must not erase the first-write identity while that newer score
+    // may still exist in ClickHouse.
+    await expect(claimEvaluatorScoreReceipt(pool, {
+      projectId,
+      scoreId,
+      traceId,
+      requestFingerprint,
+      candidateBatchId: "batch_prune_retry"
+    })).resolves.toEqual(scoreReceipt);
   });
 
   it("keeps a score's first timestamp across days and rejects id reuse", async () => {
@@ -203,7 +225,8 @@ describe("evaluator trace feed (postgres)", () => {
       projectId,
       scoreId,
       traceId,
-      requestFingerprint
+      requestFingerprint,
+      candidateBatchId: "batch_score_first"
     });
     await pool.query(
       `update evaluator_score_receipts
@@ -215,13 +238,91 @@ describe("evaluator trace feed (postgres)", () => {
       projectId,
       scoreId,
       traceId,
-      requestFingerprint
-    })).resolves.toEqual({ timestamp: "2026-08-29T23:59:59.999Z" });
+      requestFingerprint,
+      candidateBatchId: "batch_score_retry"
+    })).resolves.toEqual({
+      timestamp: "2026-08-29T23:59:59.999Z",
+      batchId: "batch_score_first",
+      staged: false
+    });
+    await markEvaluatorScoreReceiptStaged(pool, {
+      projectId,
+      scoreId,
+      batchId: "batch_score_first"
+    });
     await expect(claimEvaluatorScoreReceipt(pool, {
       projectId,
       scoreId,
       traceId,
-      requestFingerprint: "b".repeat(64)
+      requestFingerprint,
+      candidateBatchId: "batch_score_after_stage"
+    })).resolves.toMatchObject({ batchId: "batch_score_first", staged: true });
+    await expect(claimEvaluatorScoreReceipt(pool, {
+      projectId,
+      scoreId,
+      traceId,
+      requestFingerprint: "b".repeat(64),
+      candidateBatchId: "batch_score_conflict"
     })).rejects.toBeInstanceOf(EvaluatorScoreIdempotencyConflictError);
+  });
+
+  it("stages imported snapshots with stable retries and monotonic reversions", async () => {
+    const traceId = `trace_${ulid()}`;
+    const stage = (contentHash: string, candidateActivityId: string, candidateActivityAt: string) =>
+      stageEvaluatorImportTraces(pool, {
+        projectId,
+        source: "langfuse",
+        candidateActivityId,
+        candidateActivityAt,
+        traces: [{ traceId, contentHash }]
+      });
+    const first = (await stage("a".repeat(64), "import_a1", "2026-08-30T12:00:00.000Z"))
+      .get(traceId)!;
+    expect((await listPendingEvaluatorImportTraceIds(pool, projectId, [traceId])).has(traceId))
+      .toBe(true);
+    await publishEvaluatorTraceActivities(pool, {
+      projectId,
+      traceIds: [traceId],
+      sourceActivityAt: first.sourceActivityAt,
+      activityId: first.activityId,
+      importSource: "langfuse"
+    });
+
+    const retry = (await stage("a".repeat(64), "import_a_retry", "2026-08-30T12:01:00.000Z"))
+      .get(traceId)!;
+    expect(retry).toEqual(first);
+    await publishEvaluatorTraceActivities(pool, {
+      projectId,
+      traceIds: [traceId],
+      sourceActivityAt: retry.sourceActivityAt,
+      activityId: retry.activityId,
+      importSource: "langfuse"
+    });
+
+    const changed = (await stage("b".repeat(64), "import_b", "2026-08-30T11:00:00.000Z"))
+      .get(traceId)!;
+    expect(changed.activityId).toBe("import_b");
+    expect(changed.sourceActivityAt > first.sourceActivityAt).toBe(true);
+    await expect(publishEvaluatorTraceActivities(pool, {
+      projectId,
+      traceIds: [traceId],
+      sourceActivityAt: first.sourceActivityAt,
+      activityId: first.activityId,
+      importSource: "langfuse"
+    })).rejects.toThrow("stale imported evaluator materialization");
+    expect((await listPendingEvaluatorImportTraceIds(pool, projectId, [traceId])).has(traceId))
+      .toBe(true);
+    await publishEvaluatorTraceActivities(pool, {
+      projectId,
+      traceIds: [traceId],
+      sourceActivityAt: changed.sourceActivityAt,
+      activityId: changed.activityId,
+      importSource: "langfuse"
+    });
+
+    const reverted = (await stage("a".repeat(64), "import_a2", "2026-08-30T10:00:00.000Z"))
+      .get(traceId)!;
+    expect(reverted.activityId).toBe("import_a2");
+    expect(reverted.sourceActivityAt > changed.sourceActivityAt).toBe(true);
   });
 });

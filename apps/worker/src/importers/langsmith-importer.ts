@@ -4,12 +4,16 @@ import {
   getImportCheckpoint,
   markImportRunFailed,
   markImportRunIdle,
+  publishEvaluatorTraceActivities,
+  stageEvaluatorImportTraces,
   saveImportProgress
 } from "@ironside/db";
 import { ulid } from "ulid";
 import type { Pool } from "pg";
+import type { Observation, Score, Trace } from "@ironside/shared";
 import { LangsmithClient, type LangsmithClientConfig, type LangsmithRun } from "./langsmith-client.js";
 import { mapLangsmithFeedback, mapLangsmithObservation, mapLangsmithRun } from "./langsmith-mapper.js";
+import { importedTraceContentHash } from "./evaluator-publication.js";
 
 interface LangsmithCheckpointShape {
   [key: string]: unknown;
@@ -71,8 +75,6 @@ export async function runLangsmithImport(
     ...(existing?.checkpoint as LangsmithCheckpointShape | undefined)
   };
   const startTimeForThisRun = checkpoint.lastStartTime;
-  const eventTsForThisRun = new Date().toISOString();
-
   const client = new LangsmithClient(options.client);
   let totalImported = 0;
   let resumable = false;
@@ -97,9 +99,9 @@ export async function runLangsmithImport(
         // save, same contract as the LangFuse importer: a retry re-fetches
         // the page and its trees idempotently, no partial page is ever
         // recorded as done.
-        const traces = [];
-        const observations = [];
-        const scores = [];
+        const traces: Trace[] = [];
+        const observations: Observation[] = [];
+        const scores: Score[] = [];
         for (const rootRun of response.runs as LangsmithRun[]) {
           const traceId = rootRun.trace_id ?? rootRun.id;
           const treeRuns = await client.getTraceRuns(traceId);
@@ -123,9 +125,51 @@ export async function runLangsmithImport(
             if (score) scores.push(score);
           }
         }
-        await insertTraces(clickhouse, traces, { eventTs: eventTsForThisRun });
-        await insertObservations(clickhouse, observations, { eventTs: eventTsForThisRun });
-        await insertScores(clickhouse, scores, { eventTs: eventTsForThisRun });
+        const candidateActivityAt = new Date().toISOString();
+        const staged = await stageEvaluatorImportTraces(pool, {
+          projectId,
+          source: "langsmith",
+          candidateActivityId: `import_langsmith_${ulid()}`,
+          candidateActivityAt,
+          traces: traces.map((trace) => ({
+            traceId: trace.id,
+            contentHash: importedTraceContentHash(
+              trace,
+              observations.filter((observation) => observation.traceId === trace.id)
+            )
+          }))
+        });
+        const byActivity = new Map<string, {
+          traces: typeof traces;
+          observations: typeof observations;
+        }>();
+        for (const trace of traces) {
+          const state = staged.get(trace.id);
+          if (!state) throw new Error(`missing staged LangSmith trace: ${trace.id}`);
+          const group = byActivity.get(state.sourceActivityAt) ?? { traces: [], observations: [] };
+          group.traces.push(trace);
+          group.observations.push(
+            ...observations.filter((observation) => observation.traceId === trace.id)
+          );
+          byActivity.set(state.sourceActivityAt, group);
+        }
+        for (const [eventTs, group] of byActivity) {
+          await Promise.all([
+            insertTraces(clickhouse, group.traces, { eventTs }),
+            insertObservations(clickhouse, group.observations, { eventTs })
+          ]);
+        }
+        await insertScores(clickhouse, scores, { eventTs: candidateActivityAt });
+        for (const trace of traces) {
+          const state = staged.get(trace.id)!;
+          await publishEvaluatorTraceActivities(pool, {
+            projectId,
+            traceIds: [trace.id],
+            sourceActivityAt: state.sourceActivityAt,
+            activityId: state.activityId,
+            importSource: "langsmith"
+          });
+        }
         pageImported = traces.length;
         totalImported += pageImported;
         // order: "asc" server-side, so the last element is the newest

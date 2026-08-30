@@ -13,7 +13,9 @@ import {
   EvaluatorScoreIdempotencyConflictError,
   getEvaluatorTracePublications,
   getProject,
-  listEvaluatorTraceActivities
+  listPendingEvaluatorImportTraceIds,
+  listEvaluatorTraceActivities,
+  markEvaluatorScoreReceiptStaged
 } from "@ironside/db";
 import { buildObservationTree, safeJsonParse } from "@ironside/mappers";
 import {
@@ -179,11 +181,12 @@ export function evaluatorReadRoutes(deps: EvaluatorReadDeps): Hono<AuthEnv> {
       });
       const hasMore = rows.length > parsed.data.limit;
       const candidatePage = hasMore ? rows.slice(0, parsed.data.limit) : rows;
-      const pendingTraceIds = await listPendingTraceRawRefIds(
-        deps.clickhouse,
-        projectId,
-        candidatePage.map((row) => row.id)
-      );
+      const candidateTraceIds = candidatePage.map((row) => row.id);
+      const [pendingRawTraceIds, pendingImportTraceIds] = await Promise.all([
+        listPendingTraceRawRefIds(deps.clickhouse, projectId, candidateTraceIds),
+        listPendingEvaluatorImportTraceIds(deps.pool, projectId, candidateTraceIds)
+      ]);
+      const pendingTraceIds = new Set([...pendingRawTraceIds, ...pendingImportTraceIds]);
       const firstPendingIndex = candidatePage.findIndex((row) => pendingTraceIds.has(row.id));
       const page = firstPendingIndex === -1
         ? candidatePage
@@ -246,10 +249,12 @@ export function evaluatorReadRoutes(deps: EvaluatorReadDeps): Hono<AuthEnv> {
     let next: EvaluatorCursor = cursor;
     let blocked = false;
     const activityTraceIds = activities.map((activity) => activity.traceId);
-    const [currentByTraceId, pendingTraceIds] = await Promise.all([
+    const [currentByTraceId, pendingRawTraceIds, pendingImportTraceIds] = await Promise.all([
       getVersionedTraceSummaries(deps.clickhouse, projectId, activityTraceIds),
-      listPendingTraceRawRefIds(deps.clickhouse, projectId, activityTraceIds)
+      listPendingTraceRawRefIds(deps.clickhouse, projectId, activityTraceIds),
+      listPendingEvaluatorImportTraceIds(deps.pool, projectId, activityTraceIds)
     ]);
+    const pendingTraceIds = new Set([...pendingRawTraceIds, ...pendingImportTraceIds]);
 
     for (const activity of activities) {
       if (activity.sourceActivityAt > settledBefore) {
@@ -311,7 +316,11 @@ export function evaluatorReadRoutes(deps: EvaluatorReadDeps): Hono<AuthEnv> {
       projectId,
       [traceId]
     )).get(traceId);
-    if (await hasPendingTraceRawRefs(deps.clickhouse, projectId, traceId)) {
+    const [hasPendingRawRef, pendingImportTraceIds] = await Promise.all([
+      hasPendingTraceRawRefs(deps.clickhouse, projectId, traceId),
+      listPendingEvaluatorImportTraceIds(deps.pool, projectId, [traceId])
+    ]);
+    if (hasPendingRawRef || pendingImportTraceIds.has(traceId)) {
       return c.json({ error: "trace is still materializing", code: "trace_version_changed" }, 409);
     }
     const before = await getVersionedTrace(deps.clickhouse, projectId, traceId);
@@ -329,6 +338,9 @@ export function evaluatorReadRoutes(deps: EvaluatorReadDeps): Hono<AuthEnv> {
     const observations = await listObservationsForTrace(deps.clickhouse, projectId, traceId);
     const after = await getVersionedTrace(deps.clickhouse, projectId, traceId);
     const pendingAfter = await hasPendingTraceRawRefs(deps.clickhouse, projectId, traceId);
+    const pendingImportAfter = (
+      await listPendingEvaluatorImportTraceIds(deps.pool, projectId, [traceId])
+    ).has(traceId);
     // This read must be ordered after pendingAfter. If the worker cleared the
     // pending marker, its publication commit must be visible here; running
     // these reads concurrently would not form a valid seqlock.
@@ -340,6 +352,7 @@ export function evaluatorReadRoutes(deps: EvaluatorReadDeps): Hono<AuthEnv> {
     const publicationAfter = publicationAfterMap.get(traceId);
     if (
       pendingAfter ||
+      pendingImportAfter ||
       !after ||
       after.trace_version !== before.trace_version ||
       publicationAfter?.traceVersion !== publicationBefore?.traceVersion ||
@@ -363,23 +376,36 @@ function stringifyMetadata(metadata: Record<string, unknown> | undefined): Recor
   );
 }
 
+function canonicalizeJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalizeJson);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, entry]) => [key, canonicalizeJson(entry)])
+    );
+  }
+  return value;
+}
+
 export function evaluatorScoreRoutes(deps: EvaluatorScoreDeps): Hono<AuthEnv> {
   const app = new Hono<AuthEnv>();
   app.post("/evaluator/scores", async (c) => {
     const parsed = evaluatorScoreInputSchema.safeParse(await c.req.json().catch(() => null));
     if (!parsed.success) return c.json({ error: "invalid evaluator score", issues: parsed.error.issues }, 400);
     const score = parsed.data;
-    const receivedAt = new Date();
     const requestFingerprint = createHash("sha256")
-      .update(JSON.stringify(score))
+      .update(JSON.stringify(canonicalizeJson(score)))
       .digest("hex");
-    let receipt: { timestamp: string };
+    const projectId = c.get("projectId");
+    let receipt: { timestamp: string; batchId: string; staged: boolean };
     try {
       receipt = await claimEvaluatorScoreReceipt(deps.pool, {
-        projectId: c.get("projectId"),
+        projectId,
         scoreId: score.id,
         traceId: score.traceId,
-        requestFingerprint
+        requestFingerprint,
+        candidateBatchId: ulid()
       });
     } catch (error) {
       if (!(error instanceof EvaluatorScoreIdempotencyConflictError)) throw error;
@@ -388,6 +414,7 @@ export function evaluatorScoreRoutes(deps: EvaluatorScoreDeps): Hono<AuthEnv> {
         code: "score_idempotency_conflict"
       }, 409);
     }
+    if (receipt.staged) return c.json({ id: score.id }, 200);
     const body = {
       id: score.id,
       traceId: score.traceId,
@@ -406,7 +433,7 @@ export function evaluatorScoreRoutes(deps: EvaluatorScoreDeps): Hono<AuthEnv> {
       }
     };
     const event: IngestEvent = {
-      id: ulid(),
+      id: `event_${receipt.batchId}`,
       type: "score-upsert",
       source: "native",
       schemaVersion: INGEST_SCHEMA_VERSION,
@@ -414,12 +441,20 @@ export function evaluatorScoreRoutes(deps: EvaluatorScoreDeps): Hono<AuthEnv> {
       body
     };
     const batch: IngestBatch = {
-      batchId: ulid(),
-      projectId: c.get("projectId"),
-      receivedAt: receivedAt.toISOString(),
+      batchId: receipt.batchId,
+      projectId,
+      receivedAt: receipt.timestamp,
       events: [event]
     };
-    await persistAndEnqueueIngestBatch(deps, batch);
+    await persistAndEnqueueIngestBatch(deps, batch, {
+      afterIntentPersisted: async () => {
+        await markEvaluatorScoreReceiptStaged(deps.pool, {
+          projectId,
+          scoreId: score.id,
+          batchId: receipt.batchId
+        });
+      }
+    });
     return c.json({ id: score.id }, 200);
   });
   return app;
