@@ -40,6 +40,8 @@ export interface PendingIngestReconcilerOptions {
   /** Optional enabled-retention coordination; absent means zero hot-path overhead. */
   coordinateMessage?: <T>(message: QueueMessage, operation: () => Promise<T>) => Promise<T>;
   isRetentionBlocked?: (message: QueueMessage) => Promise<boolean>;
+  /** Settle any cross-store commit before a terminal queue job is quarantined. */
+  beforeTerminalFailure?: (message: QueueMessage) => Promise<void>;
 }
 
 const DEFAULT_BATCH_SIZE = 1_000;
@@ -205,6 +207,10 @@ async function reconcileIntent(
       await options.storage.delete(key);
       result.completedCleaned += 1;
     } else if (state === "failed") {
+      // Some processors have a durable cross-store commit before their final
+      // acknowledgement. If settlement is temporarily unavailable, fail this
+      // reconciliation pass and keep the pending marker for the next tick.
+      await options.beforeTerminalFailure?.(message);
       // Respect BullMQ's finite retry policy. Move terminal diagnostics out of
       // the hot pending prefix instead of retrying a poison batch forever.
       await options.storage.putJson(failedIngestObjectKey(message.batchId), {

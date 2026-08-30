@@ -147,8 +147,11 @@ export {
 } from "./projects.js";
 export {
   publishEvaluatorTraceActivities,
+  claimEvaluatorScoreReceipt,
+  EvaluatorScoreIdempotencyConflictError,
   listEvaluatorTraceActivities,
   getEvaluatorTracePublications,
+  listEvaluatorPublishedTraceIdsForActivity,
   deleteEvaluatorTraceFeedEntries,
   listEvaluatorTraceFeedKeys,
   type EvaluatorTraceActivity,

@@ -2,7 +2,9 @@ import { Pool } from "pg";
 import { ulid } from "ulid";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
+  claimEvaluatorScoreReceipt,
   deleteEvaluatorTraceFeedEntries,
+  EvaluatorScoreIdempotencyConflictError,
   listEvaluatorTraceFeedKeys,
   listEvaluatorTraceActivities,
   publishEvaluatorTraceActivities
@@ -191,5 +193,35 @@ describe("evaluator trace feed (postgres)", () => {
     expect(await deleteEvaluatorTraceFeedEntries(pool, [current])).toBe(1);
     expect((await listEvaluatorTraceFeedKeys(pool, { limit: 100 }))
       .some((row) => row.traceId === traceId)).toBe(false);
+  });
+
+  it("keeps a score's first timestamp across days and rejects id reuse", async () => {
+    const scoreId = `score_${ulid()}`;
+    const traceId = `trace_${ulid()}`;
+    const requestFingerprint = "a".repeat(64);
+    await claimEvaluatorScoreReceipt(pool, {
+      projectId,
+      scoreId,
+      traceId,
+      requestFingerprint
+    });
+    await pool.query(
+      `update evaluator_score_receipts
+          set score_timestamp = '2026-08-29T23:59:59.999Z'::timestamptz
+        where project_id = $1 and score_id = $2`,
+      [projectId, scoreId]
+    );
+    await expect(claimEvaluatorScoreReceipt(pool, {
+      projectId,
+      scoreId,
+      traceId,
+      requestFingerprint
+    })).resolves.toEqual({ timestamp: "2026-08-29T23:59:59.999Z" });
+    await expect(claimEvaluatorScoreReceipt(pool, {
+      projectId,
+      scoreId,
+      traceId,
+      requestFingerprint: "b".repeat(64)
+    })).rejects.toBeInstanceOf(EvaluatorScoreIdempotencyConflictError);
   });
 });

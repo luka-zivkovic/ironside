@@ -99,7 +99,10 @@ export async function runRetention(options: RunRetentionOptions): Promise<Retent
   // window (not the per-project retention settings) keeps the table
   // bounded without inventing a separate config knob for it.
   const purgedIngestFailures = await purgeIngestFailuresOlderThan(pool, 30);
-  const prunedEvaluatorTraceFeed = await pruneOrphanedEvaluatorTraceFeed(pool, clickhouse);
+  const traceRetentionRan = droppedPartitions.traces.length > 0 || projectDeletes.length > 0;
+  const prunedEvaluatorTraceFeed = traceRetentionRan
+    ? await pruneOrphanedEvaluatorTraceFeed(pool, clickhouse)
+    : 0;
 
   return { droppedPartitions, projectDeletes, purgedIngestFailures, prunedEvaluatorTraceFeed };
 }

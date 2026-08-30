@@ -28,7 +28,9 @@ writeback. Machine routes never accept a project id from the caller.
   concurrent later write returns `409 trace_version_changed` rather than
   mixing two versions.
 - `POST /api/v1/evaluator/scores` records an idempotent numeric assessment.
-  Reusing `id` converges on one score. Score writes do not reopen traces.
+  Reusing `id` with the same request converges on the first server timestamp
+  and one score, including retries on another UTC day. Reusing the id for a
+  different request returns 409. Score writes do not reopen traces.
 
 `traceVersion` is a server-owned, commit-ordered publication version for one
 materialized trace snapshot, not the trace's client-supplied start time. The
@@ -46,7 +48,13 @@ precision in opaque cursors. Exact detail reads also reject a version with 409
 while any durable raw reference for the trace is pending. Feed polling keeps
 the cursor before such a publication until its pending reference is cleared,
 so the same version remains discoverable. New consumers bootstrap ClickHouse
-first so traces predating the table remain discoverable.
+first so traces predating the table remain discoverable. Bootstrap applies the
+same pending guard. Its live handoff starts from the feed origin: entries
+already returned by bootstrap retain the same publication version and are
+consumer-deduplicated, while no source and publication clocks are compared.
+If a worker attempt fails after publication, its failure hook reconciles the
+published batch ledger back to applied raw references; score-only references
+are never marked snapshot-pending.
 
 If retention removes a trace after publication, the feed cursor advances past
 that orphan. Retention reconciles and prunes the corresponding feed and batch

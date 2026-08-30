@@ -5,7 +5,10 @@ import { createObjectStorage } from "@ironside/storage";
 import { Pool } from "pg";
 import { loadConfig } from "./config.js";
 import { createWorkerMetrics } from "./metrics.js";
-import { createIngestProcessor } from "./processors/ingest.js";
+import {
+  createIngestProcessor,
+  settlePublishedEvaluatorTraceRefs
+} from "./processors/ingest.js";
 import { startPendingIngestRecovery } from "./recovery/recovery-loop.js";
 import { verifyPendingIngestStorage } from "./recovery/storage-permissions.js";
 import { startScheduler } from "./scheduler.js";
@@ -47,6 +50,17 @@ worker.on("completed", (job) => {
 worker.on("failed", (job, err) => {
   metrics.batchesFailed.inc();
   console.error(`[ingest] batch=${job?.data.batchId} failed:`, err);
+  if (job) {
+    void settlePublishedEvaluatorTraceRefs(
+      { storage, clickhouse, pool: pgPool },
+      job.data
+    ).catch((recoveryError) => {
+      console.error(
+        `[ingest] batch=${job.data.batchId} failed to settle its committed evaluator publication:`,
+        recoveryError
+      );
+    });
+  }
 });
 
 console.log("ironside-worker: ingest consumer running");
@@ -58,6 +72,12 @@ const recovery = startPendingIngestRecovery({
   retentionExecutionEnabled: config.rawRetentionExecutionEnabled,
   intervalMs: config.ingestRecoveryIntervalMs,
   batchSize: config.ingestRecoveryBatchSize,
+  beforeTerminalFailure: async (message) => {
+    await settlePublishedEvaluatorTraceRefs(
+      { storage, clickhouse, pool: pgPool },
+      message
+    );
+  },
   onResult: (result) => {
     const recovered = result.enqueued;
     if (recovered > 0) {

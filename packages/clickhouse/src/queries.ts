@@ -311,6 +311,10 @@ export interface VersionedTraceDetailRow extends TraceDetailRow {
   trace_version: string;
 }
 
+export interface VersionedTraceSummaryRow extends TraceRow {
+  trace_version: string;
+}
+
 /** Current trace payload plus its server-owned latest activity version. */
 export async function getVersionedTrace(
   client: ClickHouseClient,
@@ -318,6 +322,34 @@ export async function getVersionedTrace(
   traceId: string
 ): Promise<VersionedTraceDetailRow | null> {
   return (await getVersionedTraces(client, projectId, [traceId])).get(traceId) ?? null;
+}
+
+/** Summary-only batch form for evaluator feed pages; omits large payloads. */
+export async function getVersionedTraceSummaries(
+  client: ClickHouseClient,
+  projectId: string,
+  traceIds: string[]
+): Promise<Map<string, VersionedTraceSummaryRow>> {
+  const uniqueTraceIds = [...new Set(traceIds)].filter(Boolean);
+  if (uniqueTraceIds.length === 0) return new Map();
+  const result = await client.query({
+    query: `
+      select t.id, t.timestamp, t.name, t.user_id, t.session_id,
+             t.environment, t.tags, t.metadata,
+             activity.last_activity_at as trace_version
+      from traces as t final
+      inner join (${traceActivityQuery(undefined, "traceIds")}) as activity on activity.trace_id = t.id
+      where t.project_id = {projectId:String} and t.id in {traceIds:Array(String)}
+    `,
+    query_params: { projectId, traceIds: uniqueTraceIds },
+    format: "JSONEachRow"
+  });
+  const rows = await result.json<VersionedTraceSummaryRow>();
+  return new Map(rows.map((row) => [row.id, {
+    ...row,
+    timestamp: fromClickHouseDateTime(row.timestamp),
+    trace_version: new Date(fromClickHouseDateTime(row.trace_version)).toISOString()
+  }]));
 }
 
 /** Bounded batch form used by evaluator feed pages to avoid one CH query per trace. */

@@ -2,13 +2,15 @@ import { createHash } from "node:crypto";
 import type { ClickHouseClient, VersionedTraceDetailRow } from "@ironside/clickhouse";
 import {
   getVersionedTrace,
-  getVersionedTraces,
+  getVersionedTraceSummaries,
   hasPendingTraceRawRefs,
   listPendingTraceRawRefIds,
   listObservationsForTrace,
   listSettledTraceVersions
 } from "@ironside/clickhouse";
 import {
+  claimEvaluatorScoreReceipt,
+  EvaluatorScoreIdempotencyConflictError,
   getEvaluatorTracePublications,
   getProject,
   listEvaluatorTraceActivities
@@ -35,6 +37,7 @@ import { z } from "zod";
 import {
   decodeEvaluatorCursor,
   encodeEvaluatorCursor,
+  initialLiveEvaluatorCursor,
   type EvaluatorCursor
 } from "../lib/evaluator-cursor.js";
 import { persistAndEnqueueIngestBatch } from "../lib/persist-ingest-batch.js";
@@ -47,6 +50,7 @@ interface EvaluatorReadDeps {
 }
 
 interface EvaluatorScoreDeps {
+  pool: Pool;
   storage: ObjectStorage;
   queue: Queue<QueueMessage>;
 }
@@ -174,14 +178,24 @@ export function evaluatorReadRoutes(deps: EvaluatorReadDeps): Hono<AuthEnv> {
           : {})
       });
       const hasMore = rows.length > parsed.data.limit;
-      const page = hasMore ? rows.slice(0, parsed.data.limit) : rows;
+      const candidatePage = hasMore ? rows.slice(0, parsed.data.limit) : rows;
+      const pendingTraceIds = await listPendingTraceRawRefIds(
+        deps.clickhouse,
+        projectId,
+        candidatePage.map((row) => row.id)
+      );
+      const firstPendingIndex = candidatePage.findIndex((row) => pendingTraceIds.has(row.id));
+      const page = firstPendingIndex === -1
+        ? candidatePage
+        : candidatePage.slice(0, firstPendingIndex);
+      const blocked = firstPendingIndex !== -1;
       const publications = await getEvaluatorTracePublications(
         deps.pool,
         projectId,
         page.map((row) => row.id)
       );
       const last = page.at(-1);
-      const nextCursor = hasMore && last
+      const nextCursor = (hasMore || blocked) && last
         ? encodeEvaluatorCursor({
             v: 1,
             kind: "bootstrap",
@@ -189,7 +203,9 @@ export function evaluatorReadRoutes(deps: EvaluatorReadDeps): Hono<AuthEnv> {
             afterVersion: last.trace_version,
             afterTraceId: last.id
           })
-        : windowTo < cursor.through
+        : blocked
+          ? encodeEvaluatorCursor(cursor)
+          : windowTo < cursor.through
           ? encodeEvaluatorCursor({
               v: 1,
               kind: "bootstrap",
@@ -197,15 +213,7 @@ export function evaluatorReadRoutes(deps: EvaluatorReadDeps): Hono<AuthEnv> {
               afterVersion: last?.trace_version ?? windowTo,
               afterTraceId: last?.id ?? "\uffff"
             })
-          : encodeEvaluatorCursor({
-              v: 1,
-              kind: "live",
-              // Bootstrap covered every source activity through this horizon.
-              // Begin live publication strictly after it so pre-existing feed
-              // rows are not emitted a second time with publication versions.
-              publishedAt: cursor.through,
-              traceId: "\uffff"
-            });
+          : encodeEvaluatorCursor(initialLiveEvaluatorCursor());
       const response: EvaluatorTraceFeedResponse = {
         protocolVersion: EVALUATOR_PROTOCOL_VERSION,
         traces: page.map((row) => {
@@ -218,7 +226,10 @@ export function evaluatorReadRoutes(deps: EvaluatorReadDeps): Hono<AuthEnv> {
           );
         }),
         nextCursor,
-        hasMore
+        // A pending first row returns an unchanged cursor and false so a
+        // consumer yields instead of spinning. A safe prefix advertises the
+        // blocked remainder and the next request stops on that first row.
+        hasMore: blocked ? page.length > 0 : hasMore
       };
       return c.json(response, 200);
     }
@@ -236,7 +247,7 @@ export function evaluatorReadRoutes(deps: EvaluatorReadDeps): Hono<AuthEnv> {
     let blocked = false;
     const activityTraceIds = activities.map((activity) => activity.traceId);
     const [currentByTraceId, pendingTraceIds] = await Promise.all([
-      getVersionedTraces(deps.clickhouse, projectId, activityTraceIds),
+      getVersionedTraceSummaries(deps.clickhouse, projectId, activityTraceIds),
       listPendingTraceRawRefIds(deps.clickhouse, projectId, activityTraceIds)
     ]);
 
@@ -316,11 +327,16 @@ export function evaluatorReadRoutes(deps: EvaluatorReadDeps): Hono<AuthEnv> {
     }
 
     const observations = await listObservationsForTrace(deps.clickhouse, projectId, traceId);
-    const [after, pendingAfter, publicationAfterMap] = await Promise.all([
-      getVersionedTrace(deps.clickhouse, projectId, traceId),
-      hasPendingTraceRawRefs(deps.clickhouse, projectId, traceId),
-      getEvaluatorTracePublications(deps.pool, projectId, [traceId])
-    ]);
+    const after = await getVersionedTrace(deps.clickhouse, projectId, traceId);
+    const pendingAfter = await hasPendingTraceRawRefs(deps.clickhouse, projectId, traceId);
+    // This read must be ordered after pendingAfter. If the worker cleared the
+    // pending marker, its publication commit must be visible here; running
+    // these reads concurrently would not form a valid seqlock.
+    const publicationAfterMap = await getEvaluatorTracePublications(
+      deps.pool,
+      projectId,
+      [traceId]
+    );
     const publicationAfter = publicationAfterMap.get(traceId);
     if (
       pendingAfter ||
@@ -354,6 +370,24 @@ export function evaluatorScoreRoutes(deps: EvaluatorScoreDeps): Hono<AuthEnv> {
     if (!parsed.success) return c.json({ error: "invalid evaluator score", issues: parsed.error.issues }, 400);
     const score = parsed.data;
     const receivedAt = new Date();
+    const requestFingerprint = createHash("sha256")
+      .update(JSON.stringify(score))
+      .digest("hex");
+    let receipt: { timestamp: string };
+    try {
+      receipt = await claimEvaluatorScoreReceipt(deps.pool, {
+        projectId: c.get("projectId"),
+        scoreId: score.id,
+        traceId: score.traceId,
+        requestFingerprint
+      });
+    } catch (error) {
+      if (!(error instanceof EvaluatorScoreIdempotencyConflictError)) throw error;
+      return c.json({
+        error: error.message,
+        code: "score_idempotency_conflict"
+      }, 409);
+    }
     const body = {
       id: score.id,
       traceId: score.traceId,
@@ -362,7 +396,7 @@ export function evaluatorScoreRoutes(deps: EvaluatorScoreDeps): Hono<AuthEnv> {
       value: score.value,
       source: "eval",
       comment: score.comment ? `${score.assessmentLabel}: ${score.comment}` : score.assessmentLabel,
-      timestamp: receivedAt.toISOString(),
+      timestamp: receipt.timestamp,
       metadata: {
         ...stringifyMetadata(score.metadata),
         assessmentLabel: score.assessmentLabel,
@@ -376,7 +410,7 @@ export function evaluatorScoreRoutes(deps: EvaluatorScoreDeps): Hono<AuthEnv> {
       type: "score-upsert",
       source: "native",
       schemaVersion: INGEST_SCHEMA_VERSION,
-      idempotencyKey: createHash("sha256").update(JSON.stringify(body)).digest("hex"),
+      idempotencyKey: requestFingerprint,
       body
     };
     const batch: IngestBatch = {

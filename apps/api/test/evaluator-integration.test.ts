@@ -281,24 +281,99 @@ describe("native evaluator integration", () => {
       .toMatchObject({ traces: [], hasMore: true });
 
     const scoreId = `score_${ulid()}`;
+    const scoreRequestBody = {
+      id: scoreId,
+      traceId: trace.id,
+      name: "coeval_assessment/support-quality",
+      value: 0.92,
+      assessmentLabel: "pass",
+      comment: "The response follows policy.",
+      evaluator: {
+        provider: "coeval" as const,
+        versionId: "skillv_1",
+        criterionKey: "support-quality"
+      }
+    };
     const scoreResponse = await app.request("/api/v1/evaluator/scores", {
       method: "POST",
       headers: { ...headers(), "content-type": "application/json" },
-      body: JSON.stringify({
-        id: scoreId,
-        traceId: trace.id,
-        name: "coeval_assessment/support-quality",
-        value: 0.92,
-        assessmentLabel: "pass",
-        comment: "The response follows policy.",
-        evaluator: {
-          provider: "coeval",
-          versionId: "skillv_1",
-          criterionKey: "support-quality"
-        }
-      })
+      body: JSON.stringify(scoreRequestBody)
     });
     expect(scoreResponse.status).toBe(200);
     expect(await scoreResponse.json()).toEqual({ id: scoreId });
+    const scoreRetry = await app.request("/api/v1/evaluator/scores", {
+      method: "POST",
+      headers: { ...headers(), "content-type": "application/json" },
+      body: JSON.stringify(scoreRequestBody)
+    });
+    expect(scoreRetry.status).toBe(200);
+    const scoreConflict = await app.request("/api/v1/evaluator/scores", {
+      method: "POST",
+      headers: { ...headers(), "content-type": "application/json" },
+      body: JSON.stringify({ ...scoreRequestBody, comment: "Different request" })
+    });
+    expect(scoreConflict.status).toBe(409);
+    expect(await scoreConflict.json()).toMatchObject({ code: "score_idempotency_conflict" });
+  });
+
+  it("holds bootstrap before a pending trace and safely replays pre-bootstrap feed rows", async () => {
+    const bootstrapProjectId = `proj_${ulid()}`;
+    await pool.query(
+      "insert into projects (id, organization_id, name) values ($1, $2, $3)",
+      [bootstrapProjectId, organizationId, "Pending bootstrap"]
+    );
+    const bootstrapKey = (
+      await createTestMachineCredential(pool, bootstrapProjectId, "coeval-bootstrap", "integration")
+    ).token;
+    const bootstrapHeaders = { authorization: `Bearer ${bootstrapKey}` };
+    const pendingAt = "2026-08-15T12:00:00.000Z";
+    const pendingTrace: Trace = {
+      ...trace,
+      id: `trace_${ulid()}`,
+      projectId: bootstrapProjectId,
+      timestamp: "2026-08-15T11:59:00.000Z",
+      name: "pending-bootstrap"
+    };
+    const pendingRef = {
+      projectId: bootstrapProjectId,
+      traceId: pendingTrace.id,
+      objectKey: `raw/${ulid()}.json`,
+      receivedAt: pendingAt
+    };
+    await insertRawEventRefs(clickhouse, [pendingRef], pendingAt, false);
+    await insertTraces(clickhouse, [pendingTrace], { eventTs: pendingAt });
+    await publishEvaluatorTraceActivities(pool, {
+      projectId: bootstrapProjectId,
+      traceIds: [pendingTrace.id],
+      sourceActivityAt: pendingAt,
+      activityId: "batch_bootstrap_pending"
+    });
+
+    const blockedResponse = await app.request("/api/v1/evaluator/traces?limit=10", {
+      headers: bootstrapHeaders
+    });
+    const blocked = evaluatorTraceFeedResponseSchema.parse(await blockedResponse.json());
+    expect(blocked).toMatchObject({ traces: [], hasMore: false });
+
+    await insertRawEventRefs(clickhouse, [pendingRef], pendingAt, true);
+    const resumedResponse = await app.request(
+      `/api/v1/evaluator/traces?limit=10&cursor=${encodeURIComponent(blocked.nextCursor)}`,
+      { headers: bootstrapHeaders }
+    );
+    const resumed = evaluatorTraceFeedResponseSchema.parse(await resumedResponse.json());
+    expect(resumed.traces).toEqual([
+      expect.objectContaining({ traceId: pendingTrace.id })
+    ]);
+    const replayResponse = await app.request(
+      `/api/v1/evaluator/traces?limit=10&cursor=${encodeURIComponent(resumed.nextCursor)}`,
+      { headers: bootstrapHeaders }
+    );
+    const replay = evaluatorTraceFeedResponseSchema.parse(await replayResponse.json());
+    expect(replay.traces).toEqual([
+      expect.objectContaining({
+        traceId: pendingTrace.id,
+        traceVersion: resumed.traces[0]!.traceVersion
+      })
+    ]);
   });
 });

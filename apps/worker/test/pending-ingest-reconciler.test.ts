@@ -116,8 +116,15 @@ describe("pending ingest reconciler", () => {
         [live.batchId, fakeJob("waiting")]
       ])
     );
+    const settled: string[] = [];
 
-    const result = await createPendingIngestReconciler({ storage, queue }).run();
+    const result = await createPendingIngestReconciler({
+      storage,
+      queue,
+      beforeTerminalFailure: async (entry) => {
+        settled.push(entry.batchId);
+      }
+    }).run();
 
     expect(result).toMatchObject({
       examined: 3,
@@ -129,6 +136,24 @@ describe("pending ingest reconciler", () => {
     expect(storage.values.has(failedIngestObjectKey(failed.batchId))).toBe(true);
     expect(storage.values.has(pendingIngestObjectKey(completed.batchId))).toBe(false);
     expect(storage.values.has(pendingIngestObjectKey(live.batchId))).toBe(true);
+    expect(settled).toEqual([failed.batchId]);
+  });
+
+  it("retains a terminal marker when cross-store settlement is unavailable", async () => {
+    const failed = message("0001-unsettled");
+    const pendingKey = pendingIngestObjectKey(failed.batchId);
+    const storage = fakeStorage([[pendingKey, failed]]);
+    const queue = fakeQueue(new Map([[failed.batchId, fakeJob("failed")]]));
+
+    await expect(createPendingIngestReconciler({
+      storage,
+      queue,
+      beforeTerminalFailure: async () => {
+        throw new Error("clickhouse unavailable");
+      }
+    }).run()).rejects.toThrow("clickhouse unavailable");
+    expect(storage.values.has(pendingKey)).toBe(true);
+    expect(storage.values.has(failedIngestObjectKey(failed.batchId))).toBe(false);
   });
 
   it("coordinates enabled retention before recovery can recreate work or sidecars", async () => {

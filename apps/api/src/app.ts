@@ -250,7 +250,11 @@ export function createApp(deps: AppDeps): Hono<AuthEnv> {
   const evaluatorScore = new Hono<AuthEnv>();
   evaluatorScore.use("/evaluator/scores/*", machineAuth(deps.pgPool, deps.redis, "scores:write"));
   evaluatorScore.use("/evaluator/scores/*", rateLimit(deps.redis, rateLimitOptions));
-  evaluatorScore.route("/", evaluatorScoreRoutes({ storage: deps.storage, queue: deps.queue }));
+  evaluatorScore.route("/", evaluatorScoreRoutes({
+    pool: deps.pgPool,
+    storage: deps.storage,
+    queue: deps.queue
+  }));
   app.route("/api/v1", evaluatorScore);
 
   // LangFuse compat reads: GET /api/public/traces[/:id] — LangFuse's own

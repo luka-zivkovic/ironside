@@ -5,7 +5,7 @@ const bootstrapCursorSchema = z.object({
   kind: z.literal("bootstrap"),
   through: z.iso.datetime({ offset: true }),
   afterVersion: z.iso.datetime({ offset: true }),
-  afterTraceId: z.string().min(1)
+  afterTraceId: z.string()
 });
 
 const liveCursorSchema = z.object({

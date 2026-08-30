@@ -7,6 +7,7 @@ import {
 } from "@ironside/clickhouse";
 import {
   getRawRetentionIntent,
+  listEvaluatorPublishedTraceIdsForActivity,
   publishEvaluatorTraceActivities,
   recordIngestFailures,
   withRawRetentionObjectLock,
@@ -15,6 +16,7 @@ import {
 import { mapLangfuseIngestionRequest, mapNativeEvents, mapOtlpTraceRequest } from "@ironside/mappers";
 import type { IngestBatch, Observation, QueueMessage, Score, Trace } from "@ironside/shared";
 import {
+  ingestBatchSchema,
   langfuseIngestionRequestSchema,
   otlpExportTraceServiceRequestSchema,
   pendingIngestObjectKeyForRaw
@@ -35,6 +37,35 @@ export interface IngestProcessorDeps {
   onDeadLetter?: (count: number) => void;
   /** Bounded-cardinality metric hook; values/project ids are never labels. */
   onEnvironmentRegistryOverflow?: (count: number) => void;
+}
+
+/**
+ * A job can fail after its evaluator publication committed but before the
+ * final raw-ref acknowledgement. The worker failure hook calls this recovery
+ * step so an exhausted post-publication retry cannot leave the feed blocked.
+ */
+export async function settlePublishedEvaluatorTraceRefs(
+  deps: Pick<IngestProcessorDeps, "storage" | "clickhouse" | "pool">,
+  message: QueueMessage
+): Promise<number> {
+  const traceIds = await listEvaluatorPublishedTraceIdsForActivity(deps.pool, {
+    projectId: message.projectId,
+    activityId: message.batchId
+  });
+  if (traceIds.length === 0) return 0;
+  const batch = ingestBatchSchema.parse(await deps.storage.getJson(message.objectKey));
+  await insertRawEventRefs(
+    deps.clickhouse,
+    traceIds.map((traceId) => ({
+      projectId: message.projectId,
+      traceId,
+      objectKey: message.objectKey,
+      receivedAt: batch.receivedAt
+    })),
+    batch.receivedAt,
+    true
+  );
+  return traceIds.length;
 }
 
 /**
@@ -150,13 +181,24 @@ export function createIngestProcessor(deps: IngestProcessorDeps) {
       objectKey,
       receivedAt: batch.receivedAt
     }));
+    const snapshotTraceIds = new Set([
+      ...traces.map((trace) => trace.id),
+      ...observations.map((observation) => observation.traceId)
+    ]);
+    const snapshotRawRefs = rawRefs.filter((ref) => snapshotTraceIds.has(ref.traceId));
+    const annotationOnlyRawRefs = rawRefs.filter((ref) => !snapshotTraceIds.has(ref.traceId));
 
-    // Mark refs pending before domain rows become visible. Existing complete
-    // traces therefore become conservatively incomplete during the short
-    // write window instead of returning a new trace version without its raw
-    // batch. `applied=true` replaces these rows only after all domain inserts
-    // succeed; a crash leaves a visible pending marker for the retry/debugger.
-    await insertRawEventRefs(deps.clickhouse, rawRefs, batch.receivedAt, false);
+    // Mark only snapshot-affecting refs pending before domain rows become
+    // visible. Existing complete traces therefore become conservatively
+    // incomplete during the short write window. Score-only refs start applied
+    // because annotations never alter evaluator snapshots.
+    await Promise.all([
+      insertRawEventRefs(deps.clickhouse, snapshotRawRefs, batch.receivedAt, false),
+      // Annotation-only rows never affect a trace snapshot, so their raw
+      // references can be retention-visible immediately without making
+      // evaluator reads wait for score materialization.
+      insertRawEventRefs(deps.clickhouse, annotationOnlyRawRefs, batch.receivedAt, true)
+    ]);
 
     const insertOptions = { eventTs: batch.receivedAt };
     await Promise.all([
@@ -185,8 +227,7 @@ export function createIngestProcessor(deps: IngestProcessorDeps) {
     await publishEvaluatorTraceActivities(deps.pool, {
       projectId,
       traceIds: [
-        ...traces.map((trace) => trace.id),
-        ...observations.map((observation) => observation.traceId)
+        ...snapshotTraceIds
       ],
       sourceActivityAt: batch.receivedAt,
       activityId: batch.batchId
@@ -195,7 +236,7 @@ export function createIngestProcessor(deps: IngestProcessorDeps) {
     // Applied refs are written last. Until this succeeds evaluator detail
     // reads return 409 and the feed cursor remains retryable. A retry repeats
     // ClickHouse writes but does not mint another feed version.
-    await insertRawEventRefs(deps.clickhouse, rawRefs, batch.receivedAt, true);
+    await insertRawEventRefs(deps.clickhouse, snapshotRawRefs, batch.receivedAt, true);
 
     if (failures.length > 0) {
       deps.onDeadLetter?.(failures.length);

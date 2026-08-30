@@ -33,6 +33,27 @@ create table evaluator_trace_feed_watermarks (
   published_at timestamptz not null
 );
 
+-- The score table's physical identity includes the UTC date of timestamp.
+-- Keep the first accepted timestamp and request fingerprint in Postgres so a
+-- lost-response retry on another day still converges on one ClickHouse row.
+create table evaluator_score_receipts (
+  project_id text not null references projects(id) on delete cascade,
+  score_id text not null,
+  trace_id text not null,
+  request_fingerprint text not null,
+  score_timestamp timestamptz not null default clock_timestamp(),
+  primary key (project_id, score_id),
+  constraint evaluator_score_receipts_score_id_check
+    check (length(score_id) > 0 and score_id = btrim(score_id)),
+  constraint evaluator_score_receipts_trace_id_check
+    check (length(trace_id) > 0 and trace_id = btrim(trace_id)),
+  constraint evaluator_score_receipts_fingerprint_check
+    check (request_fingerprint ~ '^[0-9a-f]{64}$')
+);
+
+create index evaluator_score_receipts_trace_idx
+  on evaluator_score_receipts (project_id, trace_id);
+
 -- Publishing must be retry-safe even when a batch succeeds through Postgres
 -- and then retries because final object-storage cleanup failed. One durable row
 -- per materialized batch/trace prevents that retry from minting another
@@ -58,3 +79,6 @@ comment on table evaluator_trace_feed_activities is
 
 comment on table evaluator_trace_feed_watermarks is
   'Durable per-project publication high-water marks for commit-ordered evaluator cursors.';
+
+comment on table evaluator_score_receipts is
+  'First-write timestamp and request identity for retry-idempotent native evaluator scores.';

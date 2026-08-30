@@ -12,6 +12,45 @@ export interface EvaluatorTraceFeedCursor {
   traceId: string;
 }
 
+export class EvaluatorScoreIdempotencyConflictError extends Error {
+  constructor(readonly scoreId: string) {
+    super(`Evaluator score id was already used for a different request: ${scoreId}`);
+    this.name = "EvaluatorScoreIdempotencyConflictError";
+  }
+}
+
+export async function claimEvaluatorScoreReceipt(
+  pool: Pool,
+  input: {
+    projectId: string;
+    scoreId: string;
+    traceId: string;
+    requestFingerprint: string;
+  }
+): Promise<{ timestamp: string }> {
+  const result = await pool.query<{
+    trace_id: string;
+    request_fingerprint: string;
+    score_timestamp: Date;
+  }>(
+    `insert into evaluator_score_receipts
+       (project_id, score_id, trace_id, request_fingerprint)
+     values ($1, $2, $3, $4)
+     on conflict (project_id, score_id) do update
+       set score_id = excluded.score_id
+     returning trace_id, request_fingerprint, score_timestamp`,
+    [input.projectId, input.scoreId, input.traceId, input.requestFingerprint]
+  );
+  const receipt = result.rows[0]!;
+  if (
+    receipt.trace_id !== input.traceId ||
+    receipt.request_fingerprint !== input.requestFingerprint
+  ) {
+    throw new EvaluatorScoreIdempotencyConflictError(input.scoreId);
+  }
+  return { timestamp: receipt.score_timestamp.toISOString() };
+}
+
 /**
  * Records the newest trace/observation activity only after ClickHouse and the
  * raw-event index are fully materialized. Replaying the same ingest batch is
@@ -163,6 +202,20 @@ export async function getEvaluatorTracePublications(
   }]));
 }
 
+export async function listEvaluatorPublishedTraceIdsForActivity(
+  pool: Pool,
+  input: { projectId: string; activityId: string }
+): Promise<string[]> {
+  const result = await pool.query<{ trace_id: string }>(
+    `select trace_id
+       from evaluator_trace_feed_activities
+      where project_id = $1 and activity_id = $2
+      order by trace_id asc`,
+    [input.projectId, input.activityId]
+  );
+  return result.rows.map((row) => row.trace_id);
+}
+
 export async function deleteEvaluatorTraceFeedEntries(
   pool: Pool,
   entries: { projectId: string; traceId: string; traceVersion: string }[]
@@ -187,6 +240,12 @@ export async function deleteEvaluatorTraceFeedEntries(
        using deleted_feed
        where activity.project_id = deleted_feed.project_id
          and activity.trace_id = deleted_feed.trace_id
+       returning 1
+     ), deleted_score_receipts as (
+       delete from evaluator_score_receipts receipt
+       using deleted_feed
+       where receipt.project_id = deleted_feed.project_id
+         and receipt.trace_id = deleted_feed.trace_id
        returning 1
      )
      select count(*)::text as deleted_count from deleted_feed`,
