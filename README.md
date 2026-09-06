@@ -1,17 +1,56 @@
-# Ironside
+<h1 align="center">Ironside</h1>
 
-[![CI](https://github.com/luka-zivkovic/ironside/actions/workflows/ci.yml/badge.svg)](https://github.com/luka-zivkovic/ironside/actions/workflows/ci.yml)
-[![License: Sustainable Use](https://img.shields.io/badge/license-sustainable%20use-314158)](./LICENSE.md)
+<p align="center"><strong>Keep your AI traces. Understand what happened. Take the data anywhere.</strong></p>
 
-**The system of record for AI interaction data.** Ingest LLM traces from anywhere (native SDK, plain JSON, OpenTelemetry `gen_ai.*`, LangFuse-compatible endpoints), store them durably and cheaply, and export them anywhere (Parquet to your warehouse, OTLP forwarding, webhooks, full API).
+<p align="center">
+  <a href="https://github.com/luka-zivkovic/ironside/actions/workflows/ci.yml"><img src="https://github.com/luka-zivkovic/ironside/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-Sustainable%20Use-475569" alt="Sustainable Use license"></a>
+</p>
 
-Deliberately narrow: **storage + pipes + a great trace viewer**. Evals and prompt management live elsewhere — bring any eval tool. Ironside exposes a native, versioned settled-trace feed for evaluator systems such as [Coeval](https://github.com/luka-zivkovic/coeval), while retaining LangFuse-compatible fetch and score APIs for existing tools.
+<p align="center">
+  <a href="#run-it">Run locally</a> · <a href="#install-with-your-coding-agent">Install with an agent</a> · <a href="#mcp-and-agent-harnesses">MCP & harnesses</a> · <a href="#instrument-your-app">SDK</a> · <a href="docs/self-hosting.md">Self-hosting</a>
+</p>
+
+Ironside gives your AI traces a home you control. Capture model calls,
+inspect the full interaction, and keep the original events available for
+later debugging, evaluation, or export. Use the native SDK, JSON, or
+OpenTelemetry to connect your application.
+
+<p align="center">
+  <picture>
+    <source media="(max-width: 600px)" srcset="docs/assets/workflow-mobile.svg">
+    <img src="docs/assets/workflow.svg" width="100%" alt="Ironside captures SDK, JSON, and OTLP events, stores raw data in S3 and trace projections in ClickHouse, and supports inspection and export.">
+  </picture>
+</p>
+
+Ironside focuses on **trace storage, a viewer, and data integrations**. Bring your own evaluation and prompt-management tools. Ironside exposes a native, versioned settled-trace feed for evaluator systems such as [Coeval](https://github.com/luka-zivkovic/coeval), while retaining LangFuse-compatible fetch and score APIs for existing tools.
 
 Status: pre-release, under active development. See [ROADMAP.md](./ROADMAP.md). Licensed under the [Ironside Sustainable Use License](./LICENSE.md) — self-hosting for your own organization's use is always free and unrestricted; see the license for the (narrow) limitations.
 
 [Self-hosting](./docs/self-hosting.md) · [SDK guide](./packages/sdk/README.md) · [Roadmap](./ROADMAP.md) · [Security](./SECURITY.md) · [Contributing](./CONTRIBUTING.md)
 
+## Install with your coding agent
+
+Claude Code, Codex, and other agents with a shell can install the local Docker
+stack. Paste this into a session in your projects directory:
+
+```text
+Set up Ironside locally from https://github.com/luka-zivkovic/ironside.
+Read its README and docs/agent-setup.md first. Check Docker and available
+ports, build and start the Compose stack, and verify service health.
+Preserve existing data and services. Guide me through owner setup and
+creating a project, then help me connect my app with the SDK or OTLP.
+Keep credentials out of chat and Git.
+```
+
+**[Agent setup guide →](docs/agent-setup.md)** — Claude Code, Codex, other
+harnesses, verification, session capture, and where MCP fits.
+
 ## Run it
+
+Requires **Git and Docker with Compose v2**. The containerized installation
+builds the application for you; a host Node.js installation is only needed for
+[development](#development).
 
 ```sh
 git clone https://github.com/luka-zivkovic/ironside.git
@@ -85,22 +124,38 @@ OTLP is the portable default for third parties; the SDK is the native Node.js co
 
 Already storing traces in LangFuse or LangSmith and want them in Ironside too? Point their SDKs at Ironside's compatible endpoints instead of standing up new instrumentation (`spec/langfuse-compat-v1.md`), or backfill your existing history with the pull-based importers (`spec/langfuse-importer-v1.md`, `spec/langsmith-importer-v1.md`) — both capture full observation trees and scores, not just trace summaries.
 
+## MCP and agent harnesses
+
+**Ironside does not currently ship an MCP server.** Its native JSON and OTLP
+endpoints are HTTP ingestion APIs; they are not MCP endpoints. A coding agent
+can install and instrument Ironside using its shell without an MCP adapter.
+
+To capture coding-agent sessions, Overclock's optional
+[eval-stack plugin](https://github.com/luka-zivkovic/overclock/tree/master/plugins/eval-stack)
+includes Claude Code and Codex session importers and a pi tracing extension.
+See [session capture](docs/agent-setup.md#capture-coding-agent-sessions) for the
+separate installation path.
+
+For evaluation tools inside your harness, [Coeval](https://github.com/luka-zivkovic/coeval)
+can consume Ironside's native evaluator feed and exposes its own
+[stdio MCP server](https://github.com/luka-zivkovic/coeval/tree/main/tools/mcp).
+That connection uses a **Coeval project key**. Ironside's **Integration**
+credential is configured separately in Coeval to read traces and write scores.
+
 ## Architecture
 
-```
-        ┌─ native JSON ──┐
-clients ┼─ OTLP http ────┼→ api (Hono, fast ACK)
-        └─ LF-compat ────┘       │
-                   raw event → MinIO/S3 (immutable log)
-                   reference → Redis (BullMQ)
-                                 │
-                              worker ──→ ClickHouse (traces/observations/scores)
-                                 │
-                   exports: Parquet → bucket / OTLP forward / webhooks
+| Layer | Responsibility |
+| --- | --- |
+| API · Hono | Accept events, persist raw data, and expose project APIs. |
+| Object storage · MinIO/S3 | Retain the immutable raw event log. |
+| Queue · Redis/BullMQ | Coordinate asynchronous processing. |
+| Worker + ClickHouse | Build searchable trace, observation, and score projections. |
+| Web · React | Browse traces, manage projects, and configure connections. |
+| Postgres | Store organizations, projects, credentials, and configuration. |
+| Export workers | Write Parquet, forward OTLP, and deliver webhooks. |
 
-web (React SPA, nginx) ──→ api: trace viewer, Connections, project management
-Postgres: orgs, projects, scoped credentials, bounded environment discovery, configs/quotas
-```
+The [ingest contract](spec/trace-envelope-v1.md) and
+[self-hosting guide](docs/self-hosting.md) cover durability and operation in detail.
 
 ## Development
 

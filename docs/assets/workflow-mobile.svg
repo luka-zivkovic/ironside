@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 650" role="img" aria-labelledby="title desc">
+<title id="title">Capture → Store → Inspect → Connect</title>
+<desc id="desc">Capture: SDK · JSON · OTLP Bring your own stack.; Store: Raw events in S3. Traces in ClickHouse.; Inspect: Follow the full trace. See usage and scores.; Connect: Export, forward, or evaluate elsewhere.. Durable raw events → asynchronous processing → searchable traces and portable exports.</desc>
+<defs><pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" fill="#dddcd4"/></pattern></defs>
+<rect width="620" height="650" rx="20" fill="#f7f6f0"/>
+<rect width="620" height="650" rx="20" fill="url(#grid)" opacity=".5"/>
+<g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif">
+<rect x="36" y="31" width="5" height="20" rx="2" fill="#356fc0"/>
+<text x="53" y="47" fill="#48534e" font-size="16" font-weight="600" letter-spacing="2">ONE HOME FOR YOUR AI INTERACTION DATA</text>
+<rect x="36" y="79" width="258" height="205" rx="14" fill="#ffffff" stroke="#dcded7"/>
+<text x="263" y="113" text-anchor="end" fill="#75827b" font-size="14" font-weight="600">01</text>
+<g transform="translate(59 101)" fill="none" stroke="#356fc0" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="0" y="4" width="40" height="32" rx="6"/><path d="M9 14h22M9 23h16M9 31h10"/></g>
+<text x="59" y="186" fill="#192d27" font-size="24" font-weight="600">Capture</text>
+<text x="59" y="219" fill="#506159" font-size="18">SDK · JSON · OTLP</text>
+<text x="59" y="246" fill="#506159" font-size="18">Bring your own stack.</text>
+<rect x="326" y="79" width="258" height="205" rx="14" fill="#ffffff" stroke="#dcded7"/>
+<text x="553" y="113" text-anchor="end" fill="#75827b" font-size="14" font-weight="600">02</text>
+<g transform="translate(349 101)" fill="none" stroke="#356fc0" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="20" cy="20" r="19"/><path d="m10 20 7 7 14-15"/></g>
+<text x="349" y="186" fill="#192d27" font-size="24" font-weight="600">Store</text>
+<text x="349" y="219" fill="#506159" font-size="18">Raw events in S3.</text>
+<text x="349" y="246" fill="#506159" font-size="18">Traces in ClickHouse.</text>
+<rect x="36" y="324" width="258" height="205" rx="14" fill="#ffffff" stroke="#dcded7"/>
+<text x="263" y="358" text-anchor="end" fill="#75827b" font-size="14" font-weight="600">03</text>
+<g transform="translate(59 346)" fill="none" stroke="#356fc0" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="36" height="36" rx="8"/><path d="M11 12h18M11 20h18M11 28h9"/></g>
+<text x="59" y="431" fill="#192d27" font-size="24" font-weight="600">Inspect</text>
+<text x="59" y="464" fill="#506159" font-size="18">Follow the full trace.</text>
+<text x="59" y="491" fill="#506159" font-size="18">See usage and scores.</text>
+<rect x="326" y="324" width="258" height="205" rx="14" fill="#ffffff" stroke="#dcded7"/>
+<text x="553" y="358" text-anchor="end" fill="#75827b" font-size="14" font-weight="600">04</text>
+<g transform="translate(349 346)" fill="none" stroke="#356fc0" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 37V24h8v13M17 37V14h8v23M31 37V3h8v34"/></g>
+<text x="349" y="431" fill="#192d27" font-size="24" font-weight="600">Connect</text>
+<text x="349" y="464" fill="#506159" font-size="18">Export, forward,</text>
+<text x="349" y="491" fill="#506159" font-size="18">or evaluate elsewhere.</text>
+<text x="36" y="584" fill="#506159" font-size="18">Durable raw events → asynchronous processing → searchable</text>
+<text x="36" y="611" fill="#506159" font-size="18">traces and portable exports.</text>
+</g>
+</svg>
