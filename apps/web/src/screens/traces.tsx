@@ -1,25 +1,34 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { ArrowRight, RefreshCcw, Search } from "lucide-react";
-import type { TraceSummary } from "@ironside/shared/browser";
-import { ApiError, fetchTraces, getApiBaseUrl, type ListTracesParams } from "@/lib/api";
+import type { AggregatesResponse, TraceSummary } from "@ironside/shared/browser";
+import { ApiError, fetchAggregates, fetchTraces, getApiBaseUrl, type ListTracesParams } from "@/lib/api";
 import { buildNativeIngestCurl } from "@/lib/connection-snippets";
+import {
+  TIME_RANGE_OPTIONS,
+  parseTimeRange,
+  rangeFrom,
+  summaryTiles,
+  type SummaryTile,
+  type TimeRange
+} from "@/lib/trace-analytics";
 import { useActiveProject } from "@/lib/projects";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { PageHeader } from "@/components/page-header";
-import { formatTimestamp } from "@/lib/utils";
+import { cn, formatTimestamp } from "@/lib/utils";
 
 interface Filters {
   userId: string;
   sessionId: string;
   tags: string;
   environment: string;
+  range: TimeRange;
 }
 
-const EMPTY_FILTERS: Filters = { userId: "", sessionId: "", tags: "", environment: "" };
+const EMPTY_FILTERS: Filters = { userId: "", sessionId: "", tags: "", environment: "", range: "" };
 const EMPTY_STATE_REFRESH_INTERVAL_MS = 3_000;
 const EMPTY_STATE_MAX_AUTO_REFRESHES = 40;
 
@@ -53,8 +62,10 @@ function toParams(filters: Filters, cursor: string | null): ListTracesParams {
     .split(",")
     .map((t) => t.trim())
     .filter(Boolean);
+  const from = rangeFrom(filters.range);
   return {
     limit: 30,
+    ...(from !== undefined && { from }),
     ...(filters.userId.trim() && { userId: filters.userId.trim() }),
     ...(filters.sessionId.trim() && { sessionId: filters.sessionId.trim() }),
     ...(filters.environment.trim() && { environment: filters.environment.trim() }),
@@ -79,6 +90,8 @@ export function TracesScreen() {
   const [loading, setLoading] = useState(true);
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [autoRefreshCount, setAutoRefreshCount] = useState(0);
+  const [aggregates, setAggregates] = useState<AggregatesResponse | null>(null);
+  const [aggregatesError, setAggregatesError] = useState<string | null>(null);
 
   const showFirstTraceOnboarding =
     traces?.length === 0 && !hasFilters(filters) && currentCursor === null;
@@ -104,6 +117,25 @@ export function TracesScreen() {
       cancelled = true;
     };
   }, [project.id, filters, currentCursor, refreshVersion]);
+
+  // The summary covers the whole filtered set, not the current page, so it
+  // ignores the cursor and refreshes only when filters change or on demand.
+  useEffect(() => {
+    let cancelled = false;
+    setAggregatesError(null);
+    const { limit: _limit, cursor: _cursor, ...params } = toParams(filters, null);
+    fetchAggregates(project.id, params)
+      .then((response) => {
+        if (!cancelled) setAggregates(response);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setAggregatesError(err instanceof ApiError ? err.message : "Failed to load summary");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [project.id, filters, refreshVersion]);
 
   useEffect(() => {
     setPendingFilters(filters);
@@ -168,6 +200,22 @@ export function TracesScreen() {
           <CardDescription>Filter by the identifiers attached at ingest.</CardDescription>
         </CardHeader>
         <CardContent className="flex flex-wrap items-end gap-3 pt-4">
+          <Field label="Time range">
+            <select
+              value={filters.range}
+              onChange={(e) =>
+                setSearchParams(searchParamsFromFilters({ ...filters, range: parseTimeRange(e.target.value) }))
+              }
+              className="h-8 w-full rounded-sm border border-rule bg-card px-2 text-[12.5px] text-ink outline-none focus-visible:border-signal sm:w-[150px]"
+              aria-label="Time range"
+            >
+              {TIME_RANGE_OPTIONS.map((option) => (
+                <option key={option.value || "all"} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </Field>
           <Field label="User ID">
             <Input
               value={pendingFilters.userId}
@@ -203,12 +251,14 @@ export function TracesScreen() {
               onClick={() => {
                 setPendingFilters({
                   ...EMPTY_FILTERS,
-                  environment: filters.environment
+                  environment: filters.environment,
+                  range: filters.range
                 });
                 setSearchParams(
                   searchParamsFromFilters({
                     ...EMPTY_FILTERS,
-                    environment: filters.environment
+                    environment: filters.environment,
+                    range: filters.range
                   })
                 );
               }}
@@ -218,6 +268,10 @@ export function TracesScreen() {
           ) : null}
         </CardContent>
       </Card>
+
+      {showFirstTraceOnboarding ? null : (
+        <SummaryStrip aggregates={aggregates} error={aggregatesError} range={filters.range} />
+      )}
 
       {error ? (
         <Card className="p-6 text-[12.5px] text-error">{error}</Card>
@@ -390,7 +444,8 @@ export function filtersFromSearchParams(search: URLSearchParams): Filters {
     userId: search.get("userId") ?? "",
     sessionId: search.get("sessionId") ?? "",
     tags: search.getAll("tags").join(", "),
-    environment: search.get("environment") ?? ""
+    environment: search.get("environment") ?? "",
+    range: parseTimeRange(search.get("range"))
   };
 }
 
@@ -399,11 +454,56 @@ export function searchParamsFromFilters(filters: Filters): URLSearchParams {
   if (filters.userId.trim()) search.set("userId", filters.userId.trim());
   if (filters.sessionId.trim()) search.set("sessionId", filters.sessionId.trim());
   if (filters.environment.trim()) search.set("environment", filters.environment.trim());
+  if (filters.range) search.set("range", filters.range);
   for (const tag of filters.tags.split(",").map((value) => value.trim()).filter(Boolean)) {
     search.append("tags", tag);
   }
   return search;
 }
+
+function SummaryStrip({
+  aggregates,
+  error,
+  range
+}: {
+  aggregates: AggregatesResponse | null;
+  error: string | null;
+  range: TimeRange;
+}) {
+  const rangeLabel = TIME_RANGE_OPTIONS.find((option) => option.value === range)?.label ?? "All time";
+  const tiles: SummaryTile[] | null = aggregates ? summaryTiles(aggregates) : null;
+  return (
+    <section aria-label="Trace summary" className="flex flex-col gap-2">
+      <div className="flex items-baseline justify-between gap-3">
+        <span className="eyebrow">Summary · {rangeLabel.toLowerCase()}</span>
+        {error ? <span className="text-[11.5px] text-error">{error}</span> : null}
+      </div>
+      <div className="grid grid-cols-2 gap-px overflow-hidden rounded-sm border border-rule-soft bg-rule-soft lg:grid-cols-4">
+        {(tiles ?? PLACEHOLDER_TILES).map((tile) => (
+          <div key={tile.label} className="flex min-w-0 flex-col gap-1 bg-card px-4 py-3">
+            <span className="text-[11.5px] text-ink-3">{tile.label}</span>
+            <span
+              className={cn(
+                "font-sans text-[22px] font-semibold leading-none tracking-[-0.01em] text-ink",
+                tiles === null && "text-ink-4"
+              )}
+            >
+              {tile.value}
+            </span>
+            <span className="min-h-[14px] truncate font-mono text-[10.5px] text-ink-4">{tile.detail ?? ""}</span>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+const PLACEHOLDER_TILES: SummaryTile[] = [
+  { label: "Traces", value: "—" },
+  { label: "Tokens", value: "—" },
+  { label: "Cost", value: "—" },
+  { label: "Latency p50", value: "—" }
+];
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (

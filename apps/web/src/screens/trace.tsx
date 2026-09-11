@@ -175,12 +175,12 @@ export function TraceRecordView({ trace }: { trace: TraceTreeResponse }) {
         className={cn("trace-record-split min-w-0 items-start", dragging && "trace-record-split--dragging")}
         style={{ "--trace-tree-share": `${treeShare}%` } as CSSProperties}
       >
-        <Card className="min-w-0">
+        <Card className="trace-record-pane min-w-0">
           <CardHeader className="flex-col items-start gap-1 border-b border-rule-soft">
             <div className="eyebrow">Execution path</div>
             <CardTitle>Observation tree</CardTitle>
           </CardHeader>
-          <CardContent className="p-2">
+          <CardContent className="trace-record-pane-body p-2">
             {trace.observations.length === 0 ? (
               <div className="p-4 text-[12.5px] text-ink-3">This trace has no observations.</div>
             ) : (
@@ -244,12 +244,12 @@ export function TraceRecordView({ trace }: { trace: TraceTreeResponse }) {
           <span aria-hidden="true" />
         </div>
 
-        <Card className="trace-record-inspector min-w-0">
+        <Card className="trace-record-pane min-w-0">
           <CardHeader className="flex-col items-start gap-1 border-b border-rule-soft">
             <div className="eyebrow">Record inspector</div>
             <CardTitle>{selected ? "Observation" : "Trace"} detail</CardTitle>
           </CardHeader>
-          <CardContent className="flex min-w-0 flex-col gap-3">
+          <CardContent className="trace-record-pane-body flex min-w-0 flex-col gap-3">
             {selected ? <ObservationDetail node={selected} /> : <TraceDetail trace={trace} />}
           </CardContent>
         </Card>
