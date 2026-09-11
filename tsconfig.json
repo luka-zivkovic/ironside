@@ -20,6 +20,9 @@
       "path": "./packages/mappers"
     },
     {
+      "path": "./packages/pricing"
+    },
+    {
       "path": "./packages/sdk"
     },
     {

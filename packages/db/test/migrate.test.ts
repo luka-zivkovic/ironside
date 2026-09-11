@@ -47,7 +47,7 @@ describe("runMigrations (postgres)", () => {
     expect(applied.rows).toEqual([
       {
         id: "0001_baseline",
-        checksum: "ca0fe03d88db6c911b1c682303738c090b6351c192845b453781b7321d2b588b"
+        checksum: "921f4cff1efc807621eaa3531492a65f5fdfeaa02d12877ddeedc2f65bf8dab9"
       }
     ]);
     expect((await pool.query("select to_regclass('api_keys') as table_name")).rows).toEqual([

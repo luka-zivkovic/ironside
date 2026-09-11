@@ -1,0 +1,23 @@
+{
+  "name": "@ironside/pricing",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Vendored model price table and the cost computation Ironside applies to observations that report usage but no cost.",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && rm -rf dist/data && cp -r data dist/data",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "sync-prices": "node scripts/sync-model-prices.mjs"
+  },
+  "dependencies": {
+    "@ironside/shared": "workspace:*"
+  }
+}

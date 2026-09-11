@@ -32,6 +32,68 @@ export const updateProjectQuotasRequestSchema = z.object({
 });
 export type UpdateProjectQuotasRequest = z.infer<typeof updateProjectQuotasRequestSchema>;
 
+// Project-defined model prices (spec/cost-pricing-v1.md). Checked in list
+// order before the vendored table when the worker derives cost for an
+// observation with usage but no cost. Prices are USD per token; null means
+// "this rule does not price that component" (never zero).
+const perTokenPriceSchema = z.number().nonnegative().max(1).nullable();
+
+function isValidRegex(pattern: string): boolean {
+  try {
+    new RegExp(pattern, "i");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export const modelPriceOverrideInputSchema = z
+  .object({
+    /** Case-insensitive regular expression tested against the observation's model name. */
+    pattern: z.string().trim().min(1).max(200).refine(isValidRegex, "must be a valid regular expression"),
+    inputCostPerToken: perTokenPriceSchema.default(null),
+    outputCostPerToken: perTokenPriceSchema.default(null),
+    cacheReadInputTokenCost: perTokenPriceSchema.default(null),
+    cacheWriteInputTokenCost: perTokenPriceSchema.default(null)
+  })
+  .refine(
+    (value) =>
+      value.inputCostPerToken !== null ||
+      value.outputCostPerToken !== null ||
+      value.cacheReadInputTokenCost !== null ||
+      value.cacheWriteInputTokenCost !== null,
+    "at least one price is required"
+  );
+export type ModelPriceOverrideInput = z.infer<typeof modelPriceOverrideInputSchema>;
+
+export const modelPriceOverrideSchema = z.object({
+  id: z.string(),
+  pattern: z.string(),
+  inputCostPerToken: z.number().nullable(),
+  outputCostPerToken: z.number().nullable(),
+  cacheReadInputTokenCost: z.number().nullable(),
+  cacheWriteInputTokenCost: z.number().nullable()
+});
+export type ModelPriceOverride = z.infer<typeof modelPriceOverrideSchema>;
+
+// GET /api/v1/projects/:projectId/model-prices
+export const modelPricesResponseSchema = z.object({
+  overrides: z.array(modelPriceOverrideSchema),
+  /** The vendored price table this installation falls back to. */
+  table: z.object({
+    source: z.string(),
+    syncedAt: z.string(),
+    modelCount: z.number().int().nonnegative()
+  })
+});
+export type ModelPricesResponse = z.infer<typeof modelPricesResponseSchema>;
+
+// PUT /api/v1/projects/:projectId/model-prices — replaces the whole ordered list.
+export const replaceModelPricesRequestSchema = z.object({
+  overrides: z.array(modelPriceOverrideInputSchema).max(100)
+});
+export type ReplaceModelPricesRequest = z.infer<typeof replaceModelPricesRequestSchema>;
+
 export const listProjectsResponseSchema = z.object({
   projects: z.array(projectSchema)
 });

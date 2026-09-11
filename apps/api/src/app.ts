@@ -29,6 +29,7 @@ import { evaluatorReadRoutes, evaluatorScoreRoutes } from "./routes/evaluator.js
 import { langfuseFetchRoutes } from "./routes/langfuse-fetch.js";
 import { langfuseRoutes } from "./routes/langfuse.js";
 import { otlpRoutes } from "./routes/otlp.js";
+import { modelPricesRoutes } from "./routes/model-prices.js";
 import { projectQuotasRoutes, projectsRoutes } from "./routes/projects.js";
 import { rawEventsRoutes } from "./routes/raw-events.js";
 import { tracesRoutes } from "./routes/traces.js";
@@ -175,6 +176,7 @@ export function createApp(deps: AppDeps): Hono<AuthEnv> {
   const ownerProject = new Hono<OwnerProjectEnv>();
   ownerProject.use("*", ownerProjectAuth(deps.pgPool));
   ownerProject.route("/", projectQuotasRoutes({ pool: deps.pgPool }));
+  ownerProject.route("/", modelPricesRoutes({ pool: deps.pgPool }));
   ownerProject.route("/", tracesRoutes({ clickhouse: deps.clickhouse }));
   ownerProject.route("/", credentialsRoutes({ pool: deps.pgPool, redis: deps.redis }));
   ownerProject.route("/", environmentsRoutes({ pool: deps.pgPool }));

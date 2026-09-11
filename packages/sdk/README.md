@@ -69,7 +69,8 @@ const generation = trace.generation({
 generation.end({
   output: { answer: "Rayleigh scattering." },
   usageDetails: { input_tokens: 8, output_tokens: 4 },
-  costDetails: { total_usd: 0.00012 }
+  // Optional: omit it and Ironside derives cost from usageDetails and the model name.
+  costDetails: { input: 0.00008, output: 0.00004, total: 0.00012 }
 });
 
 trace.score({ name: "correctness", value: 1, source: "eval" });

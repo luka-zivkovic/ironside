@@ -187,3 +187,9 @@ export {
   type MediaAsset,
   type ProjectMediaStorageSummary
 } from "./media-assets.js";
+export {
+  listProjectModelPrices,
+  replaceProjectModelPrices,
+  type ProjectModelPrice,
+  type ProjectModelPriceInput
+} from "./model-prices.js";

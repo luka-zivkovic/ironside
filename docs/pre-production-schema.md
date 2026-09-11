@@ -50,6 +50,7 @@ baselines; development-only upgrade behavior is removed.
 | #67 — Add owner bootstrap, recovery, and browser sessions | owner principals, challenges, sessions, audit events | adopting or disambiguating organizations created before owner auth |
 | #70 — Add scoped machine credentials and Connections UX | scoped `ironside_sc_` credentials | `ironside_sk_` backfill, dual cache namespaces, mixed-version replica handling, browser-key cleanup |
 | #71 — Add observed environments and project trace filtering | environment projection and rebuild state | existing-project backfill and mixed-version project trigger; current project creation initializes state explicitly |
+| Computed model cost (spec/cost-pricing-v1.md) | project_model_prices | none; overrides are current runtime state |
 
 Protocol compatibility is a separate concern and is not removed by this policy.
 Ironside still accepts supported OTLP and LangFuse wire shapes because those are

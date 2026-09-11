@@ -44,7 +44,7 @@ A span with no `parentSpanId` is the trace root — its `traceId` becomes the `T
 
 ## Known gaps (M4 direct-ingest-primacy audit, 2026-07-12)
 
-- **No cost mapping.** Verified directly against the live semconv registry (`open-telemetry/semantic-conventions-genai`, `model/gen-ai/registry.yaml`): there is no `gen_ai.usage.cost` or any standardized cost/price attribute upstream — this isn't a missed mapping, there's nothing to map. A client that wants cost recorded must compute it and send it via the native JSON ingest path instead (`Observation.costDetails`), or as a custom OTLP attribute captured generically via the metadata fallback above.
+- **No cost mapping from attributes; cost is derived instead.** Verified directly against the live semconv registry (`open-telemetry/semantic-conventions-genai`, `model/gen-ai/registry.yaml`): there is no `gen_ai.usage.cost` or any standardized cost/price attribute upstream — this isn't a missed mapping, there's nothing to map. Since `gen_ai.usage.*` and `gen_ai.request.model` map to usage and model, the worker derives cost from the price table at ingest (`spec/cost-pricing-v1.md`). A client that needs an exact provider-billed figure can still send it via the native JSON ingest path (`Observation.costDetails`); a custom OTLP cost attribute is captured generically via the metadata fallback above but is not promoted into `costDetails`.
 - **No score support.** OTLP/OTel has no native "score" concept (human feedback, eval results). Scores can only be recorded via native JSON ingest (`score-upsert`) or the SDK's `score()` method — there is no OTLP-side workaround, documented here rather than left silent.
 
 ## Storage path

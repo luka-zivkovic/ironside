@@ -13,6 +13,7 @@
     { "path": "../../packages/clickhouse" },
     { "path": "../../packages/queue" },
     { "path": "../../packages/storage" },
-    { "path": "../../packages/mappers" }
+    { "path": "../../packages/mappers" },
+    { "path": "../../packages/pricing" }
   ]
 }

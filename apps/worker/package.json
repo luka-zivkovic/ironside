@@ -19,6 +19,7 @@
     "@ironside/clickhouse": "workspace:*",
     "@ironside/db": "workspace:*",
     "@ironside/mappers": "workspace:*",
+    "@ironside/pricing": "workspace:*",
     "@ironside/queue": "workspace:*",
     "@ironside/shared": "workspace:*",
     "@ironside/storage": "workspace:*",
