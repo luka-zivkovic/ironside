@@ -35,9 +35,9 @@ A second, much smaller bug surfaced while writing that test suite: the initial b
 
 ## License
 
-`LICENSE.md` — an Ironside-adapted version of coeval's (same author) Sustainable Use License v1.0, per the original planning doc's stated intent ("monetization mirrors coeval: sustainable-use license, paid hosted cloud + enterprise self-host features later"). The one meaningful adaptation from coeval's wording: coeval's "Use" clause restricts free use to "internal business purposes or non-commercial/personal use," while Ironside's explicitly permits commercial self-hosting for your own organization outright — self-hosting your own trace storage is the core value proposition this product exists to deliver, not an edge case to gate behind a stricter clause than necessary. The "Competing Use" clause is the actual restriction: you can't offer Ironside to third parties on a hosted/managed basis or embed it in a product you sell, without a separate commercial agreement — self-hosting for your own org's own use is explicitly carved out as not a competing use, since a naive reading of "no hosted or managed basis" could otherwise be misread as prohibiting the exact self-hosting this whole batch just built support for.
+`LICENSE.md` — the MIT License (Ironside was relicensed from the Sustainable Use License to MIT after this batch shipped; `packages/sdk/LICENSE.md` carries the same text so the published npm package is self-describing). The original planning doc's monetization intent ("paid hosted cloud + enterprise self-host features later") remains a TARGET statement, independent of the license: self-hosting, embedding, and redistribution of the MIT-licensed code are unrestricted, and any hosted or enterprise offering would be a separate product, not a license gate.
 
-`package.json`'s `"license": "SEE LICENSE IN LICENSE.md"` field already existed (from M0's scaffold, matching coeval's convention) but pointed at a file that had never been created — confirmed by checking before writing anything.
+`package.json`'s `"license"` field originally read `"SEE LICENSE IN LICENSE.md"` (from M0's scaffold, matching coeval's convention) and pointed at a file that had never been created — confirmed by checking before writing anything. It now reads `"MIT"` in the root and SDK `package.json`.
 
 ## CI release workflow
 

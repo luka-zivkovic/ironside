@@ -62,7 +62,9 @@ by Coolify, and trustctl does not update a Coolify Service.
 Every tagged release (`vX.Y.Z`) runs the build, typecheck, and test suite,
 validates the generic Compose checksum and render, and then publishes
 multi-architecture `ghcr.io/luka-zivkovic/ironside-{api,worker,web}:X.Y.Z`
-images. The release tag is immutable; a `sha-<full commit>` tag is published
+images. The `0.2.0` images are public and anonymously pullable today (amd64
+and arm64), so `0.2.0` is the first version installable this way; `0.1.0`
+predates the public-image contract. The release tag is immutable; a `sha-<full commit>` tag is published
 for traceability. To use published images instead of building from source,
 use the [generic single-host bundle](../deploy/self-host/compose.yaml), the
 [Coolify stack](../deploy/coolify.yaml), or replace each `build:` block with

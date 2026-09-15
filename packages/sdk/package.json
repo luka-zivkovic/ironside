@@ -2,7 +2,7 @@
   "name": "ironside",
   "version": "0.1.0",
   "description": "Ironside client SDK — instrument LLM traces in a few lines.",
-  "license": "SEE LICENSE IN LICENSE.md",
+  "license": "MIT",
   "keywords": [
     "ai",
     "llm",
