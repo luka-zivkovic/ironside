@@ -25,14 +25,44 @@ OpenTelemetry to connect your application.
 
 Ironside focuses on **trace storage, a viewer, and data integrations**. Bring your own evaluation and prompt-management tools. Ironside exposes a native, versioned settled-trace feed for evaluator systems such as [Coeval](https://github.com/luka-zivkovic/coeval), while retaining LangFuse-compatible fetch and score APIs for existing tools.
 
+## Where Ironside fits
+
+Ironside is one of a few small, separately installable tools. Each does one
+job; none requires the others.
+
+| Tool | Job | Status with Ironside |
+| --- | --- | --- |
+| **Ironside** (this repo) | Records what your AI did: traces via the SDK, JSON, or OTLP; LangFuse-compatible read and score APIs; a native `ironside/evaluator/v1` settled-trace feed. | Current. |
+| [Coeval](https://github.com/luka-zivkovic/coeval) | Turns failures into evaluators checked against human judgment. | Current: consumes Ironside's evaluator feed, verified end to end ([`spec/langfuse-fetch-v1.md`](./spec/langfuse-fetch-v1.md), [`spec/evaluator-integration-v1.md`](./spec/evaluator-integration-v1.md)). |
+| [Dailies](https://github.com/luka-zivkovic/dailies) | Decides whether an AI change meets release rules from evidence such as Coeval receipts. | No direct Ironside integration; Dailies consumes Coeval evidence. |
+| [Casefile](https://github.com/luka-zivkovic/casefile) | Inspects agent skills and plugins before installation. | No Ironside integration; it is the scanner used to check this repo's plugin. |
+| [Overclock](https://github.com/luka-zivkovic/overclock) | Coding-agent skills, including optional Claude Code and Codex session importers for Ironside. | Current: the importers write to an existing Ironside instance ([session capture](docs/agent-setup.md#capture-coding-agent-sessions)). |
+
+The intent is that traces in Ironside can feed Coeval, and Coeval's evidence
+can feed Dailies, without any of the three owning the others' data. That is a
+direction, not a commitment; see each repository for its own status.
+
 Status: pre-release, under active development. See [ROADMAP.md](./ROADMAP.md). Licensed under the [MIT License](./LICENSE.md).
 
 [Self-hosting](./docs/self-hosting.md) · [SDK guide](./packages/sdk/README.md) · [Roadmap](./ROADMAP.md) · [Security](./SECURITY.md) · [Contributing](./CONTRIBUTING.md)
 
 ## Install with your coding agent
 
-Claude Code, Codex, and other agents with a shell can install the local Docker
-stack. Paste this into a session in your projects directory:
+In **Claude Code**, add the marketplace and install the plugin, then run
+`/ironside:setup`:
+
+```text
+/plugin marketplace add luka-zivkovic/ironside
+/plugin install ironside@ironside
+```
+
+The bundled `setup` skill checks Docker and ports, builds and starts the
+Compose stack, verifies health, guides owner setup and project creation, and
+helps connect your app with the SDK or OTLP. It keeps credentials out of chat
+and Git and asks before anything destructive.
+
+**Codex and other agents** with a shell can do the same from a prompt. Paste
+this into a session in your projects directory:
 
 ```text
 Set up Ironside locally from https://github.com/luka-zivkovic/ironside.
