@@ -1,0 +1,6 @@
+interface:
+  display_name: "Ironside Setup"
+  short_description: "Install a local Ironside trace store and send one trace"
+  default_prompt: "Use $setup to install Ironside locally with Docker Compose, create the owner account and a project, and connect my application so one trace appears in the viewer."
+policy:
+  allow_implicit_invocation: false
