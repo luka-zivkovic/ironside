@@ -5,9 +5,10 @@
 - **TARGET:** an Ironside release is one exact semantic version shared by the
   API, worker, and web images and deployed as one Coolify Service.
 - **CURRENT:** `deploy/coolify.yaml` defines that seven-container Service. It
-  becomes installable after the next release publishes public GHCR images; the
-  existing `v0.1.0` predates the verified multi-architecture/public-image
-  contract.
+  is installable now with `IRONSIDE_VERSION=0.2.0`: the `v0.2.0` release
+  published public, multi-architecture (amd64/arm64) GHCR images for the API,
+  worker, and web, verified by anonymous manifest pulls. The earlier `v0.1.0`
+  predates the verified multi-architecture/public-image contract; do not use it.
 - **CURRENT:** founder-only deployments are disposable test instances. This
   pre-launch release supports clean Postgres and ClickHouse installs only.
 - **ASSUMPTION:** the default stack is single-server, the nginx web component

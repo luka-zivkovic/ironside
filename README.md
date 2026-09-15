@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/luka-zivkovic/ironside/actions/workflows/ci.yml"><img src="https://github.com/luka-zivkovic/ironside/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-Sustainable%20Use-475569" alt="Sustainable Use license"></a>
+  <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-MIT-475569" alt="MIT license"></a>
 </p>
 
 <p align="center">
@@ -25,7 +25,7 @@ OpenTelemetry to connect your application.
 
 Ironside focuses on **trace storage, a viewer, and data integrations**. Bring your own evaluation and prompt-management tools. Ironside exposes a native, versioned settled-trace feed for evaluator systems such as [Coeval](https://github.com/luka-zivkovic/coeval), while retaining LangFuse-compatible fetch and score APIs for existing tools.
 
-Status: pre-release, under active development. See [ROADMAP.md](./ROADMAP.md). Licensed under the [Ironside Sustainable Use License](./LICENSE.md) — self-hosting for your own organization's use is always free and unrestricted; see the license for the (narrow) limitations.
+Status: pre-release, under active development. See [ROADMAP.md](./ROADMAP.md). Licensed under the [MIT License](./LICENSE.md).
 
 [Self-hosting](./docs/self-hosting.md) · [SDK guide](./packages/sdk/README.md) · [Roadmap](./ROADMAP.md) · [Security](./SECURITY.md) · [Contributing](./CONTRIBUTING.md)
 
