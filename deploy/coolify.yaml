@@ -43,6 +43,7 @@ services:
       WEB_ORIGINS: ${SERVICE_URL_WEB}
       AUTH_INSECURE_COOKIES: "false"
       AUTH_TRUST_PROXY: "true"
+      IRONSIDE_COEVAL_URL: ${IRONSIDE_COEVAL_URL:-}
     depends_on:
       postgres:
         condition: service_healthy

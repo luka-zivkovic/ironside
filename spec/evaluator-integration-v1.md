@@ -114,6 +114,46 @@ refreshes this monotonic ledger before every import tick, so projects created
 after startup are covered too; it fails closed and retries if initialization
 cannot complete.
 
+## Viewer deep links
+
+Evaluator consumers and the Ironside viewer link to each other by the same
+identity this protocol exposes: the Ironside project id (`project.id` from
+`/evaluator/context`), `traceId`, and optionally `traceVersion`. Links are
+navigation only; they grant no access and change no data.
+
+**Ironside to Coeval (outbound).** When the operator sets the optional API
+environment variable `IRONSIDE_COEVAL_URL` to Coeval's web base URL, the
+owner-session route `GET /api/v1/viewer-config` returns
+`{ "coevalUrl": "<base>" }` and the trace detail view shows an "Open in
+Coeval" link to:
+
+```text
+<IRONSIDE_COEVAL_URL>/links/trace?source=ironside&project=<projectId>&trace=<traceId>[&version=<traceVersion>]
+```
+
+Query values are URL-encoded. The viewer omits `version` because the
+owner-session trace read does not carry the evaluator publication version;
+Coeval resolves the latest settled version it has ingested. Unset or blank,
+the route returns `{ "coevalUrl": null }` and the viewer is unchanged. The
+value must be an absolute `http(s)` URL without credentials, query, or
+fragment; a path prefix is allowed and a trailing slash is removed. An invalid
+value fails API startup. The setting is read at runtime by the web app, never
+baked into the static bundle.
+
+**Coeval to Ironside (inbound).** The stable viewer URL for one trace is:
+
+```text
+<Ironside web base>/projects/<projectId>/traces/<traceId>
+```
+
+`projectId` and `traceId` are URL-encoded path segments. The route requires
+an owner session; an unauthenticated visitor is sent to sign in and returned
+to the same URL. A project outside the owner's organization renders the same
+"Project not found" page as a nonexistent one. The legacy
+`<Ironside web base>/traces/<traceId>` redirects into the owner's last or
+first project and is not part of this contract. Ironside does not know its
+own public web base; the linking system is configured with it.
+
 ## Non-goals
 
 This protocol does not define release policy, evaluator thresholds, automatic

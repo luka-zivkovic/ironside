@@ -34,7 +34,8 @@ const app = createApp({
   authTrustProxy: config.authTrustProxy,
   defaultRateLimitPerMinute: config.defaultRateLimitPerMinute,
   defaultTraceQuietPeriodSeconds: config.defaultTraceQuietPeriodSeconds,
-  metricsToken: config.metricsToken
+  metricsToken: config.metricsToken,
+  coevalUrl: config.coevalUrl
 });
 
 serve({ fetch: app.fetch, port: config.port }, (info) => {

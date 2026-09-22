@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
 import { Link, useLocation, useParams } from "react-router-dom";
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { ChevronDown, ChevronRight, ExternalLink } from "lucide-react";
 import type { ObservationNode, TraceTreeResponse } from "@ironside/shared/browser";
-import { ApiError, MEDIA_REF_PATTERN, fetchMediaBlob, fetchTraceTree } from "@/lib/api";
+import { ApiError, MEDIA_REF_PATTERN, fetchMediaBlob, fetchTraceTree, fetchViewerConfig } from "@/lib/api";
+import { Button } from "@/components/ui/button";
+import { coevalTraceLink } from "@/lib/coeval-link";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { PageHeader } from "@/components/page-header";
@@ -24,6 +26,20 @@ export function TraceScreen() {
   const { id } = useParams<{ id: string }>();
   const [trace, setTrace] = useState<TraceTreeResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [coevalUrl, setCoevalUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    // Optional integration: any failure leaves the Coeval link hidden.
+    fetchViewerConfig()
+      .then((config) => {
+        if (!cancelled) setCoevalUrl(config.coevalUrl);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (!id) return;
@@ -60,10 +76,18 @@ export function TraceScreen() {
     );
   }
 
-  return <TraceRecordView trace={trace} />;
+  return <TraceRecordView trace={trace} coevalUrl={coevalUrl} />;
 }
 
-export function TraceRecordView({ trace }: { trace: TraceTreeResponse }) {
+export function TraceRecordView({
+  trace,
+  coevalUrl = null
+}: {
+  trace: TraceTreeResponse;
+  /** Operator-configured Coeval web base; null hides the "Open in Coeval" link. */
+  coevalUrl?: string | null;
+}) {
+  const { project } = useActiveProject();
   const [selected, setSelected] = useState<ObservationNode | null>(null);
   const [collapsedIds, setCollapsedIds] = useState<Set<string>>(() => new Set());
   const splitRef = useRef<HTMLDivElement>(null);
@@ -168,6 +192,20 @@ export function TraceRecordView({ trace }: { trace: TraceTreeResponse }) {
         eyebrow="Trace record · reconstructed"
         title={trace.name ?? <span className="text-ink-4 italic">unnamed trace</span>}
         description={<span className="font-mono text-[11px]">{trace.id}</span>}
+        actions={
+          coevalUrl ? (
+            <Button asChild variant="outline" size="sm">
+              <a
+                href={coevalTraceLink(coevalUrl, { projectId: project.id, traceId: trace.id })}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Open in Coeval
+                <ExternalLink aria-hidden="true" />
+              </a>
+            </Button>
+          ) : undefined
+        }
       />
 
       <div

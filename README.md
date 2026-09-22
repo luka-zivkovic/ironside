@@ -42,6 +42,13 @@ The intent is that traces in Ironside can feed Coeval, and Coeval's evidence
 can feed Dailies, without any of the three owning the others' data. That is a
 direction, not a commitment; see each repository for its own status.
 
+Ironside and Coeval can also link to each other's views. Set the optional
+`IRONSIDE_COEVAL_URL` on the API to show an **Open in Coeval** link on each
+trace. Coeval, or any other tool, can link back to a trace at the stable URL
+`<Ironside web base>/projects/<projectId>/traces/<traceId>`. Both link
+shapes are defined in
+[`spec/evaluator-integration-v1.md`](./spec/evaluator-integration-v1.md#viewer-deep-links).
+
 Status: pre-release, under active development. See [ROADMAP.md](./ROADMAP.md). Licensed under the [MIT License](./LICENSE.md).
 
 [Self-hosting](./docs/self-hosting.md) · [SDK guide](./packages/sdk/README.md) · [Roadmap](./ROADMAP.md) · [Security](./SECURITY.md) · [Contributing](./CONTRIBUTING.md)

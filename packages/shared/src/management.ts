@@ -353,3 +353,12 @@ export const listIngestFailuresResponseSchema = z.object({
   failures: z.array(ingestFailureSchema)
 });
 export type ListIngestFailuresResponse = z.infer<typeof listIngestFailuresResponseSchema>;
+
+// Owner-session runtime settings for the web viewer. Deployment-level, not
+// per project; values come from API environment variables so a published web
+// image never bakes them in at build time.
+export const viewerConfigResponseSchema = z.object({
+  /** Coeval web base URL (no trailing slash), or null when the link is disabled. */
+  coevalUrl: z.url().nullable()
+});
+export type ViewerConfigResponse = z.infer<typeof viewerConfigResponseSchema>;
