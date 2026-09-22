@@ -46,9 +46,9 @@ Every ingest path — native JSON, OTLP, LangFuse-compat, importers — converge
 
 Rules:
 - Upsert semantics: same id twice = update (ClickHouse ReplacingMergeTree handles dedup by event timestamp).
-- Usage/cost unavailable = **null/absent, never zero** (coeval convention).
+- Usage/cost unavailable = **null/absent, never zero** (rubrist convention).
 - Arbitrary metadata values are stringified for the CH Map column; original preserved in the raw envelope.
-- Trace tree must flatten to coeval's `TraceStep[] { name?, input, output, metadata? }` via depth-first ordered observations.
+- Trace tree must flatten to rubrist's `TraceStep[] { name?, input, output, metadata? }` via depth-first ordered observations.
 
 ## Trace completion contract (normative)
 

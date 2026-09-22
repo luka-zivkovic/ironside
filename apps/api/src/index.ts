@@ -35,7 +35,7 @@ const app = createApp({
   defaultRateLimitPerMinute: config.defaultRateLimitPerMinute,
   defaultTraceQuietPeriodSeconds: config.defaultTraceQuietPeriodSeconds,
   metricsToken: config.metricsToken,
-  coevalUrl: config.coevalUrl
+  rubristUrl: config.rubristUrl
 });
 
 serve({ fetch: app.fetch, port: config.port }, (info) => {

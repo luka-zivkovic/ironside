@@ -56,11 +56,11 @@ function trace(): TraceTreeResponse {
   };
 }
 
-function render(coevalUrl?: string | null, record: TraceTreeResponse = trace()): string {
+function render(rubristUrl?: string | null, record: TraceTreeResponse = trace()): string {
   return renderToStaticMarkup(
     createElement(MemoryRouter, null,
       createElement(ActiveProjectProvider, { project, projects: [project] },
-        createElement(TraceRecordView, { trace: record, coevalUrl })
+        createElement(TraceRecordView, { trace: record, rubristUrl })
       )
     )
   );
@@ -81,16 +81,16 @@ describe("TraceRecordView", () => {
     expect(html).toContain("trace-tree-row");
   });
 
-  it("hides the Coeval link unless the operator configured a Coeval URL", () => {
-    expect(render()).not.toContain("Open in Coeval");
-    expect(render(null)).not.toContain("Open in Coeval");
+  it("hides the Rubrist link unless the operator configured a Rubrist URL", () => {
+    expect(render()).not.toContain("Open in Rubrist");
+    expect(render(null)).not.toContain("Open in Rubrist");
   });
 
-  it("links the trace to Coeval using the evaluator project and trace identity", () => {
-    const html = render("https://coeval.example.com/app", { ...trace(), id: "trace/with space" });
-    expect(html).toContain("Open in Coeval");
+  it("links the trace to Rubrist using the evaluator project and trace identity", () => {
+    const html = render("https://rubrist.example.com/app", { ...trace(), id: "trace/with space" });
+    expect(html).toContain("Open in Rubrist");
     expect(html).toContain(
-      'href="https://coeval.example.com/app/links/trace?source=ironside&amp;project=project_test&amp;trace=trace%2Fwith+space"'
+      'href="https://rubrist.example.com/app/links/trace?source=ironside&amp;project=project_test&amp;trace=trace%2Fwith+space"'
     );
     expect(html).toContain('target="_blank"');
     expect(html).toContain('rel="noopener noreferrer"');

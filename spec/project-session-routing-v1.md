@@ -12,7 +12,7 @@ no route that accepts either principal interchangeably.
 Session APIs name the project explicitly:
 
 - `GET|POST /api/v1/projects` lists or creates projects in the session's organization.
-- `GET /api/v1/viewer-config` returns deployment-level viewer settings (currently the optional `coevalUrl`; see [`evaluator-integration-v1.md`](./evaluator-integration-v1.md#viewer-deep-links)). It is not project-scoped.
+- `GET /api/v1/viewer-config` returns deployment-level viewer settings (currently the optional `rubristUrl`; see [`evaluator-integration-v1.md`](./evaluator-integration-v1.md#viewer-deep-links)). It is not project-scoped.
 - `/api/v1/projects/:projectId/traces[...]` is the native browser query surface.
 - `/api/v1/projects/:projectId/{credentials,environments,exports,otlp-forwards,webhooks,import-sources}` is management/discovery.
 - `/api/v1/projects/:projectId/{ingest-failures,media/:mediaId}` and raw-event inspection are sensitive owner reads.

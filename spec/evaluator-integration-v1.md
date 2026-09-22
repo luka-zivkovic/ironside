@@ -6,7 +6,7 @@ Status: implemented. Owner: Ironside. Protocol identifier:
 ## Purpose
 
 Provide a stable, project-bound machine contract for evaluator systems such as
-Coeval without making them impersonate LangFuse clients or copy Ironside's
+Rubrist without making them impersonate LangFuse clients or copy Ironside's
 trace-settlement policy.
 
 An Integration credential selects exactly one project and requires
@@ -48,7 +48,7 @@ the newly published version cannot retain stale observations. Score content is
 part of the durable import identity but not the evaluator-visible identity, so
 provider score-only changes reconcile without reopening a trace. Imported
 scores carry an explicit ClickHouse `import_source`; replacement tombstones
-only scores owned by that provider, preserving native/manual/Coeval
+only scores owned by that provider, preserving native/manual/Rubrist
 assessments on the same trace.
 All evaluator-visible writers hold the shared side of a cross-worker lifecycle
 fence from the first ClickHouse mutation through PG publication. Retention
@@ -121,26 +121,26 @@ identity this protocol exposes: the Ironside project id (`project.id` from
 `/evaluator/context`), `traceId`, and optionally `traceVersion`. Links are
 navigation only; they grant no access and change no data.
 
-**Ironside to Coeval (outbound).** When the operator sets the optional API
-environment variable `IRONSIDE_COEVAL_URL` to Coeval's web base URL, the
+**Ironside to Rubrist (outbound).** When the operator sets the optional API
+environment variable `IRONSIDE_RUBRIST_URL` to Rubrist's web base URL, the
 owner-session route `GET /api/v1/viewer-config` returns
-`{ "coevalUrl": "<base>" }` and the trace detail view shows an "Open in
-Coeval" link to:
+`{ "rubristUrl": "<base>" }` and the trace detail view shows an "Open in
+Rubrist" link to:
 
 ```text
-<IRONSIDE_COEVAL_URL>/links/trace?source=ironside&project=<projectId>&trace=<traceId>[&version=<traceVersion>]
+<IRONSIDE_RUBRIST_URL>/links/trace?source=ironside&project=<projectId>&trace=<traceId>[&version=<traceVersion>]
 ```
 
 Query values are URL-encoded. The viewer omits `version` because the
 owner-session trace read does not carry the evaluator publication version;
-Coeval resolves the latest settled version it has ingested. Unset or blank,
-the route returns `{ "coevalUrl": null }` and the viewer is unchanged. The
+Rubrist resolves the latest settled version it has ingested. Unset or blank,
+the route returns `{ "rubristUrl": null }` and the viewer is unchanged. The
 value must be an absolute `http(s)` URL without credentials, query, or
 fragment; a path prefix is allowed and a trailing slash is removed. An invalid
 value fails API startup. The setting is read at runtime by the web app, never
 baked into the static bundle.
 
-**Coeval to Ironside (inbound).** The stable viewer URL for one trace is:
+**Rubrist to Ironside (inbound).** The stable viewer URL for one trace is:
 
 ```text
 <Ironside web base>/projects/<projectId>/traces/<traceId>

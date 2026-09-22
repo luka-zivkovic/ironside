@@ -18,7 +18,7 @@ import { loadConfig } from "../src/config.js";
 import { createTestMachineCredential } from "./helpers/machine-credential.js";
 
 // Integration tests for the LangFuse-shaped fetch API (M8): the read
-// endpoints coeval's poller consumes (GET /api/public/traces,
+// endpoints rubrist's poller consumes (GET /api/public/traces,
 // GET /api/public/traces/:id) and the verdict sync-back write endpoint
 // (POST /api/public/scores). Runs against the real local stack, same as
 // the other route tests.
@@ -279,7 +279,7 @@ describe("GET /api/public/traces (LangFuse-shaped list)", () => {
     }
   });
 
-  it("OMITS unset optional fields rather than emitting explicit nulls — regression: coeval's LangFuse trace schema is .optional() but not .nullable(), so an explicit null fails its validation and errors the whole poll (found on the first live connection test)", async () => {
+  it("OMITS unset optional fields rather than emitting explicit nulls — regression: rubrist's LangFuse trace schema is .optional() but not .nullable(), so an explicit null fails its validation and errors the whole poll (found on the first live connection test)", async () => {
     const res = await get("/api/public/traces?limit=100");
     const body = (await res.json()) as ListResponse;
     const sparse = body.data.find((t) => t.id === traceB.id) as unknown as Record<string, unknown>;
@@ -320,7 +320,7 @@ describe("GET /api/public/traces/:id (LangFuse-shaped detail)", () => {
     expect("output" in obs).toBe(true);
     expect(obs.output).toBeNull();
     // ...while genuinely-unset optional fields are absent, not null (the
-    // same omission contract as the trace list — coeval compatibility).
+    // same omission contract as the trace list — rubrist compatibility).
     expect("parentObservationId" in obs).toBe(false);
 
     expect(body.scores).toHaveLength(1);
@@ -378,18 +378,18 @@ async function scoreBatchById(scoreId: string): Promise<IngestBatch> {
   throw new Error(`no queued batch found containing score ${scoreId}`);
 }
 
-describe("POST /api/public/scores (coeval verdict sync-back)", () => {
-  it("accepts a coeval-shaped verdict score and enqueues a domain-valid score-upsert", async () => {
+describe("POST /api/public/scores (rubrist verdict sync-back)", () => {
+  it("accepts a rubrist-shaped verdict score and enqueues a domain-valid score-upsert", async () => {
     const feedbackId = ulid();
     const res = await postScore({
       id: feedbackId,
       traceId: traceA.id,
-      name: "coeval_verdict",
+      name: "rubrist_verdict",
       value: 1,
       comment: "pass: the answer is grounded",
       metadata: {
         verdict: "pass",
-        provider: "coeval",
+        provider: "rubrist",
         modelBinding: { model: "claude" }
       }
     });
@@ -406,7 +406,7 @@ describe("POST /api/public/scores (coeval verdict sync-back)", () => {
     const parsed = scoreSchema.parse({ ...(event.body as object), projectId });
     expect(parsed.id).toBe(feedbackId);
     expect(parsed.traceId).toBe(traceA.id);
-    expect(parsed.name).toBe("coeval_verdict");
+    expect(parsed.name).toBe("rubrist_verdict");
     expect(parsed.dataType).toBe("numeric");
     expect(parsed.value).toBe(1);
     expect(parsed.source).toBe("api");
@@ -414,7 +414,7 @@ describe("POST /api/public/scores (coeval verdict sync-back)", () => {
     // Non-string metadata values are stringified, not dropped.
     expect(parsed.metadata).toEqual({
       verdict: "pass",
-      provider: "coeval",
+      provider: "rubrist",
       modelBinding: '{"model":"claude"}'
     });
   });

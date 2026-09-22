@@ -4,7 +4,7 @@ import { ChevronDown, ChevronRight, ExternalLink } from "lucide-react";
 import type { ObservationNode, TraceTreeResponse } from "@ironside/shared/browser";
 import { ApiError, MEDIA_REF_PATTERN, fetchMediaBlob, fetchTraceTree, fetchViewerConfig } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { coevalTraceLink } from "@/lib/coeval-link";
+import { rubristTraceLink } from "@/lib/rubrist-link";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { PageHeader } from "@/components/page-header";
@@ -26,14 +26,14 @@ export function TraceScreen() {
   const { id } = useParams<{ id: string }>();
   const [trace, setTrace] = useState<TraceTreeResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [coevalUrl, setCoevalUrl] = useState<string | null>(null);
+  const [rubristUrl, setRubristUrl] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    // Optional integration: any failure leaves the Coeval link hidden.
+    // Optional integration: any failure leaves the Rubrist link hidden.
     fetchViewerConfig()
       .then((config) => {
-        if (!cancelled) setCoevalUrl(config.coevalUrl);
+        if (!cancelled) setRubristUrl(config.rubristUrl);
       })
       .catch(() => undefined);
     return () => {
@@ -76,16 +76,16 @@ export function TraceScreen() {
     );
   }
 
-  return <TraceRecordView trace={trace} coevalUrl={coevalUrl} />;
+  return <TraceRecordView trace={trace} rubristUrl={rubristUrl} />;
 }
 
 export function TraceRecordView({
   trace,
-  coevalUrl = null
+  rubristUrl = null
 }: {
   trace: TraceTreeResponse;
-  /** Operator-configured Coeval web base; null hides the "Open in Coeval" link. */
-  coevalUrl?: string | null;
+  /** Operator-configured Rubrist web base; null hides the "Open in Rubrist" link. */
+  rubristUrl?: string | null;
 }) {
   const { project } = useActiveProject();
   const [selected, setSelected] = useState<ObservationNode | null>(null);
@@ -193,14 +193,14 @@ export function TraceRecordView({
         title={trace.name ?? <span className="text-ink-4 italic">unnamed trace</span>}
         description={<span className="font-mono text-[11px]">{trace.id}</span>}
         actions={
-          coevalUrl ? (
+          rubristUrl ? (
             <Button asChild variant="outline" size="sm">
               <a
-                href={coevalTraceLink(coevalUrl, { projectId: project.id, traceId: trace.id })}
+                href={rubristTraceLink(rubristUrl, { projectId: project.id, traceId: trace.id })}
                 target="_blank"
                 rel="noopener noreferrer"
               >
-                Open in Coeval
+                Open in Rubrist
                 <ExternalLink aria-hidden="true" />
               </a>
             </Button>

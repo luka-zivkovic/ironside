@@ -61,7 +61,7 @@ beforeAll(async () => {
     "insert into projects (id, organization_id, name) values ($1, $2, $3)",
     [projectId, organizationId, "Evaluator source project"]
   );
-  apiKey = (await createTestMachineCredential(pool, projectId, "coeval", "integration")).token;
+  apiKey = (await createTestMachineCredential(pool, projectId, "rubrist", "integration")).token;
   trace = {
     id: `trace_${ulid()}`,
     projectId,
@@ -284,13 +284,13 @@ describe("native evaluator integration", () => {
     const scoreRequestBody = {
       id: scoreId,
       traceId: trace.id,
-      name: "coeval_assessment/support-quality",
+      name: "rubrist_assessment/support-quality",
       value: 0.92,
       assessmentLabel: "pass",
       comment: "The response follows policy.",
       metadata: { zeta: "last", alpha: "first" },
       evaluator: {
-        provider: "coeval" as const,
+        provider: "rubrist" as const,
         versionId: "skillv_1",
         criterionKey: "support-quality"
       }
@@ -327,7 +327,7 @@ describe("native evaluator integration", () => {
       [bootstrapProjectId, organizationId, "Pending bootstrap"]
     );
     const bootstrapKey = (
-      await createTestMachineCredential(pool, bootstrapProjectId, "coeval-bootstrap", "integration")
+      await createTestMachineCredential(pool, bootstrapProjectId, "rubrist-bootstrap", "integration")
     ).token;
     const bootstrapHeaders = { authorization: `Bearer ${bootstrapKey}` };
     const pendingAt = "2026-08-15T12:00:00.000Z";
@@ -388,7 +388,7 @@ describe("native evaluator integration", () => {
       [scoreProjectId, organizationId, "Score-only import barrier"]
     );
     const scoreKey = (
-      await createTestMachineCredential(pool, scoreProjectId, "coeval-score-only", "integration")
+      await createTestMachineCredential(pool, scoreProjectId, "rubrist-score-only", "integration")
     ).token;
     const scoreHeaders = { authorization: `Bearer ${scoreKey}` };
     const version = "2026-08-16T12:00:00.000Z";
@@ -452,7 +452,7 @@ describe("native evaluator integration", () => {
       [retentionProjectId, organizationId, "Retention feed ordering"]
     );
     const retentionKey = (
-      await createTestMachineCredential(pool, retentionProjectId, "coeval-retention", "integration")
+      await createTestMachineCredential(pool, retentionProjectId, "rubrist-retention", "integration")
     ).token;
     const retentionHeaders = { authorization: `Bearer ${retentionKey}` };
     const initial = evaluatorTraceFeedResponseSchema.parse(await (
@@ -537,7 +537,7 @@ describe("native evaluator integration", () => {
       [bootstrapProjectId, organizationId, "Bootstrap retention regression"]
     );
     const bootstrapKey = (
-      await createTestMachineCredential(pool, bootstrapProjectId, "coeval-bootstrap-retention", "integration")
+      await createTestMachineCredential(pool, bootstrapProjectId, "rubrist-bootstrap-retention", "integration")
     ).token;
     const bootstrapHeaders = { authorization: `Bearer ${bootstrapKey}` };
     const oldActivityAt = "2026-08-21T12:00:00.000Z";

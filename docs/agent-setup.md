@@ -91,7 +91,7 @@ The project's **Connections** page offers two presets:
 | Preset | Capabilities | Use it for |
 | --- | --- | --- |
 | Ingest | `ingest`, `media:write` | SDKs, OTLP exporters, and session importers. |
-| Integration | `traces:read`, `scores:write` | Evaluator integrations such as Coeval. |
+| Integration | `traces:read`, `scores:write` | Evaluator integrations such as Rubrist. |
 
 Keep the credential in your application's local environment or secret store
 as `IRONSIDE_API_KEY`. It is separate from the owner's browser session and
@@ -153,12 +153,12 @@ HTTP MCP server: those endpoints speak different protocols.
 | Send application traces | Native SDK, JSON ingest, or OTLP. |
 | Capture coding-agent sessions | Overclock's optional importers or tracing extension. |
 | Let an evaluator read traces and write scores | Ironside's versioned evaluator API with an Integration credential. |
-| Call evaluation tools through MCP | A separate Coeval instance and its stdio MCP server. |
+| Call evaluation tools through MCP | A separate Rubrist instance and its stdio MCP server. |
 
-Connect the Ironside project in **Coeval's Integrations** screen using an
+Connect the Ironside project in **Rubrist's Integrations** screen using an
 Ironside Integration credential and an evaluator selection. Then register
-[Coeval's MCP server](https://github.com/luka-zivkovic/coeval/tree/main/tools/mcp)
-in your harness using a **Coeval project key**. This exposes Coeval tools;
+[Rubrist's MCP server](https://github.com/luka-zivkovic/rubrist/tree/main/tools/mcp)
+in your harness using a **Rubrist project key**. This exposes Rubrist tools;
 it does not expose Ironside's entire API or manage Ironside through MCP.
 
 ## Troubleshooting
