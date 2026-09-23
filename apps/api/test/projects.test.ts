@@ -314,3 +314,37 @@ describe("PATCH /api/v1/projects/:id/quotas", () => {
     expect(res.status).toBe(404);
   });
 });
+
+describe("GET /api/v1/viewer-config", () => {
+  it("requires an owner session and rejects machine credentials", async () => {
+    expect((await app.request("/api/v1/viewer-config")).status).toBe(401);
+    const machine = await app.request("/api/v1/viewer-config", {
+      headers: { authorization: `Bearer ${apiKey}` }
+    });
+    expect(machine.status).toBe(401);
+  });
+
+  it("reports no Rubrist link when IRONSIDE_RUBRIST_URL is unset", async () => {
+    const res = await authed("/api/v1/viewer-config");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ rubristUrl: null });
+  });
+
+  it("exposes the configured Rubrist base URL to the owner viewer", async () => {
+    const configured = createApp({
+      pgPool: pool,
+      clickhouse,
+      redis,
+      storage,
+      queue,
+      webOrigins: ["http://localhost:5174"],
+      defaultRateLimitPerMinute: 10000,
+      rubristUrl: "https://rubrist.example.com"
+    });
+    const res = await configured.request("/api/v1/viewer-config", {
+      headers: ownerHeaders(ownerCookie)
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ rubristUrl: "https://rubrist.example.com" });
+  });
+});

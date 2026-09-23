@@ -62,7 +62,11 @@ by Coolify, and trustctl does not update a Coolify Service.
 Every tagged release (`vX.Y.Z`) runs the build, typecheck, and test suite,
 validates the generic Compose checksum and render, and then publishes
 multi-architecture `ghcr.io/luka-zivkovic/ironside-{api,worker,web}:X.Y.Z`
-images. The release tag is immutable; a `sha-<full commit>` tag is published
+images. The `0.3.0` images are the current release and are public and
+anonymously pullable (amd64 and arm64). `0.2.0` was the first version
+installable this way; `0.3.0` changed the clean-install baselines, so install it
+fresh rather than updating a `0.2.0` instance. `0.1.0` predates the
+public-image contract. The release tag is immutable; a `sha-<full commit>` tag is published
 for traceability. To use published images instead of building from source,
 use the [generic single-host bundle](../deploy/self-host/compose.yaml), the
 [Coolify stack](../deploy/coolify.yaml), or replace each `build:` block with
@@ -71,11 +75,11 @@ its matching exact `image:` reference.
 ```yaml
 services:
   api:
-    image: ghcr.io/luka-zivkovic/ironside-api:0.2.0
+    image: ghcr.io/luka-zivkovic/ironside-api:0.3.0
   worker:
-    image: ghcr.io/luka-zivkovic/ironside-worker:0.2.0
+    image: ghcr.io/luka-zivkovic/ironside-worker:0.3.0
   web:
-    image: ghcr.io/luka-zivkovic/ironside-web:0.2.0
+    image: ghcr.io/luka-zivkovic/ironside-web:0.3.0
 ```
 
 After every image publishes, the workflow pulls those exact tags into the
@@ -109,6 +113,7 @@ All configuration is environment variables, set directly on the `api`/`worker` s
 | `DEFAULT_TRACE_QUIET_PERIOD_SECONDS` | `300` | Seconds without trace/observation activity before automated consumers treat a trace as settled. Set identically on API and worker; override per project with `traceQuietPeriodSeconds` via session-authenticated `PATCH /api/v1/projects/:projectId/quotas` |
 | `IRONSIDE_ENCRYPTION_SECRET` | unset | Encrypts export/forward/webhook/import-source credentials at rest (AES-256-GCM) in Postgres. Required before configuring any of those features (saving credentials errors without it); must be identical on `api` and `worker`. Treat it like a database password — losing or changing it orphans every stored credential (see the backup caveat below) |
 | `METRICS_TOKEN` | unset | Enables Prometheus metrics. On the **api**, `GET /metrics` is disabled entirely (404) until this is set, then requires `Authorization: Bearer <token>`. On the **worker**, gates the worker's own metrics listener |
+| `IRONSIDE_RUBRIST_URL` | unset | Optional Rubrist web base URL (API only), such as `https://rubrist.example.com`. When set, each trace view shows an **Open in Rubrist** link; unset leaves the viewer unchanged. Must be an absolute `http(s)` URL without credentials, query, or fragment. The web app reads it at runtime, so no image rebuild is needed. Link shapes: [`spec/evaluator-integration-v1.md`](../spec/evaluator-integration-v1.md#viewer-deep-links) |
 | `METRICS_PORT` | `9464` | Port for the worker's dedicated `/metrics` listener (the worker has no other HTTP surface) |
 | `INGEST_RECOVERY_INTERVAL_MS` | `30000` | How often the worker reconciles durable pending-ingest intents back into Redis after queue loss |
 | `INGEST_RECOVERY_BATCH_SIZE` | `1000` | Maximum pending intents examined in one recovery pass; persisted scan cycles advance later passes and force fair revisitation |

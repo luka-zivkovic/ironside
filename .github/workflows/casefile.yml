@@ -1,0 +1,47 @@
+name: casefile
+
+# Static, no-execution admission scan of the Claude Code plugin this
+# repository publishes, using the Casefile composite Action. Only critical
+# findings fail the job; warnings stay visible in the job summary.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "plugins/**"
+      - ".claude-plugin/**"
+      - ".github/workflows/casefile.yml"
+  pull_request:
+    paths:
+      - "plugins/**"
+      - ".claude-plugin/**"
+      - ".github/workflows/casefile.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  scan-plugin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Scan plugins/ironside with Casefile
+        id: casefile
+        uses: luka-zivkovic/casefile@main
+        with:
+          path: plugins/ironside
+          version: 0.2.1
+          fail-on: critical
+          strict: "true"
+      - name: Upload Casefile reports
+        if: always() && steps.casefile.outputs.report-json != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: casefile-report
+          path: |
+            ${{ steps.casefile.outputs.report-json }}
+            ${{ steps.casefile.outputs.sarif }}
+          if-no-files-found: ignore

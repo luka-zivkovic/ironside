@@ -6,7 +6,25 @@ Ironside runs as a Docker Compose stack. Claude Code, Codex, or another coding
 agent with a shell can clone it, start the services, and help instrument your
 application. This does not require MCP.
 
-## Ask your agent to set it up
+## Claude Code: install the plugin
+
+Ironside publishes a Claude Code plugin marketplace from this repository. In
+Claude Code, run:
+
+```text
+/plugin marketplace add luka-zivkovic/ironside
+/plugin install ironside@ironside
+```
+
+Then run `/ironside:setup` in your projects directory (or an existing
+checkout). The `setup` skill follows the steps in this guide: it checks Git,
+Docker Compose v2, and port collisions, clones or reuses a checkout, starts
+the stack, verifies health, guides owner setup and project creation, and
+instruments your application with the SDK or OTLP. It keeps setup codes and
+credentials out of chat and Git and asks before anything destructive. The
+plugin source lives in [`plugins/ironside`](../plugins/ironside).
+
+## Other agents: paste a prompt
 
 Open the agent in your projects directory and paste:
 
@@ -23,10 +41,10 @@ my application with the SDK or OTLP and verify one trace in the viewer.
 Explain where each process runs.
 ```
 
-For **Claude Code**, run `claude` in that directory and paste the prompt. For
-**Codex CLI**, run `codex`; in a desktop or IDE harness, open the directory and
-start a task there. Other harnesses use the same prompt if they can read files
-and execute commands. No special Ironside slash command is required.
+For **Codex CLI**, run `codex`; in a desktop or IDE harness, open the
+directory and start a task there. Other harnesses use the same prompt if they
+can read files and execute commands. Claude Code users can also paste this
+prompt instead of installing the plugin.
 
 You need Git and Docker with Compose v2. Node.js and pnpm are only needed on
 the host for developing Ironside itself. Commands below assume a POSIX shell.
@@ -73,7 +91,7 @@ The project's **Connections** page offers two presets:
 | Preset | Capabilities | Use it for |
 | --- | --- | --- |
 | Ingest | `ingest`, `media:write` | SDKs, OTLP exporters, and session importers. |
-| Integration | `traces:read`, `scores:write` | Evaluator integrations such as Coeval. |
+| Integration | `traces:read`, `scores:write` | Evaluator integrations such as Rubrist. |
 
 Keep the credential in your application's local environment or secret store
 as `IRONSIDE_API_KEY`. It is separate from the owner's browser session and
@@ -135,12 +153,12 @@ HTTP MCP server: those endpoints speak different protocols.
 | Send application traces | Native SDK, JSON ingest, or OTLP. |
 | Capture coding-agent sessions | Overclock's optional importers or tracing extension. |
 | Let an evaluator read traces and write scores | Ironside's versioned evaluator API with an Integration credential. |
-| Call evaluation tools through MCP | A separate Coeval instance and its stdio MCP server. |
+| Call evaluation tools through MCP | A separate Rubrist instance and its stdio MCP server. |
 
-Connect the Ironside project in **Coeval's Integrations** screen using an
+Connect the Ironside project in **Rubrist's Integrations** screen using an
 Ironside Integration credential and an evaluator selection. Then register
-[Coeval's MCP server](https://github.com/luka-zivkovic/coeval/tree/main/tools/mcp)
-in your harness using a **Coeval project key**. This exposes Coeval tools;
+[Rubrist's MCP server](https://github.com/luka-zivkovic/rubrist/tree/main/tools/mcp)
+in your harness using a **Rubrist project key**. This exposes Rubrist tools;
 it does not expose Ironside's entire API or manage Ironside through MCP.
 
 ## Troubleshooting

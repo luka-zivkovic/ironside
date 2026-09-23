@@ -29,4 +29,4 @@ local-only defaults.
 
 By contributing, you confirm that you have the right to submit the work and
 agree that your contribution is licensed under the
-[Ironside Sustainable Use License](./LICENSE.md).
+[MIT License](./LICENSE.md).

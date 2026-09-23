@@ -39,7 +39,7 @@ export const listTracesResponseSchema = z.object({
 export type ListTracesResponse = z.infer<typeof listTracesResponseSchema>;
 
 // Project-explicit trace detail — the full trace with its observation tree, nested
-// by parentObservationId. coeval's poller flattens this depth-first into
+// by parentObservationId. rubrist's poller flattens this depth-first into
 // TraceStep[] (see spec/trace-envelope-v1.md); the API returns a tree
 // rather than pre-flattening so other consumers aren't forced into that
 // specific shape.
