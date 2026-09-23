@@ -621,6 +621,78 @@ export async function listObservationsForTrace(
   }));
 }
 
+/**
+ * Stored traces for these ids, project-scoped: one row per id, the most
+ * recently written. A partial update is merged into this row before it is
+ * written (spec/langfuse-compat-v1.md); a trace whose timestamp moved to
+ * another day can still have an older row under its previous sort key.
+ */
+export async function listTracesByIds(
+  client: ClickHouseClient,
+  projectId: string,
+  traceIds: string[]
+): Promise<TraceDetailRow[]> {
+  if (traceIds.length === 0) return [];
+  const result = await client.query({
+    query: `
+      select id, timestamp, name, user_id, session_id, environment, release, version,
+             tags, metadata, input, output
+      from traces final
+      where project_id = {projectId:String} and id in {traceIds:Array(String)}
+      order by id, event_ts desc
+      limit 1 by id
+    `,
+    query_params: { projectId, traceIds: [...new Set(traceIds)] },
+    format: "JSONEachRow"
+  });
+  const rows = await result.json<TraceDetailRow>();
+  return rows.map((row) => ({ ...row, timestamp: fromClickHouseDateTime(row.timestamp) }));
+}
+
+/**
+ * Stored observations for these ids, project-scoped: one row per id, the
+ * most recently written. Filtering on trace_id as well lets its bloom-filter
+ * index skip granules. Same purpose as listTracesByIds.
+ */
+export async function listObservationsByIds(
+  client: ClickHouseClient,
+  projectId: string,
+  observations: { id: string; traceId: string }[]
+): Promise<ObservationRow[]> {
+  if (observations.length === 0) return [];
+  const result = await client.query({
+    // Same Map value casts as listObservationsForTrace.
+    query: `
+      select id, trace_id, parent_observation_id, type, name, start_time, end_time,
+             level, status_message, model, model_parameters, input, output,
+             mapApply((k, v) -> (k, toFloat64(v)), usage_details) as usage_details,
+             mapApply((k, v) -> (k, toFloat64(v)), cost_details) as cost_details,
+             completion_start_time, metadata
+      from observations final
+      where project_id = {projectId:String}
+        and trace_id in {traceIds:Array(String)}
+        and id in {observationIds:Array(String)}
+      order by id, event_ts desc
+      limit 1 by id
+    `,
+    query_params: {
+      projectId,
+      traceIds: [...new Set(observations.map((observation) => observation.traceId))],
+      observationIds: [...new Set(observations.map((observation) => observation.id))]
+    },
+    format: "JSONEachRow"
+  });
+  const rows = await result.json<ObservationRow>();
+  return rows.map((row) => ({
+    ...row,
+    start_time: fromClickHouseDateTime(row.start_time),
+    end_time: row.end_time ? fromClickHouseDateTime(row.end_time) : null,
+    completion_start_time: row.completion_start_time
+      ? fromClickHouseDateTime(row.completion_start_time)
+      : null
+  }));
+}
+
 export interface AggregatesRow {
   trace_count: number;
   token_totals: Record<string, number>;

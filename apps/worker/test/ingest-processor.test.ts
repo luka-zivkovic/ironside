@@ -1,9 +1,11 @@
 import {
   createClickHouseClient,
+  getTrace,
   getTraceRawIndex,
   hasPendingTraceRawRefs,
   insertRawEventRefs,
   insertTraces,
+  listObservationsForTrace,
   runMigrations as runChMigrations
 } from "@ironside/clickhouse";
 import {
@@ -596,5 +598,123 @@ describe("ingest processor dead-lettering (M9-03)", () => {
       format: "JSONEachRow"
     });
     expect(await result.json()).toHaveLength(1);
+  });
+});
+
+describe("LangFuse create and update in separate requests", () => {
+  function langfuseBatch(receivedAt: string, events: unknown[]): IngestBatch {
+    return {
+      batchId: ulid(),
+      projectId,
+      receivedAt,
+      events: [
+        {
+          id: ulid(),
+          type: "langfuse-ingestion",
+          source: "langfuse",
+          schemaVersion: INGEST_SCHEMA_VERSION,
+          idempotencyKey: ulid(),
+          body: { batch: events }
+        }
+      ]
+    };
+  }
+
+  async function processLangfuseBatch(batch: IngestBatch): Promise<void> {
+    const job = await storeAndEnqueue(batch);
+    await processBatch(job);
+    await job.remove();
+  }
+
+  it("keeps the fields only the create sent when the update arrives in a later request", async () => {
+    const traceId = `trace_${ulid()}`;
+    const generationId = `gen_${ulid()}`;
+    const startedAt = new Date(Date.now() - 10_000);
+    const endedAt = new Date(startedAt.getTime() + 3_000);
+
+    // What the LangFuse SDK flushes while the model call is still running.
+    await processLangfuseBatch(
+      langfuseBatch(startedAt.toISOString(), [
+        {
+          id: ulid(),
+          timestamp: startedAt.toISOString(),
+          type: "trace-create",
+          body: {
+            id: traceId,
+            timestamp: startedAt.toISOString(),
+            name: "checkout",
+            userId: "user_1",
+            tags: ["prod"],
+            input: { question: "hi" }
+          }
+        },
+        {
+          id: ulid(),
+          timestamp: startedAt.toISOString(),
+          type: "generation-create",
+          body: {
+            id: generationId,
+            traceId,
+            name: "llm-call",
+            model: "gpt-4o",
+            startTime: startedAt.toISOString(),
+            input: [{ role: "user", content: "hi" }]
+          }
+        }
+      ])
+    );
+
+    // The next flush, after the call finished. The SDK sends explicit nulls
+    // for fields an update is not setting.
+    await processLangfuseBatch(
+      langfuseBatch(endedAt.toISOString(), [
+        {
+          id: ulid(),
+          timestamp: endedAt.toISOString(),
+          type: "generation-update",
+          body: {
+            id: generationId,
+            traceId,
+            name: null,
+            input: null,
+            endTime: endedAt.toISOString(),
+            output: { text: "hello" },
+            usage: { promptTokens: 5, completionTokens: 2 }
+          }
+        },
+        {
+          id: ulid(),
+          timestamp: endedAt.toISOString(),
+          type: "trace-create",
+          body: { id: traceId, output: { answer: "hello" } }
+        }
+      ])
+    );
+
+    const trace = await getTrace(clickhouse, projectId, traceId);
+    expect(trace).toMatchObject({
+      name: "checkout",
+      user_id: "user_1",
+      tags: ["prod"],
+      timestamp: startedAt.toISOString()
+    });
+    expect(JSON.parse(trace?.input ?? "null")).toEqual({ question: "hi" });
+    expect(JSON.parse(trace?.output ?? "null")).toEqual({ answer: "hello" });
+
+    const observations = await listObservationsForTrace(clickhouse, projectId, traceId);
+    expect(observations).toHaveLength(1);
+    const generation = observations[0];
+    expect(generation).toMatchObject({
+      id: generationId,
+      name: "llm-call",
+      model: "gpt-4o",
+      start_time: startedAt.toISOString(),
+      end_time: endedAt.toISOString(),
+      usage_details: { input_tokens: 5, output_tokens: 2 }
+    });
+    expect(JSON.parse(generation?.input ?? "null")).toEqual([{ role: "user", content: "hi" }]);
+    expect(JSON.parse(generation?.output ?? "null")).toEqual({ text: "hello" });
+    // Model from the create plus usage from the update is enough to derive cost.
+    expect(generation?.cost_details.total).toBeCloseTo(0.0000325, 9);
   });
 });

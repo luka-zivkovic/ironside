@@ -60,3 +60,36 @@ LangFuse's real endpoint always returns **207** (not 4xx on per-event validation
 Same as native/OTLP: the whole batch is wrapped as one `langfuse-ingestion` event (`source: "langfuse"`), persisted to S3, queued, and exploded into rows by the worker's LangFuse mapper.
 
 **Deliberate deviation from LangFuse's own per-event error granularity**: LangFuse's real endpoint validates each batch item synchronously and reports per-item success/failure in the 207 body immediately. Ironside's ingest pipeline is fast-ACK-then-async everywhere (established since M1 — the edge never does mapping/validation work, only envelope checks) — event-level mapping errors (a malformed `generation-create` body, a missing `traceId`, etc.) surface only in worker logs, not this response. The route optimistically reports every event in the batch as accepted (once the outer `{batch: [...]}` envelope itself parses) rather than faking synchronous per-event validation it doesn't actually perform. This trades exact behavioral parity for staying consistent with the rest of the ingest architecture; a client relying on the SDK surfacing per-event validation errors from the response body won't see them here.
+
+## Partial updates across requests
+
+The SDK sends each record as a `*-create` followed by partial `*-update`
+events (and repeated partial `trace-create` events for trace updates), and it
+flushes on a timer. An update therefore routinely arrives in a later HTTP
+request than its create. Ironside rows are whole-row upserts
+(ReplacingMergeTree, highest `event_ts` wins), so the worker must not write
+an update's row as mapped: on its own it lacks name/model/input and its start
+time or timestamp defaults to the update's event time.
+
+- Within one request, events for the same `body.id` are merged before mapping:
+  creates first, then updates, and an explicit `null` never erases a value
+  another event in the group supplied (the SDK sends `null` for fields it is
+  not setting).
+- The mapper reports which domain fields each row actually received
+  (`MappedLangfuseRows.providedFields`). A defaulted trace `timestamp`,
+  `tags`, or `metadata`, an observation's `startTime`, `level`, or
+  `metadata`, and the `type` guessed for the untyped `observation-*` alias
+  do not count as received.
+- Before cost enrichment, the worker reads the stored trace and observation
+  rows for those ids (one row per id, the most recently written) and fills
+  every field the request did not send from them
+  (`apps/worker/src/processors/langfuse-merge.ts`). A stored cost that
+  Ironside derived is dropped when the update sends new usage or a new model,
+  so it is derived again from the merged values; a client-sent cost is
+  carried forward unchanged.
+
+Residual race: the merge reads committed rows, so it covers the normal order in
+which the earlier request was materialized first. If two requests for the same
+record are processed concurrently, or the later one is processed first, each
+can still miss the other's fields, and the row with the higher `event_ts`
+wins. Closing that needs per-record serialization and is not implemented.

@@ -45,6 +45,8 @@ export {
   listExistingTraceIds,
   getTraceRawAnchor,
   listObservationsForTrace,
+  listTracesByIds,
+  listObservationsByIds,
   listScoresForTrace,
   getAggregates,
   exportTraces,

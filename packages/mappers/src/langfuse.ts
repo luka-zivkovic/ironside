@@ -36,11 +36,23 @@ import { canonicalizeUsageKeys } from "./usage-keys.js";
 // once. Field presence, not event order, decides precedence: a field only
 // -update sets is never overwritten back to absent by a co-occurring
 // -create for the same id.
+//
+// That merge only sees one request. The SDK flushes on a timer, so a
+// -create and its -update routinely arrive in SEPARATE requests, and the
+// update alone maps to a row missing name/model/input with its start time
+// defaulted to the update's timestamp. `providedFields` records which
+// fields each row really received so the worker can fill the rest from the
+// stored row before writing (spec/langfuse-compat-v1.md).
 
 export interface MappedLangfuseRows {
   traces: Trace[];
   observations: Observation[];
   scores: Score[];
+  /** Fields each trace/observation row received from its events, keyed by row id. Any other field was defaulted here. */
+  providedFields: {
+    traces: Map<string, ReadonlySet<keyof Trace>>;
+    observations: Map<string, ReadonlySet<keyof Observation>>;
+  };
 }
 
 /**
@@ -54,7 +66,12 @@ export function mapLangfuseIngestionRequest(
   projectId: string,
   request: LangfuseIngestionRequest
 ): { rows: MappedLangfuseRows; response: LangfuseIngestionResponse } {
-  const rows: MappedLangfuseRows = { traces: [], observations: [], scores: [] };
+  const rows: MappedLangfuseRows = {
+    traces: [],
+    observations: [],
+    scores: [],
+    providedFields: { traces: new Map(), observations: new Map() }
+  };
   const response: LangfuseIngestionResponse = { successes: [], errors: [] };
 
   const traceGroups = new Map<string, LangfuseBatchEvent[]>();
@@ -102,13 +119,19 @@ export function mapLangfuseIngestionRequest(
   for (const events of traceGroups.values()) {
     const result = mapMergedTrace(projectId, events);
     recordResult(response, events, result);
-    if (result.ok && result.row) rows.traces.push(result.row);
+    if (result.ok && result.row) {
+      rows.traces.push(result.row);
+      if (result.provided) rows.providedFields.traces.set(result.row.id, result.provided);
+    }
   }
 
   for (const { type, events } of observationGroups.values()) {
     const result = mapMergedObservation(projectId, events, type);
     recordResult(response, events, result);
-    if (result.ok && result.row) rows.observations.push(result.row);
+    if (result.ok && result.row) {
+      rows.observations.push(result.row);
+      if (result.provided) rows.providedFields.observations.set(result.row.id, result.provided);
+    }
   }
 
   for (const event of scoreEvents) {
@@ -161,12 +184,21 @@ function getBodyId(event: LangfuseBatchEvent): string | undefined {
   return undefined;
 }
 
-type MergedResult<Row> = { ok: true; row: Row | null } | { ok: false; message: string };
+type MergedResult<Row> =
+  | { ok: true; row: Row | null; provided?: ReadonlySet<keyof Row> }
+  | { ok: false; message: string };
+
+/** Keys the mapper set on a row; callers then remove the ones it only defaulted. */
+function presentKeys<Row extends object>(row: Row): Set<keyof Row> {
+  return new Set(
+    (Object.keys(row) as (keyof Row)[]).filter((key) => row[key] !== undefined)
+  );
+}
 
 function recordResult(
   response: LangfuseIngestionResponse,
   events: LangfuseBatchEvent[],
-  result: MergedResult<unknown>
+  result: { ok: true } | { ok: false; message: string }
 ): void {
   for (const event of events) {
     if (result.ok) response.successes.push({ id: event.id, status: 201 });
@@ -183,7 +215,11 @@ function mergeBodies(events: LangfuseBatchEvent[]): Record<string, unknown> {
   const merged: Record<string, unknown> = {};
   for (const event of [...creates, ...updates]) {
     if (event.body && typeof event.body === "object") {
-      Object.assign(merged, event.body);
+      // The SDK sends explicit null for fields an event is not setting, so a
+      // null never erases a value an earlier event in the group supplied.
+      for (const [key, value] of Object.entries(event.body)) {
+        if (value !== null && value !== undefined) merged[key] = value;
+      }
     }
   }
   return merged;
@@ -215,7 +251,11 @@ function mapMergedTrace(
     ...(body.input !== undefined && { input: body.input }),
     ...(body.output !== undefined && { output: body.output })
   };
-  return { ok: true, row: trace };
+  const provided = presentKeys(trace);
+  if (body.timestamp == null) provided.delete("timestamp");
+  if (body.tags == null) provided.delete("tags");
+  if (body.metadata == null) provided.delete("metadata");
+  return { ok: true, row: trace, provided };
 }
 
 function mapMergedObservation(
@@ -256,7 +296,13 @@ function mapMergedObservation(
     ...(usageDetails && { usageDetails }),
     ...(body.costDetails && { costDetails: body.costDetails })
   };
-  return { ok: true, row: observation };
+  const provided = presentKeys(observation);
+  if (body.startTime == null) provided.delete("startTime");
+  if (body.level == null) provided.delete("level");
+  if (body.metadata == null) provided.delete("metadata");
+  // The deprecated observation-* alias carries no type; "span" is a guess.
+  if (events.every((event) => event.type.startsWith("observation-"))) provided.delete("type");
+  return { ok: true, row: observation, provided };
 }
 
 function mapScore(projectId: string, event: LangfuseBatchEvent): MergedResult<Score> {

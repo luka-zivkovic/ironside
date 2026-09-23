@@ -31,6 +31,7 @@ import type { Pool } from "pg";
 import { ulid } from "ulid";
 import { observeTraceEnvironments } from "../environments/environment-registry.js";
 import { enrichObservationCosts } from "./cost-enrichment.js";
+import { fillLangfuseRowsFromStored } from "./langfuse-merge.js";
 
 export interface IngestProcessorDeps {
   storage: ObjectStorage;
@@ -185,8 +186,13 @@ export function createIngestProcessor(deps: IngestProcessorDeps) {
             error.message ?? "event failed LangFuse mapping (no detail provided)"
           );
         }
-        langfuseTraces.push(...rows.traces);
-        langfuseObservations.push(...rows.observations);
+        // A LangFuse update often arrives in a later request than its create;
+        // fill the fields it did not send from the stored row so the whole-row
+        // write does not erase them. Runs before cost enrichment, which needs
+        // the merged model and usage.
+        const filled = await fillLangfuseRowsFromStored(deps.clickhouse, projectId, rows);
+        langfuseTraces.push(...filled.traces);
+        langfuseObservations.push(...filled.observations);
         langfuseScores.push(...rows.scores);
       }
     }
