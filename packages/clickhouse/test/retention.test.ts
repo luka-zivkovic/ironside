@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createClickHouseClient } from "../src/client.js";
 import { runMigrations } from "../src/migrate.js";
 import { insertObservations, insertScores, insertTraces } from "../src/rows.js";
@@ -10,17 +10,45 @@ import {
   recordExpiredEvaluatorTraceIds
 } from "../src/retention.js";
 
-const client = createClickHouseClient({
+const connection = {
   url: process.env.CLICKHOUSE_URL ?? "http://localhost:8123",
   username: process.env.CLICKHOUSE_USER ?? "ironside",
-  password: process.env.CLICKHOUSE_PASSWORD ?? "ironside",
-  database: process.env.CLICKHOUSE_DB ?? "ironside"
-});
+  password: process.env.CLICKHOUSE_PASSWORD ?? "ironside"
+};
+// dropPartitionsOlderThan drops whole monthly partitions for every project,
+// so these tests run in their own database: in the shared one they dropped
+// other test files' rows mid-test (for example, the evaluator integration
+// test's fixed-date traces once their month was more than a day old).
+const database = `retention_test_${crypto.randomUUID().replaceAll("-", "")}`;
+const admin = createClickHouseClient({ ...connection, database: process.env.CLICKHOUSE_DB ?? "ironside" });
+const client = createClickHouseClient({ ...connection, database });
 
 vi.setConfig({ testTimeout: 15_000 });
 
+/**
+ * Fixture rows stand for data written well before retention runs. Retention
+ * tombstones take their version from ClickHouse's own clock, so fixtures
+ * versioned "now" by this process could outrank a tombstone written a few
+ * milliseconds later whenever the server clock lags (as in a local VM).
+ */
+function writtenAMinuteAgo(): string {
+  return new Date(Date.now() - 60_000).toISOString();
+}
+
+beforeAll(async () => {
+  await admin.command({ query: `create database ${database}` });
+});
+
+afterAll(async () => {
+  await client.close();
+  try {
+    await admin.command({ query: `drop database if exists ${database} sync` });
+  } finally {
+    await admin.close();
+  }
+});
+
 describe("retention", () => {
-  afterAll(() => client.close());
 
   it("dropPartitionsOlderThan drops only whole-month partitions entirely past the cutoff, across every project sharing that partition", async () => {
     await runMigrations(client);
@@ -39,7 +67,7 @@ describe("retention", () => {
         { id: `trace_${crypto.randomUUID()}`, projectId: oldProjectB, timestamp: "2020-01-20T00:00:00.000Z", tags: [], metadata: {} },
         { id: `trace_${crypto.randomUUID()}`, projectId: recentProject, timestamp: new Date().toISOString(), tags: [], metadata: {} }
       ],
-      { eventTs: new Date().toISOString() }
+      { eventTs: writtenAMinuteAgo() }
     );
 
     const dropped = await dropPartitionsOlderThan(client, "traces", new Date("2024-01-01T00:00:00Z"));
@@ -95,7 +123,7 @@ describe("retention", () => {
     await insertTraces(
       client,
       [{ id: `trace_${crypto.randomUUID()}`, projectId: graceProject, timestamp: justBeforeNominalCutoff.toISOString(), tags: [], metadata: {} }],
-      { eventTs: new Date().toISOString() }
+      { eventTs: writtenAMinuteAgo() }
     );
 
     await dropPartitionsOlderThan(client, "traces", nominalCutoff);
@@ -119,7 +147,7 @@ describe("retention", () => {
     await insertTraces(
       client,
       [{ id: `trace_${crypto.randomUUID()}`, projectId: mixedProject, timestamp: new Date().toISOString(), tags: [], metadata: {} }],
-      { eventTs: new Date().toISOString() }
+      { eventTs: writtenAMinuteAgo() }
     );
 
     // Sanity: the current month's partition must not be reported as
@@ -182,7 +210,7 @@ describe("retention", () => {
           metadata: {}
         }
       ],
-      { eventTs: new Date().toISOString() }
+      { eventTs: writtenAMinuteAgo() }
     );
 
     await markProjectDataDeletedOlderThan(client, "traces", targetProject, cutoff);
@@ -240,7 +268,7 @@ describe("retention", () => {
     const projectId = `proj_retention_tree_${crypto.randomUUID()}`;
     const traceId = `trace_${crypto.randomUUID()}`;
     const observationId = `obs_${crypto.randomUUID()}`;
-    const eventTs = new Date().toISOString();
+    const eventTs = writtenAMinuteAgo();
     await insertTraces(client, [{
       id: traceId,
       projectId,
@@ -276,7 +304,7 @@ describe("retention", () => {
     const traceId = `trace_${crypto.randomUUID()}`;
     const newerTraceId = `trace_${crypto.randomUUID()}`;
     const observationId = `obs_${crypto.randomUUID()}`;
-    const eventTs = new Date().toISOString();
+    const eventTs = writtenAMinuteAgo();
     await insertTraces(client, [
       {
         id: traceId,
@@ -323,7 +351,7 @@ describe("retention", () => {
     const traceId = `trace_${crypto.randomUUID()}`;
     const observationId = `obs_${crypto.randomUUID()}`;
     const scoreId = `score_${crypto.randomUUID()}`;
-    const eventTs = new Date().toISOString();
+    const eventTs = writtenAMinuteAgo();
     const recent = new Date().toISOString();
     await insertTraces(client, [{
       id: traceId,
@@ -400,7 +428,7 @@ describe("retention", () => {
       startTime: recent,
       level: "default",
       metadata: {}
-    }], { eventTs: new Date().toISOString() });
+    }], { eventTs: writtenAMinuteAgo() });
     await markChildrenOfExpiredTracesDeleted(client, [projectId]);
     const delayed = await client.query({
       query: `select id from observations final
@@ -413,7 +441,7 @@ describe("retention", () => {
 
   it("pages expired-parent capture and child reconciliation without a global row ceiling", async () => {
     const projectId = `proj_retention_paged_${crypto.randomUUID()}`;
-    const eventTs = new Date().toISOString();
+    const eventTs = writtenAMinuteAgo();
     const traceIds = [0, 1, 2].map(() => `trace_${crypto.randomUUID()}`);
     const observationIds = traceIds.map(() => `obs_${crypto.randomUUID()}`);
     await insertTraces(client, traceIds.map((id, index) => ({
