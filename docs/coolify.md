@@ -5,10 +5,12 @@
 - **TARGET:** an Ironside release is one exact semantic version shared by the
   API, worker, and web images and deployed as one Coolify Service.
 - **CURRENT:** `deploy/coolify.yaml` defines that seven-container Service. It
-  is installable now with `IRONSIDE_VERSION=0.2.0`: the `v0.2.0` release
+  is installable now with `IRONSIDE_VERSION=0.3.0`: the `v0.3.0` release
   published public, multi-architecture (amd64/arm64) GHCR images for the API,
-  worker, and web, verified by anonymous manifest pulls. The earlier `v0.1.0`
-  predates the verified multi-architecture/public-image contract; do not use it.
+  worker, and web, verified by anonymous manifest pulls. Its Postgres and
+  ClickHouse baselines changed, so it needs a clean instance; do not update a
+  `v0.2.0` Service in place. The earlier `v0.1.0` predates the verified
+  multi-architecture/public-image contract; do not use it.
 - **CURRENT:** founder-only deployments are disposable test instances. This
   pre-launch release supports clean Postgres and ClickHouse installs only.
 - **ASSUMPTION:** the default stack is single-server, the nginx web component
@@ -21,7 +23,7 @@ source for a future public Coolify catalog template.
 
 1. Create a Docker Compose Empty Service in the target project/environment.
 2. Paste `deploy/coolify.yaml` and save it.
-3. Set `IRONSIDE_VERSION` to an exact published release such as `0.2.0`.
+3. Set `IRONSIDE_VERSION` to an exact published release such as `0.3.0`.
    Never use `latest`, `main`, or another floating value.
 4. Confirm Coolify generated the web URL and the Postgres, ClickHouse, Redis,
    MinIO, metrics, and encryption secrets. These values are instance identity;
@@ -116,7 +118,7 @@ Before publishing:
 docker build -f apps/api/Dockerfile -t ironside-api:smoke .
 docker build -f apps/worker/Dockerfile -t ironside-worker:smoke .
 docker build -f apps/web/Dockerfile -t ironside-web:smoke .
-IRONSIDE_VERSION=0.2.0 docker compose -f deploy/coolify.yaml config >/dev/null
+IRONSIDE_VERSION=0.3.0 docker compose -f deploy/coolify.yaml config >/dev/null
 ```
 
 Use the real candidate version. Compose rendering does not prove anonymous GHCR
