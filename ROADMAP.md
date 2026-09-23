@@ -31,8 +31,9 @@ below are complete.
 ## Before a stable release
 
 - Validate the LangSmith importer against a representative live account.
-- Complete upgrade and restore drills for the frozen append-only Postgres and
-  ClickHouse migration policy on every release that changes stored data.
+- Run upgrade and restore drills on every release that adds a migration.
+  Migrations are append-only and 0.3.0 installations upgrade in place
+  (docs/schema-migrations.md).
 - Complete fresh-machine installation, upgrade, backup, and recovery drills
   against the published container images.
 - Expand production deployment guidance for TLS, secret management, object

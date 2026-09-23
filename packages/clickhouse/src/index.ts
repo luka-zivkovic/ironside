@@ -1,5 +1,5 @@
 export { createClickHouseClient, type ClickHouseConfig } from "./client.js";
-export { runMigrations } from "./migrate.js";
+export { runMigrations, type MigrationOptions } from "./migrate.js";
 export {
   insertTraces,
   insertObservations,

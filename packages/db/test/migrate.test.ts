@@ -22,7 +22,7 @@ describe("runMigrations (postgres)", () => {
        ('organizations', 'projects', 'ironside_migrations', 'raw_retention_intents',
         'owner_principals', 'owner_auth_challenges', 'owner_sessions', 'auth_audit_events',
         'machine_credentials', 'project_environments', 'project_environment_registry_state',
-        'evaluator_trace_feed', 'evaluator_import_trace_state')`
+        'evaluator_trace_feed', 'evaluator_import_trace_state', 'project_model_prices')`
     );
     const names = tables.rows.map((r) => r.table_name).sort();
     expect(names).toEqual([
@@ -37,6 +37,7 @@ describe("runMigrations (postgres)", () => {
       "owner_sessions",
       "project_environment_registry_state",
       "project_environments",
+      "project_model_prices",
       "projects",
       "raw_retention_intents"
     ]);
@@ -47,7 +48,11 @@ describe("runMigrations (postgres)", () => {
     expect(applied.rows).toEqual([
       {
         id: "0001_baseline",
-        checksum: "921f4cff1efc807621eaa3531492a65f5fdfeaa02d12877ddeedc2f65bf8dab9"
+        checksum: "ca0fe03d88db6c911b1c682303738c090b6351c192845b453781b7321d2b588b"
+      },
+      {
+        id: "0002_project_model_prices",
+        checksum: "7de46f83d3bcbb222ce23d4e34f3cd3a9ba764707c7b4961d7bbb4d63c42d4cb"
       }
     ]);
     expect((await pool.query("select to_regclass('api_keys') as table_name")).rows).toEqual([

@@ -14,7 +14,7 @@ This builds the `api`/`worker`/`web` images locally and starts the whole stack. 
 
 The checked-in `docker-compose.yml` is a local stack with fixed development credentials, so it publishes every port on `127.0.0.1` only. Docker-published ports bypass host firewalls such as ufw on Linux, so do not widen the infrastructure ports. To reach the web app or API from another machine, set `IRONSIDE_BIND_ADDRESS` (for example `0.0.0.0`) to publish only `api` and `web` on that interface, put a TLS reverse proxy on the host in front of `127.0.0.1:8080`, or use the [generic single-host release bundle](#generic-single-host-release-bundle), which generates real secrets.
 
-`api` and `worker` each verify the same current Postgres/ClickHouse baseline on boot and ensure the `ironside-raw` object storage bucket exists, so there's no separate schema step to run by hand. This pre-launch release supports clean database installs only; founder-owned test instances are recreated when either baseline changes. See [Database schema lifecycle](pre-production-schema.md).
+`api` and `worker` apply pending Postgres and ClickHouse migrations on boot and ensure the `ironside-raw` object storage bucket exists, so there's no separate schema step to run by hand. Installations created with 0.3.0 or later upgrade in place; see [Database schema migrations](schema-migrations.md).
 
 Once every container reports healthy (`docker compose ps`), generate a short-lived, one-time owner setup code from the host:
 
@@ -89,8 +89,8 @@ generic Compose bundle, boots a disposable stack, verifies the public health
 route and owner-setup command, and only then creates a **draft** GitHub
 release. After the first workflow run, an owner must make all three GHCR
 packages public; package visibility persists for later versions. Verify
-anonymous pulls, document whether the current clean baseline changed, and then
-publish the draft.
+anonymous pulls, list any new Postgres or ClickHouse migrations in the release
+notes, and then publish the draft.
 Default trustctl installs and update checks see only the published release.
 Do not use `latest`, `main`, or another floating tag for a persistent instance.
 
@@ -221,16 +221,20 @@ For production, prefer pointing `S3_ENDPOINT` at real S3 and using bucket versio
 
 The three backups are not a single consistent snapshot — a trace ingested between the ClickHouse and Postgres dumps exists in one and not the other. This is fine in practice: the stores are independently meaningful (Postgres = control plane, ClickHouse = data, raw log = history), and the raw log is append-only so a slightly-later object-storage backup only ever contains *more* history. If you need a hard-consistent snapshot, `docker compose stop api worker` first (ingest pauses; ACKed-but-unprocessed batches wait safely in Redis/raw log), back up all three, then `start`.
 
-## Updating during founder-only testing
+## Upgrading
 
-An image-only update is supported only when the release notes say the baseline
-is unchanged. Change API, worker, and web to the same exact target version and
-verify health, owner sign-in, ingest, query, queue recovery, and scheduled work.
-When either baseline changes, create a clean instance instead of carrying the
-old database forward. Both `api` and `worker` verify the current baselines on
-boot. Concurrent first starts are safe, in-flight queue jobs survive ordinary
-worker restarts, and durable pending-ingest intents reconstruct lost Redis
-jobs within one current instance.
+Installations created with 0.3.0 or later upgrade in place. Back up all three
+stores ([Backups and restore](#backups-and-restore)), change API, worker, and
+web to the same exact target version, and start them; pending migrations apply
+on boot. Then verify health, owner sign-in, ingest, query, queue recovery, and
+scheduled work. Concurrent starts are safe, in-flight queue jobs survive
+ordinary worker restarts, and durable pending-ingest intents reconstruct lost
+Redis jobs.
+
+Downgrades are not supported: an older release refuses to start on a schema a
+newer release migrated. To go back, restore the pre-upgrade backup. See
+[Database schema migrations](schema-migrations.md) for the upgrade procedure
+and the rules for writing migrations.
 
 Coolify-specific installation, backup coverage, and version-change steps are
 in [the Coolify runbook](coolify.md).

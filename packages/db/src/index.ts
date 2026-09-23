@@ -1,4 +1,4 @@
-export { runMigrations } from "./migrate.js";
+export { runMigrations, type MigrationOptions } from "./migrate.js";
 export {
   closeEvaluatorLifecycleFence,
   withEvaluatorDataWriteFence,

@@ -49,8 +49,9 @@ First boot builds the images and initializes storage, which takes a few
 minutes; wait until every container reports healthy. If one stays unhealthy,
 read `docker compose logs api worker` and report what you found. Named
 volumes (`pgdata`, `chdata`, `miniodata`) hold data from earlier runs; leave
-them in place. On an incompatible database baseline, stop and point the user
-to `docs/pre-production-schema.md` instead of deleting anything.
+them in place. If `api` or `worker` refuses to start because of a database
+migration, stop and point the user to `docs/schema-migrations.md` instead of
+deleting anything.
 
 ## 4. Owner setup and first project
 

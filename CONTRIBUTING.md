@@ -17,7 +17,9 @@ pnpm test
 ```
 
 Keep changes focused, add tests for behavior changes, and update the relevant
-file in [`spec/`](./spec) when a contract or invariant changes. Pull requests
+file in [`spec/`](./spec) when a contract or invariant changes. Schema changes
+go in a new numbered migration file; released migrations are never edited
+([database schema migrations](./docs/schema-migrations.md)). Pull requests
 should explain the user-visible outcome, migration impact, and verification
 performed.
 

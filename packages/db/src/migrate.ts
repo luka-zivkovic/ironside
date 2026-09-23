@@ -11,14 +11,25 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // Arbitrary fixed lock id that serializes concurrent Ironside startup.
 const MIGRATION_LOCK_ID = 427193856;
 
-export async function runMigrations(pool: Pool): Promise<void> {
+export interface MigrationOptions {
+  /** Directory of NNNN_name.sql files. Defaults to the migrations shipped with this release; tests override it to simulate an older install. */
+  migrationsDir?: string;
+}
+
+/**
+ * Applies pending migrations in file order, all in one transaction under an
+ * advisory lock, so concurrent api/worker starts apply each exactly once and a
+ * failure leaves the schema unchanged. Migrations are append-only: a released
+ * file is never edited (docs/schema-migrations.md).
+ */
+export async function runMigrations(pool: Pool, options: MigrationOptions = {}): Promise<void> {
   const client = await pool.connect();
   try {
     await client.query("begin");
     await client.query("select pg_advisory_xact_lock($1)", [MIGRATION_LOCK_ID]);
     await ensureMigrationsTable(client);
 
-    const migrationsDir = join(__dirname, "..", "migrations");
+    const migrationsDir = options.migrationsDir ?? join(__dirname, "..", "migrations");
     const files = (await readdir(migrationsDir))
       .filter((file) => file.endsWith(".sql"))
       .sort();
@@ -29,9 +40,9 @@ export async function runMigrations(pool: Pool): Promise<void> {
       .filter((id) => !migrationIds.has(id));
     if (obsolete.length > 0) {
       throw new Error(
-        `Postgres migration history is newer than or incompatible with this release ` +
-        `(${obsolete.join(", ")}); this pre-launch release supports clean installations only, ` +
-        "so recreate the disposable database"
+        `Postgres schema was migrated by a newer Ironside release (${obsolete.join(", ")}); ` +
+        "run that release or a later one. Returning to an older release means restoring " +
+        "the backup taken before the upgrade (docs/schema-migrations.md)"
       );
     }
 
@@ -46,8 +57,9 @@ export async function runMigrations(pool: Pool): Promise<void> {
       if (existing.rows[0]) {
         if (existing.rows[0].checksum !== checksum) {
           throw new Error(
-            `applied Postgres migration ${id} checksum does not match this release; ` +
-            "recreate the disposable database"
+            `Postgres migration ${id} differs from the version this database applied. ` +
+            "Released migrations are never edited, so this database was created by an " +
+            "unreleased build (docs/schema-migrations.md)"
           );
         }
         continue;

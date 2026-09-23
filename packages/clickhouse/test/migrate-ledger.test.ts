@@ -7,7 +7,7 @@ function jsonRows<T>(rows: T[]) {
 }
 
 describe("runMigrations ClickHouse ledger validation", () => {
-  it("rejects a non-current disposable ledger before querying unsupported columns", async () => {
+  it("rejects a pre-0.3.0 ledger before querying unsupported columns", async () => {
     const queries: string[] = [];
     const client = {
       command: vi.fn(async () => undefined),
@@ -22,7 +22,7 @@ describe("runMigrations ClickHouse ledger validation", () => {
     } as unknown as ClickHouseClient;
 
     await expect(runMigrations(client)).rejects.toThrow(
-      "ClickHouse migration ledger is incompatible with this clean-install release; recreate the disposable database"
+      "ClickHouse migration ledger predates the 0.3.0 baseline and cannot be upgraded"
     );
     expect(queries).toHaveLength(1);
     expect(queries[0]?.toLowerCase()).not.toContain(" final");
