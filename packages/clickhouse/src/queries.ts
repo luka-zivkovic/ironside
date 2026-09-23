@@ -622,6 +622,14 @@ export async function listObservationsForTrace(
 }
 
 /**
+ * ClickHouse ignores skip indexes under FINAL by default. Enabling them is
+ * safe for these lookups because they filter only on id and trace_id, which
+ * every version of a row shares, so no newer version can be skipped while an
+ * older one is kept.
+ */
+const SKIP_INDEXES_WITH_FINAL = { use_skip_indexes_if_final: 1 } as const;
+
+/**
  * Stored traces for these ids, project-scoped: one row per id, the most
  * recently written. A partial update is merged into this row before it is
  * written (spec/langfuse-compat-v1.md); a trace whose timestamp moved to
@@ -643,6 +651,7 @@ export async function listTracesByIds(
       limit 1 by id
     `,
     query_params: { projectId, traceIds: [...new Set(traceIds)] },
+    clickhouse_settings: SKIP_INDEXES_WITH_FINAL,
     format: "JSONEachRow"
   });
   const rows = await result.json<TraceDetailRow>();
@@ -680,6 +689,7 @@ export async function listObservationsByIds(
       traceIds: [...new Set(observations.map((observation) => observation.traceId))],
       observationIds: [...new Set(observations.map((observation) => observation.id))]
     },
+    clickhouse_settings: SKIP_INDEXES_WITH_FINAL,
     format: "JSONEachRow"
   });
   const rows = await result.json<ObservationRow>();

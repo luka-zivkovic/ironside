@@ -136,6 +136,30 @@ describe("fillUnprovidedObservationFields", () => {
   });
 });
 
+describe("fillUnprovidedObservationFields — a client cost after a derived one", () => {
+  it("drops the derived-cost labels so a later usage update keeps the client's cost", () => {
+    const derived = storedGeneration({
+      usageDetails: { input_tokens: 1000, output_tokens: 500 },
+      costDetails: { total: 0.0075 },
+      metadata: { team: "sales", ...DERIVED_COST_METADATA }
+    });
+    const clientCost = fillUnprovidedObservationFields(
+      { ...storedGeneration(), costDetails: { total: 0.5 }, metadata: {} },
+      new Set(["id", "traceId", "projectId", "type", "costDetails"]),
+      derived
+    );
+    expect(clientCost.costDetails).toEqual({ total: 0.5 });
+    expect(clientCost.metadata).toEqual({ team: "sales" });
+
+    const laterUsage = fillUnprovidedObservationFields(
+      { ...storedGeneration(), usageDetails: { input_tokens: 1200, output_tokens: 600 }, metadata: {} },
+      new Set(["id", "traceId", "projectId", "type", "usageDetails"]),
+      clientCost
+    );
+    expect(laterUsage.costDetails).toEqual({ total: 0.5 });
+  });
+});
+
 describe("observationFromStoredRow", () => {
   it("reads empty stored maps back as absent and parses stored JSON payloads", () => {
     const row: ObservationRow = {

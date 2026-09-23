@@ -75,17 +75,22 @@ export function fillUnprovidedObservationFields(
   stored: Observation
 ): Observation {
   const merged = fillUnprovided(incoming, provided, stored);
+  if (provided.has("costDetails")) {
+    // A client-sent cost replaces the stored one. Stored metadata carried
+    // forward may still label it as derived, which would let a later usage
+    // update recompute it; drop those labels.
+    if (!provided.has("metadata")) merged.metadata = withoutCostProvenance(merged.metadata);
+    return merged;
+  }
   const storedCostWasDerived =
     stored.costDetails !== undefined && stored.metadata[COST_SOURCE_METADATA_KEY] !== undefined;
-  if (provided.has("costDetails") || !storedCostWasDerived) return merged;
+  if (!storedCostWasDerived) return merged;
 
   if (provided.has("usageDetails") || provided.has("model")) {
     // The stored cost was derived from the old usage/model; drop it so cost
     // enrichment derives it again from the merged values.
     delete merged.costDetails;
-    merged.metadata = Object.fromEntries(
-      Object.entries(merged.metadata).filter(([key]) => !COST_METADATA_KEYS.includes(key))
-    );
+    merged.metadata = withoutCostProvenance(merged.metadata);
   } else if (provided.has("metadata")) {
     // New metadata replaced the stored map; keep the carried cost's provenance.
     for (const key of COST_METADATA_KEYS) {
@@ -94,6 +99,10 @@ export function fillUnprovidedObservationFields(
     }
   }
   return merged;
+}
+
+function withoutCostProvenance(metadata: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(metadata).filter(([key]) => !COST_METADATA_KEYS.includes(key)));
 }
 
 function fillUnprovided<Row extends object>(
