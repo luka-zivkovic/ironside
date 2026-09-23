@@ -33,15 +33,20 @@ describe("project URL context", () => {
       userId: " user_1 ",
       sessionId: "session_2",
       tags: "prod, checkout",
-      environment: "production"
+      environment: "production",
+      range: "7d"
     });
-    expect(search.toString()).toBe("userId=user_1&sessionId=session_2&environment=production&tags=prod&tags=checkout");
+    expect(search.toString()).toBe(
+      "userId=user_1&sessionId=session_2&environment=production&range=7d&tags=prod&tags=checkout"
+    );
     expect(filtersFromSearchParams(search)).toEqual({
       userId: "user_1",
       sessionId: "session_2",
       tags: "prod, checkout",
-      environment: "production"
+      environment: "production",
+      range: "7d"
     });
+    expect(filtersFromSearchParams(new URLSearchParams("range=nonsense")).range).toBe("");
   });
 
   it("changes only the global environment parameter and preserves local filters", () => {

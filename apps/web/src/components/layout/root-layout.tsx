@@ -26,8 +26,11 @@ export function RootLayout() {
           <Topbar crumbs={crumbs} />
           <div
             className={cn(
-              "min-w-0 w-full px-5 pt-7 pb-20 sm:px-8 xl:px-12 xl:pt-9",
-              isTraceRecord ? "max-w-none" : "max-w-[1440px]"
+              "min-w-0 w-full px-5 pt-7 sm:px-8 xl:px-12 xl:pt-9",
+              // The trace record's panes are viewport-capped and sticky; the
+              // bottom padding must match the cap's bottom margin (24px) so the
+              // panes never scroll under the top bar at the page's end.
+              isTraceRecord ? "max-w-none pb-6" : "max-w-[1440px] pb-20"
             )}
           >
             <Outlet />

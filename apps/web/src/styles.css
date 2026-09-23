@@ -218,9 +218,21 @@
     user-select: none;
   }
 
-  .trace-record-inspector {
+  /* Both panes are viewport-capped and scroll internally, so a long record
+     inspector is readable without paging past the whole observation tree.
+     68px = topbar height + breathing room; 24px = bottom margin. */
+  .trace-record-pane {
     position: sticky;
     top: 68px;
+    display: flex;
+    flex-direction: column;
+    max-height: calc(100dvh - 68px - 24px);
+  }
+
+  .trace-record-pane > .trace-record-pane-body {
+    min-height: 0;
+    overflow: auto;
+    overscroll-behavior: contain;
   }
 
   .trace-tree-item:focus-visible > .trace-tree-row {
@@ -476,8 +488,13 @@
     display: none;
   }
 
-  .trace-record-inspector {
+  .trace-record-pane {
     position: static;
+    max-height: none;
+  }
+
+  .trace-record-pane > .trace-record-pane-body {
+    overflow: visible;
   }
 }
 
