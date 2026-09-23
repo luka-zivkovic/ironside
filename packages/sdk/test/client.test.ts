@@ -585,6 +585,107 @@ describe("ingest delivery retries", () => {
     ]);
   });
 
+  it("flush() returns after flushTimeoutMs while undelivered events keep retrying in the background", async () => {
+    const { fetchImpl, requests } = scriptedFetch([503]);
+    const onError = vi.fn();
+    const client = init({
+      apiKey: "k",
+      host: "http://localhost:8788",
+      fetchImpl,
+      onError,
+      retryDelayMs: 200,
+      flushTimeoutMs: 20
+    });
+    clients.push(client);
+
+    client.trace({ name: "slow-delivery" });
+    const started = Date.now();
+    await client.flush();
+    expect(Date.now() - started).toBeLessThan(150);
+    expect(requests).toHaveLength(1);
+
+    await client.shutdown();
+    expect(requests).toHaveLength(2);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("keeps sending after an onError handler throws", async () => {
+    const { fetchImpl, requests } = scriptedFetch([400]);
+    const client = init({
+      apiKey: "k",
+      host: "http://localhost:8788",
+      fetchImpl,
+      onError: () => {
+        throw new Error("handler bug");
+      }
+    });
+    clients.push(client);
+
+    client.trace({ name: "rejected" });
+    await client.flush();
+    client.trace({ name: "after-handler-threw" });
+    await client.flush();
+
+    expect(requests.map(traceNames)).toEqual([["rejected"], ["after-handler-threw"]]);
+  });
+
+  it("treats non-finite option values safely instead of retrying forever or aborting at once", async () => {
+    const { fetchImpl, requests } = scriptedFetch([500, 500, 500, 500, 500, 500, 500, 500]);
+    const onError = vi.fn();
+    const client = init({
+      apiKey: "k",
+      host: "http://localhost:8788",
+      fetchImpl,
+      onError,
+      maxRetries: Number.NaN,
+      retryDelayMs: 1,
+      shutdownTimeoutMs: Infinity
+    });
+
+    client.trace({ name: "nan-retries" });
+    await client.shutdown();
+
+    // NaN falls back to the default of 5 retries; Infinity waits them all out.
+    expect(requests).toHaveLength(6);
+    expect(onError).toHaveBeenCalledOnce();
+    expect(String(onError.mock.calls[0]?.[0])).toMatch(/HTTP 500/);
+  });
+
+  it("clamps a shutdownTimeoutMs beyond the timer range instead of cancelling at once", async () => {
+    let releaseSend!: () => void;
+    const sendGate = new Promise<void>((resolve) => {
+      releaseSend = resolve;
+    });
+    const requests: unknown[] = [];
+    // Honors the abort signal like real fetch, so an early cancellation shows up.
+    const gatedFetch: typeof fetch = vi.fn(
+      (_input, init) =>
+        new Promise<Response>((resolve, reject) => {
+          requests.push(init?.body);
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+          void sendGate.then(() => resolve(new Response("{}", { status: 202 })));
+        })
+    ) as unknown as typeof fetch;
+    const onError = vi.fn();
+    const client = init({
+      apiKey: "k",
+      host: "http://localhost:8788",
+      fetchImpl: gatedFetch,
+      onError,
+      maxRetries: 0,
+      shutdownTimeoutMs: 2 ** 40
+    });
+
+    client.trace({ name: "long-shutdown" });
+    const shutdown = client.shutdown();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    releaseSend();
+    await shutdown;
+
+    expect(requests).toHaveLength(1);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
   it("shutdown() stops retrying after shutdownTimeoutMs and reports the unsent batch", async () => {
     const { fetchImpl } = scriptedFetch([503, 503, 503, 503, 503, 503]);
     const onError = vi.fn();

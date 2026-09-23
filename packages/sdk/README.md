@@ -90,9 +90,10 @@ A batch that fails with a network error, `408`, `429`, or a `5xx` response is re
 | `maxRetries` | `5` | Retries after the first attempt; `0` disables retrying. |
 | `retryDelayMs` | `500` | Base backoff delay, doubled on each retry. |
 | `maxQueuedEvents` | `10000` | Events held in memory while sends are pending. New events beyond it are dropped and reported through `onError` on the next flush. |
+| `flushTimeoutMs` | `10000` | Longest `flush()` waits for delivery. Events not yet delivered keep retrying in the background, so an awaited `flush()` cannot hold a request open through an outage. |
 | `shutdownTimeoutMs` | `10000` | Longest `shutdown()` waits for sends and retries. When it expires, the pending request is cancelled and unsent batches are reported through `onError`. |
 
-A pending retry keeps the Node.js process alive the same way an in-flight request does. In serverless functions, set `shutdownTimeoutMs` below the platform's function timeout.
+Both timeouts accept `Infinity` to wait indefinitely. A pending retry keeps the Node.js process alive the same way an in-flight request does. In serverless functions, set `flushTimeoutMs` and `shutdownTimeoutMs` below the platform's function timeout. An `onError` handler that throws is ignored rather than stopping delivery.
 
 `recordGenerateTextResult()` is available for results returned by the Vercel AI SDK. `uploadMedia()` stores binary content separately and returns an `ironside://media/...` reference suitable for trace input or output.
 

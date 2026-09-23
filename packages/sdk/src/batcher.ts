@@ -17,7 +17,9 @@ export interface BatcherOptions {
   retryDelayMs?: number;
   /** Most events held in memory at once, buffered or waiting to send. Events beyond it are dropped and reported via onError. Default 10,000. */
   maxQueuedEvents?: number;
-  /** Longest close() waits for pending sends and retries before reporting the remainder via onError. Default 10,000 ms. */
+  /** Longest flush() waits for its events to be delivered; undelivered events keep retrying in the background. `Infinity` waits indefinitely. Default 10,000 ms. */
+  flushTimeoutMs?: number;
+  /** Longest close() waits for pending sends and retries before cancelling them and reporting the remainder via onError. `Infinity` waits indefinitely. Default 10,000 ms. */
   shutdownTimeoutMs?: number;
 }
 
@@ -26,7 +28,10 @@ const DEFAULT_FLUSH_INTERVAL_MS = 5000;
 const DEFAULT_MAX_RETRIES = 5;
 const DEFAULT_RETRY_DELAY_MS = 500;
 const DEFAULT_MAX_QUEUED_EVENTS = 10_000;
+const DEFAULT_FLUSH_TIMEOUT_MS = 10_000;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
+/** setTimeout clamps anything larger to 1 ms. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
 // The API's rate limiter uses one-minute windows, so no single wait needs to
 // be longer than that.
 const MAX_RETRY_DELAY_MS = 60_000;
@@ -35,6 +40,17 @@ type SendOutcome =
   | { kind: "sent" }
   | { kind: "rejected"; error: Error }
   | { kind: "retryable"; error: unknown; retryAfterMs?: number };
+
+/** A finite number of at least `min`, or the fallback for undefined, NaN, and infinities. */
+function finiteAtLeast(value: number | undefined, min: number, fallback: number): number {
+  return value !== undefined && Number.isFinite(value) ? Math.max(min, value) : fallback;
+}
+
+/** A wait in ms: `Infinity` means no limit; NaN or undefined takes the fallback. */
+function timeoutMs(value: number | undefined, fallback: number): number {
+  if (value === undefined || Number.isNaN(value)) return fallback;
+  return value === Infinity ? Infinity : Math.min(Math.max(0, value), MAX_TIMER_MS);
+}
 
 /** 408/429/5xx are transient; any other 4xx will fail the same way again. 501 means the route itself is unsupported. */
 function isRetryableStatus(status: number): boolean {
@@ -72,6 +88,7 @@ export class EventBatcher {
   private readonly maxRetries: number;
   private readonly retryDelayMs: number;
   private readonly maxQueuedEvents: number;
+  private readonly flushTimeoutMs: number;
   private readonly shutdownTimeoutMs: number;
 
   private buffer: IngestRequestEvent[] = [];
@@ -94,10 +111,11 @@ export class EventBatcher {
     this.onError =
       options.onError ??
       ((error) => console.error("[ironside] failed to send trace events:", error));
-    this.maxRetries = Math.max(0, options.maxRetries ?? DEFAULT_MAX_RETRIES);
-    this.retryDelayMs = Math.max(0, options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS);
-    this.maxQueuedEvents = Math.max(1, options.maxQueuedEvents ?? DEFAULT_MAX_QUEUED_EVENTS);
-    this.shutdownTimeoutMs = Math.max(0, options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS);
+    this.maxRetries = Math.floor(finiteAtLeast(options.maxRetries, 0, DEFAULT_MAX_RETRIES));
+    this.retryDelayMs = finiteAtLeast(options.retryDelayMs, 0, DEFAULT_RETRY_DELAY_MS);
+    this.maxQueuedEvents = Math.floor(finiteAtLeast(options.maxQueuedEvents, 1, DEFAULT_MAX_QUEUED_EVENTS));
+    this.flushTimeoutMs = timeoutMs(options.flushTimeoutMs, DEFAULT_FLUSH_TIMEOUT_MS);
+    this.shutdownTimeoutMs = timeoutMs(options.shutdownTimeoutMs, DEFAULT_SHUTDOWN_TIMEOUT_MS);
 
     this.timer = setInterval(() => void this.flush(), this.flushIntervalMs);
     // Don't let the flush timer keep the process alive on its own.
@@ -118,23 +136,41 @@ export class EventBatcher {
     }
   }
 
-  /** Sends whatever is currently buffered. Safe to call concurrently — flushes serialize via inFlight. */
+  /**
+   * Sends whatever is currently buffered and waits until it is delivered or
+   * `flushTimeoutMs` passes; events still undelivered then keep retrying in
+   * the background. Safe to call concurrently — flushes serialize via inFlight.
+   */
   async flush(): Promise<void> {
+    if (!this.claimBuffer()) return;
+    await settleWithin(this.inFlight, this.flushTimeoutMs);
+  }
+
+  /** Moves buffered events onto the send chain; false when there was nothing to send. */
+  private claimBuffer(): boolean {
     this.reportDropped();
-    if (this.buffer.length === 0) return;
+    if (this.buffer.length === 0) return false;
     const events = this.buffer;
     this.buffer = [];
     this.queuedCount += events.length;
-
     this.inFlight = this.inFlight.then(() => this.send(events));
-    await this.inFlight;
+    return true;
+  }
+
+  /** Calls onError without letting a throwing handler break the send chain. */
+  private report(error: unknown, events: IngestRequestEvent[]): void {
+    try {
+      this.onError(error, events);
+    } catch {
+      // A trace SDK must never throw into the application, including from its own error hook.
+    }
   }
 
   private reportDropped(): void {
     if (this.dropped.length === 0) return;
     const events = this.dropped;
     this.dropped = [];
-    this.onError(
+    this.report(
       new Error(
         `ironside send queue is full (${this.maxQueuedEvents} events); dropped ${events.length} event(s)`
       ),
@@ -148,12 +184,12 @@ export class EventBatcher {
         const outcome = await this.attempt(events);
         if (outcome.kind === "sent") return;
         if (outcome.kind === "rejected" || attempt >= this.maxRetries) {
-          this.onError(outcome.error, events);
+          this.report(outcome.error, events);
           return;
         }
         const delayMs = outcome.retryAfterMs ?? this.backoffMs(attempt);
         if (!(await this.wait(delayMs))) {
-          this.onError(outcome.error, events);
+          this.report(outcome.error, events);
           return;
         }
       }
@@ -231,12 +267,26 @@ export class EventBatcher {
   async close(): Promise<void> {
     this.closed = true;
     if (this.timer) clearInterval(this.timer);
-    const deadline = setTimeout(() => this.closeTimeout.abort(), this.shutdownTimeoutMs);
+    const deadline =
+      this.shutdownTimeoutMs === Infinity
+        ? undefined
+        : setTimeout(() => this.closeTimeout.abort(), this.shutdownTimeoutMs);
     try {
-      await this.flush();
+      this.claimBuffer();
       await this.inFlight;
     } finally {
       clearTimeout(deadline);
     }
+  }
+}
+
+/** Resolves when `promise` settles or after `ms`, whichever is first. */
+async function settleWithin(promise: Promise<void>, ms: number): Promise<void> {
+  if (ms === Infinity) return promise;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([promise, new Promise<void>((resolve) => (timer = setTimeout(resolve, ms)))]);
+  } finally {
+    clearTimeout(timer);
   }
 }
