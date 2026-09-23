@@ -82,6 +82,10 @@ function rule(overrides: Partial<OtlpForwardRule> = {}): OtlpForwardRule {
     pollIntervalSeconds: 300,
     nextRunAt: new Date(),
     feedCursor: null,
+    lastRunAt: null,
+    lastRunStatus: null,
+    lastRunError: null,
+    lastRunForwardedCount: null,
     ...overrides
   };
 }
@@ -190,7 +194,7 @@ describe("forwardOtlpTraces", () => {
       allowPrivateDestinations: true
     });
     expect(failedRun).toMatchObject({ matched: 1, forwarded: 0 });
-    expect(failedRun.failed).toEqual([{ traceId: traceIds[0], error: expect.stringMatching(/500/) }]);
+    expect(failedRun.failed).toEqual([{ traceId: traceIds[0], error: expect.stringMatching(/500/), skipped: false }]);
     // Earlier traces in this shared project did not match and were stepped
     // over; the position stops short of the rejected trace.
     expect((await getOtlpForwardRule(pool, projectId, stored.id))?.feedCursor?.traceId).not.toBe(traceIds[0]);
@@ -215,6 +219,67 @@ describe("forwardOtlpTraces", () => {
       allowPrivateDestinations: true
     });
     expect(nothingNew).toMatchObject({ matched: 0, forwarded: 0 });
+  });
+
+  it("skips a trace the destination permanently rejects, keeps forwarding, and records the rejection", async () => {
+    const marker = `otlp_fwd_reject_${ulid()}`;
+    const traceIds = [`trace_${marker}_1`, `trace_${marker}_2`];
+    for (const id of traceIds) {
+      await insertPublishedTrace({ pool, clickhouse }, {
+        trace: { id, projectId, timestamp: new Date().toISOString(), tags: [marker], metadata: {} }
+      });
+    }
+    const stored = await createOtlpForwardRule(pool, {
+      id: `rule_${ulid()}`,
+      projectId,
+      name: "picky destination",
+      destinationUrl: serverUrl,
+      filter: { tags: [marker] }
+    });
+    let calls = 0;
+    const rejectFirst: typeof fetch = (async () =>
+      new Response("{}", { status: calls++ === 0 ? 413 : 200 })) as unknown as typeof fetch;
+
+    const result = await forwardOtlpTraces({
+      pool,
+      clickhouse,
+      rule: stored,
+      fetchImpl: rejectFirst,
+      traceQuietPeriodSeconds: 0,
+      allowPrivateDestinations: true
+    });
+
+    expect(result).toMatchObject({ matched: 2, forwarded: 1 });
+    expect(result.failed).toEqual([{ traceId: traceIds[0], error: expect.stringMatching(/413/), skipped: true }]);
+    const recorded = await getOtlpForwardRule(pool, projectId, stored.id);
+    expect(recorded).toMatchObject({ lastRunStatus: "error", lastRunForwardedCount: 1 });
+    expect(recorded?.lastRunError).toMatch(new RegExp(`${traceIds[0]} \\(skipped\\)`));
+    expect(recorded?.feedCursor?.traceId).toBe(traceIds[1]);
+  });
+
+  it("stops at a destination that does not answer within the request timeout", async () => {
+    const marker = `otlp_fwd_timeout_${ulid()}`;
+    const traceId = `trace_${marker}`;
+    await insertPublishedTrace({ pool, clickhouse }, {
+      trace: { id: traceId, projectId, timestamp: new Date().toISOString(), tags: [marker], metadata: {} }
+    });
+    const neverAnswers: typeof fetch = ((_input: unknown, init?: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+      })) as unknown as typeof fetch;
+
+    const result = await forwardOtlpTraces({
+      pool,
+      clickhouse,
+      rule: rule({ filter: { tags: [marker] } }),
+      fetchImpl: neverAnswers,
+      requestTimeoutMs: 50,
+      traceQuietPeriodSeconds: 0,
+      allowPrivateDestinations: true
+    });
+
+    expect(result).toMatchObject({ matched: 1, forwarded: 0 });
+    expect(result.failed).toEqual([{ traceId, error: expect.any(String), skipped: false }]);
   });
 
   it("only forwards the authenticated project's traces matching the rule's filter", async () => {

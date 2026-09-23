@@ -712,6 +712,12 @@ export async function deleteEvaluatorTraceFeedEntries(
        where activity.project_id = deleted_feed.project_id
          and activity.trace_id = deleted_feed.trace_id
        returning 1
+     ), deleted_score_feed as (
+       delete from trace_score_feed score
+       using deleted_feed
+       where score.project_id = deleted_feed.project_id
+         and score.trace_id = deleted_feed.trace_id
+       returning 1
      )
      select count(*)::text as deleted_count from deleted_feed`,
     [projectIds, traceIds, traceVersions]

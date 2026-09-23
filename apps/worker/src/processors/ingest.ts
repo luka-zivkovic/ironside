@@ -12,6 +12,7 @@ import {
   listEvaluatorPublishedTraceIdsForActivity,
   markEvaluatorScoreReceiptMaterialized,
   publishEvaluatorTraceActivities,
+  publishTraceScoreActivity,
   recordIngestFailures,
   withEvaluatorDataWriteFence,
   withRawRetentionObjectLock,
@@ -258,6 +259,12 @@ export function createIngestProcessor(deps: IngestProcessorDeps) {
       await markEvaluatorScoreReceiptMaterialized(deps.pool, {
         projectId,
         batchId: batch.batchId
+      });
+      // Scores for traces this batch did not otherwise touch never move the
+      // trace feed, so scheduled exports learn about them from the score feed.
+      await publishTraceScoreActivity(deps.pool, {
+        projectId,
+        traceIds: annotationOnlyRawRefs.map((ref) => ref.traceId)
       });
 
       // Discovery is derived, but it is part of this job's durable materialize

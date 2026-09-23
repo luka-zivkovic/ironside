@@ -18,6 +18,7 @@ import {
   markImportRunFailed,
   markImportRunIdle,
   publishEvaluatorTraceActivities,
+  publishTraceScoreActivity,
   renewImportRunLease,
   withEvaluatorDataWriteFence,
   type EvaluatorImportSource,
@@ -196,6 +197,12 @@ export async function materializeEvaluatorImportSnapshot(
         importSource: state.source,
         importRunToken: options.runToken,
         importTraceTimestamp: snapshot.trace.timestamp
+      });
+      // The trace feed stays put for score-only changes; scheduled exports
+      // pick the new scores up from the score feed.
+      await publishTraceScoreActivity(options.pool, {
+        projectId: options.projectId,
+        traceIds: [state.traceId]
       });
       return;
     }

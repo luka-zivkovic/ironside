@@ -102,13 +102,14 @@ export {
   listOtlpForwardRules,
   listEnabledOtlpForwardRules,
   claimDueOtlpForwardRules,
-  recordOtlpForwardProgress,
+  recordOtlpForwardRun,
   updateOtlpForwardRule,
   deleteOtlpForwardRule,
   type OtlpForwardRule,
   type CreateOtlpForwardRuleInput,
   type UpdateOtlpForwardRuleInput
 } from "./otlp-forward-rules.js";
+export { publishTraceScoreActivity, listTraceScoreActivities } from "./trace-score-feed.js";
 export {
   createWebhookRule,
   getWebhookRule,

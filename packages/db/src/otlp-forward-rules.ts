@@ -19,6 +19,11 @@ export interface OtlpForwardRule {
   nextRunAt: Date;
   /** Null until the first trace is forwarded; the next run starts at the beginning of the feed. */
   feedCursor: DestinationFeedCursor | null;
+  lastRunAt: Date | null;
+  lastRunStatus: "success" | "error" | null;
+  /** Why the last run stopped, or which traces the destination rejected and were skipped. */
+  lastRunError: string | null;
+  lastRunForwardedCount: number | null;
 }
 
 interface OtlpForwardRuleRow {
@@ -33,6 +38,10 @@ interface OtlpForwardRuleRow {
   next_run_at: Date;
   feed_cursor_trace_id: string | null;
   feed_cursor_published_at_text?: string | null;
+  last_run_at: Date | null;
+  last_run_status: "success" | "error" | null;
+  last_run_error: string | null;
+  last_run_forwarded_count: string | null;
 }
 
 function fromRow(row: OtlpForwardRuleRow): OtlpForwardRule {
@@ -46,7 +55,12 @@ function fromRow(row: OtlpForwardRuleRow): OtlpForwardRule {
     enabled: row.enabled,
     pollIntervalSeconds: row.poll_interval_seconds,
     nextRunAt: row.next_run_at,
-    feedCursor: feedCursorFromRow(row)
+    feedCursor: feedCursorFromRow(row),
+    lastRunAt: row.last_run_at,
+    lastRunStatus: row.last_run_status,
+    lastRunError: row.last_run_error,
+    lastRunForwardedCount:
+      row.last_run_forwarded_count === null ? null : Number(row.last_run_forwarded_count)
   };
 }
 
@@ -165,26 +179,45 @@ export async function claimDueOtlpForwardRules(
 }
 
 /**
- * Stores how far forwarding got through the trace feed. `runAgainSoon`
- * makes the next scheduler tick continue a backlog the run stopped short of.
+ * Records a forwarding run: its outcome and how far it got through the trace
+ * feed. The position is stored only if it still holds the value the run
+ * started from, so a slow run claimed twice by different worker replicas
+ * cannot move it back. `runAgainSoon` makes the next scheduler tick continue
+ * a backlog the run stopped short of.
  */
-export async function recordOtlpForwardProgress(
+export async function recordOtlpForwardRun(
   pool: Pool,
   id: string,
-  progress: { feedCursor: DestinationFeedCursor | null; runAgainSoon?: boolean }
+  run: {
+    status: "success" | "error";
+    error?: string;
+    forwarded: number;
+    feedCursor: { from: DestinationFeedCursor | null; to: DestinationFeedCursor | null };
+    runAgainSoon?: boolean;
+  }
 ): Promise<void> {
   await pool.query(
     `update otlp_forward_rules
-     set feed_cursor_published_at = $2::timestamptz,
-         feed_cursor_trace_id = $3::text,
-         next_run_at = case when $4 then now() else next_run_at end,
+     set last_run_at = now(), last_run_status = $2, last_run_error = $3,
+         last_run_forwarded_count = $4,
+         feed_cursor_published_at = case when ${UNCHANGED} then $7::timestamptz else feed_cursor_published_at end,
+         feed_cursor_trace_id = case when ${UNCHANGED} then $8::text else feed_cursor_trace_id end,
+         next_run_at = case when $9 then now() else next_run_at end,
          updated_at = now()
      where id = $1`,
     [
       id,
-      progress.feedCursor?.publishedAt ?? null,
-      progress.feedCursor?.traceId ?? null,
-      progress.runAgainSoon ?? false
+      run.status,
+      run.error ?? null,
+      run.forwarded,
+      run.feedCursor.from?.publishedAt ?? null,
+      run.feedCursor.from?.traceId ?? null,
+      run.feedCursor.to?.publishedAt ?? null,
+      run.feedCursor.to?.traceId ?? null,
+      run.runAgainSoon ?? false
     ]
   );
 }
+
+const UNCHANGED = `feed_cursor_published_at is not distinct from $5::timestamptz
+  and feed_cursor_trace_id is not distinct from $6::text`;

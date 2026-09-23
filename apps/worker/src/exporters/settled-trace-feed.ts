@@ -16,6 +16,13 @@ export interface SettledFeedEntry {
   cursor: DestinationFeedCursor;
   /** The settled trace to send, or absent when retention removed it after it was published. */
   trace?: VersionedTraceSummaryRow;
+  /**
+   * The feed's version for this publication: distinct and increasing for
+   * every publication of the trace, unlike `trace.trace_version` (its latest
+   * activity time), which a late batch with an older receive time leaves
+   * unchanged. Destinations order snapshots by this.
+   */
+  version?: string;
 }
 
 export interface SettledFeedPage {
@@ -90,7 +97,7 @@ export async function readSettledTraceFeed(
       // The worker is about to publish this newer snapshot; wait for it.
       return blockedPage;
     }
-    entries.push({ cursor, trace });
+    entries.push({ cursor, trace, version: activity.traceVersion });
   }
   return { entries, blocked: false, hasMore: activities.length > input.limit };
 }

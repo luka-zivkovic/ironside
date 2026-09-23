@@ -276,7 +276,12 @@ export const otlpForwardRuleSchema = z.object({
   filter: traceFilterSchema,
   enabled: z.boolean(),
   pollIntervalSeconds: z.number().int().positive(),
-  nextRunAt: z.string()
+  nextRunAt: z.string(),
+  lastRunAt: z.string().nullable(),
+  lastRunStatus: z.enum(["success", "error"]).nullable(),
+  /** Why the last run stopped, or which traces the destination permanently rejected and were skipped. */
+  lastRunError: z.string().nullable(),
+  lastRunForwardedCount: z.number().int().nonnegative().nullable()
 });
 export type OtlpForwardRuleResponse = z.infer<typeof otlpForwardRuleSchema>;
 

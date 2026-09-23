@@ -7,6 +7,7 @@ import { createClickHouseClient, runMigrations as runChMigrations } from "@irons
 import {
   createExportConfig,
   getExportConfig,
+  recordExportRun,
   runMigrations as runPgMigrations,
   type ExportConfig,
   type ExportFilter,
@@ -19,7 +20,7 @@ import { ulid } from "ulid";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.js";
 import { runExport } from "../src/exporters/export-runner.js";
-import { insertPublishedTrace } from "./support/published-traces.js";
+import { insertPublishedScores, insertPublishedTrace } from "./support/published-traces.js";
 
 // End-to-end: traces published to the durable feed -> runExport -> real
 // DuckDB/JSONL files -> real MinIO upload -> downloaded back and read with a
@@ -217,32 +218,120 @@ describe("runExport", () => {
     const lines = (await (await s3.send(
       new GetObjectCommand({ Bucket: BUCKET, Key: result!.objectKeys[0]! })
     )).Body!.transformToString()).trim().split("\n").map((line) => JSON.parse(line));
-    expect(lines).toEqual([{ type: "trace-upsert", body: expect.objectContaining({ id: laterId }) }]);
+    expect(lines).toEqual([
+      { type: "trace-upsert", body: expect.objectContaining({ id: laterId }), traceVersion: expect.any(String) }
+    ]);
   });
 
-  it("exports a trace again, as a new version, when it gets new activity", async () => {
+  it("exports a trace again, as a higher version, when it gets new activity", async () => {
     const projectId = await newProject();
     const traceId = `trace_${ulid()}`;
-    const firstVersion = await insertPublishedTrace(
+    await insertPublishedTrace(
       { pool, clickhouse },
       { trace: trace(projectId, traceId), receivedAt: new Date(Date.now() - 60_000).toISOString() }
     );
     const exportConfig = await newExportConfig(projectId);
-    await run(exportConfig);
+    const first = await run(exportConfig);
 
-    const secondVersion = await insertPublishedTrace(
+    await insertPublishedTrace(
       { pool, clickhouse },
       { trace: trace(projectId, traceId, { output: { answer: "later" } }) }
+    );
+    const second = await run(exportConfig);
+
+    expect(second?.rowCount).toBe(1);
+    const versionSql = "select id, output, epoch_us(trace_version) as version from {file}";
+    const [before] = await parquetRows(first!.objectKeys[0]!, versionSql);
+    const [after] = await parquetRows(second!.objectKeys[0]!, versionSql);
+    expect(after).toMatchObject({ id: traceId, output: '{"answer":"later"}' });
+    expect(BigInt(after!.version as string) > BigInt(before!.version as string)).toBe(true);
+  });
+
+  it("gives a late batch's re-export a higher version even though its receive time is older", async () => {
+    const projectId = await newProject();
+    const traceId = `trace_${ulid()}`;
+    await insertPublishedTrace({ pool, clickhouse }, { trace: trace(projectId, traceId) });
+    const exportConfig = await newExportConfig(projectId);
+    const first = await run(exportConfig);
+
+    // Received before the first batch, but written after it was exported.
+    await insertPublishedTrace(
+      { pool, clickhouse },
+      {
+        trace: trace(projectId, traceId),
+        observations: [generation(projectId, traceId, `gen_${ulid()}`)],
+        receivedAt: new Date(Date.now() - 3_600_000).toISOString()
+      }
+    );
+    const second = await run(exportConfig);
+
+    const versionSql = "select epoch_us(trace_version) as version from {file}";
+    const [before] = await parquetRows(first!.objectKeys[0]!, versionSql);
+    const [after] = await parquetRows(second!.objectKeys[0]!, versionSql);
+    expect(BigInt(after!.version as string) > BigInt(before!.version as string)).toBe(true);
+    const observationsKey = second!.objectKeys.find((key) => key.includes("/observations/"))!;
+    expect(await parquetRows(observationsKey, "select count(*) as n from {file}")).toEqual([{ n: "1" }]);
+  });
+
+  it("sends a score added after its trace was exported, without re-sending the trace", async () => {
+    const projectId = await newProject();
+    const traceId = `trace_${ulid()}`;
+    await insertPublishedTrace({ pool, clickhouse }, { trace: trace(projectId, traceId) });
+    const exportConfig = await newExportConfig(projectId, { format: "jsonl" });
+    await run(exportConfig);
+
+    const scoreId = `score_${ulid()}`;
+    await insertPublishedScores(
+      { pool, clickhouse },
+      {
+        projectId,
+        scores: [
+          {
+            id: scoreId,
+            projectId,
+            traceId,
+            name: "evaluator-verdict",
+            dataType: "numeric",
+            value: 0.8,
+            source: "eval",
+            timestamp: new Date().toISOString(),
+            metadata: {}
+          }
+        ]
+      }
     );
     const result = await run(exportConfig);
 
     expect(result?.rowCount).toBe(1);
-    const [row] = await parquetRows(
-      result!.objectKeys[0]!,
-      "select id, output, strftime(trace_version at time zone 'UTC', '%Y-%m-%dT%H:%M:%S.%gZ') as version from {file}"
-    );
-    expect(row).toEqual({ id: traceId, output: '{"answer":"later"}', version: secondVersion });
-    expect(secondVersion > firstVersion).toBe(true);
+    const lines = (await (await s3.send(
+      new GetObjectCommand({ Bucket: BUCKET, Key: result!.objectKeys[0]! })
+    )).Body!.transformToString()).trim().split("\n").map((line) => JSON.parse(line));
+    expect(lines).toEqual([
+      {
+        type: "score-upsert",
+        body: expect.objectContaining({ id: scoreId, traceId, value: 0.8 }),
+        traceVersion: expect.any(String)
+      }
+    ]);
+    expect(await run(exportConfig)).toBeNull();
+  });
+
+  it("does not move a feed position back when a slower duplicate run records after a newer one", async () => {
+    const projectId = await newProject();
+    await insertPublishedTrace({ pool, clickhouse }, { trace: trace(projectId, `trace_${ulid()}`) });
+    const exportConfig = await newExportConfig(projectId);
+    await run(exportConfig);
+    const advanced = (await getExportConfig(pool, projectId, exportConfig.id))!.feedCursor;
+
+    // A second replica that claimed the same config earlier, starting from
+    // the original position, finishes later with an older position.
+    await recordExportRun(pool, exportConfig.id, {
+      status: "success",
+      rowCount: 0,
+      feedCursor: { from: null, to: { publishedAt: "2000-01-01T00:00:00.000000Z", traceId: "stale" } }
+    });
+
+    expect((await getExportConfig(pool, projectId, exportConfig.id))?.feedCursor).toEqual(advanced);
   });
 
   it("still exports a batch the worker wrote after the previous run had passed its receive time", async () => {

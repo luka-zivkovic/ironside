@@ -12,8 +12,17 @@ export interface ExportedTrace {
   trace: Trace;
   observations: Observation[];
   scores: Score[];
-  /** Server-owned snapshot version: the trace's latest trace/observation activity. */
+  /** The trace feed's version for this snapshot (SettledFeedEntry.version). */
   traceVersion: string;
+}
+
+/** A complete trace as loaded, before it is matched to its feed entry. */
+export interface LoadedTrace {
+  trace: Trace;
+  observations: Observation[];
+  scores: Score[];
+  /** ClickHouse's latest trace/observation activity, compared with the feed entry to detect a change since the read. */
+  activityVersion: string;
 }
 
 /**
@@ -24,20 +33,20 @@ export async function loadExportedTraces(
   clickhouse: ClickHouseClient,
   projectId: string,
   traceIds: string[]
-): Promise<Map<string, ExportedTrace>> {
+): Promise<Map<string, LoadedTrace>> {
   if (traceIds.length === 0) return new Map();
   const [traces, observations, scores] = await Promise.all([
     getVersionedTraces(clickhouse, projectId, traceIds),
     listObservationsForTraces(clickhouse, projectId, traceIds),
     listScoresForTraces(clickhouse, projectId, traceIds)
   ]);
-  const loaded = new Map<string, ExportedTrace>();
+  const loaded = new Map<string, LoadedTrace>();
   for (const [traceId, row] of traces) {
     loaded.set(traceId, {
       trace: traceFromStoredRow(projectId, row),
       observations: [],
       scores: [],
-      traceVersion: row.trace_version
+      activityVersion: row.trace_version
     });
   }
   for (const row of observations) {

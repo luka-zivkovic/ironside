@@ -1,5 +1,5 @@
 import { listObservationsForTraces, type ClickHouseClient, type ObservationRow } from "@ironside/clickhouse";
-import { recordOtlpForwardProgress, type OtlpForwardRule } from "@ironside/db";
+import { recordOtlpForwardRun, type OtlpForwardRule } from "@ironside/db";
 import { buildObservationTree } from "@ironside/mappers";
 import { traceSettledBefore } from "@ironside/shared";
 import type { Pool } from "pg";
@@ -13,6 +13,8 @@ const FEED_PAGE_SIZE = 100;
 const MAX_TRACES_PER_RUN = 5_000;
 /** Feed entries examined per run, which bounds a run whose filter matches few traces. */
 const MAX_FEED_ENTRIES_PER_RUN = 100_000;
+/** One unresponsive destination must not hold the scheduler tick, which runs every subsystem in turn. */
+const REQUEST_TIMEOUT_MS = 30_000;
 
 export interface ForwardOtlpOptions {
   pool: Pool;
@@ -25,23 +27,36 @@ export interface ForwardOtlpOptions {
   allowPrivateDestinations?: boolean;
   /** Project-effective quiet period used to exclude in-flight traces. */
   traceQuietPeriodSeconds: number;
+  /** Per-request timeout; tests shorten it. Default 30 s. */
+  requestTimeoutMs?: number;
 }
 
 export interface ForwardOtlpResult {
   matched: number;
   forwarded: number;
-  /** The trace the destination rejected, which stopped the run; empty when every matched trace was accepted. */
-  failed: { traceId: string; error: string }[];
+  /**
+   * Traces the destination did not accept. A permanent rejection (4xx other
+   * than 408/429) is `skipped`: the run steps over that trace and continues.
+   * Any other failure stops the run before the trace, which is retried next run.
+   */
+  failed: { traceId: string; error: string; skipped: boolean }[];
+}
+
+/** A 4xx other than 408/429 will fail the same way on every retry. */
+function isPermanentRejection(status: number): boolean {
+  return status >= 400 && status < 500 && status !== 408 && status !== 429;
 }
 
 /**
  * Forwards settled trace versions published after the rule's feed position
  * to its destination, one OTLP/HTTP+JSON export request per trace, in feed
  * order (spec/otlp-forwarding-v1.md). The position advances past each trace
- * the destination accepts. The first rejected request stops the run with the
- * position still before that trace, so an unreachable destination delays
- * delivery instead of skipping traces. Delivery is at-least-once: OTLP ids
- * are derived deterministically, so a resent trace is the same trace
+ * the destination accepts. A timeout, network error, 408, 429, or 5xx stops
+ * the run with the position before that trace, so an unreachable destination
+ * delays delivery instead of skipping traces. A permanent rejection (any
+ * other 4xx) skips that one trace so it cannot block the rule for good. Every
+ * run records its status on the rule. Delivery is at-least-once, and because
+ * OTLP ids are derived deterministically a resent trace is the same trace
  * downstream.
  *
  * `rule.destinationUrl` is customer-supplied, so before sending anything
@@ -58,20 +73,19 @@ export async function forwardOtlpTraces(options: ForwardOtlpOptions): Promise<Fo
   }
 
   let cursor = rule.feedCursor;
-  let matched = 0;
-  let forwarded = 0;
-  let examined = 0;
   let backlog = false;
-  const failed: ForwardOtlpResult["failed"] = [];
+  let runError: unknown;
+  const result: ForwardOtlpResult = { matched: 0, forwarded: 0, failed: [] };
   try {
-    for (;;) {
+    let examined = 0;
+    read: for (;;) {
       const page = await readSettledTraceFeed(
         { pool, clickhouse },
         {
           projectId: rule.projectId,
           cursor,
           settledBefore,
-          limit: Math.min(FEED_PAGE_SIZE, MAX_TRACES_PER_RUN - forwarded)
+          limit: Math.min(FEED_PAGE_SIZE, MAX_TRACES_PER_RUN - result.forwarded)
         }
       );
       const wanted = page.entries.flatMap((entry) =>
@@ -83,55 +97,77 @@ export async function forwardOtlpTraces(options: ForwardOtlpOptions): Promise<Fo
 
       for (const entry of page.entries) {
         if (entry.trace && matchesExportFilter(entry.trace, rule.filter)) {
-          matched += 1;
+          result.matched += 1;
           const trace = entry.trace;
-          try {
-            const response = await fetchImpl(rule.destinationUrl, {
-              method: "POST",
-              headers: {
-                "content-type": "application/json",
-                ...(options.destinationAuthHeader && { authorization: options.destinationAuthHeader })
-              },
-              body: JSON.stringify(
-                mapTraceToOtlpExportRequest({
-                  id: trace.id,
-                  timestamp: trace.timestamp,
-                  name: trace.name,
-                  observations: buildObservationTree(observationsByTrace.get(trace.id) ?? [])
-                })
-              )
-            });
-            await response.body?.cancel().catch(() => {});
-            if (!response.ok) {
-              throw new Error(`destination responded HTTP ${response.status}`);
-            }
-          } catch (error) {
-            failed.push({
-              traceId: trace.id,
-              error: error instanceof Error ? error.message : String(error)
-            });
-            return { matched, forwarded, failed };
+          const outcome = await sendTrace(fetchImpl, rule, options, {
+            id: trace.id,
+            timestamp: trace.timestamp,
+            name: trace.name,
+            observations: buildObservationTree(observationsByTrace.get(trace.id) ?? [])
+          });
+          if (outcome.error !== undefined) {
+            result.failed.push({ traceId: trace.id, error: outcome.error, skipped: outcome.permanent });
+            if (!outcome.permanent) break read;
+          } else {
+            result.forwarded += 1;
           }
-          forwarded += 1;
         }
         cursor = entry.cursor;
       }
       examined += page.entries.length;
 
       if (page.blocked || !page.hasMore) break;
-      if (forwarded >= MAX_TRACES_PER_RUN || examined >= MAX_FEED_ENTRIES_PER_RUN) {
+      if (result.forwarded >= MAX_TRACES_PER_RUN || examined >= MAX_FEED_ENTRIES_PER_RUN) {
         backlog = true;
         break;
       }
     }
-    return { matched, forwarded, failed };
+    return result;
+  } catch (error) {
+    runError = error;
+    throw error;
   } finally {
-    // Also on a rejected trace: keep the progress made before it.
-    const moved =
-      cursor?.publishedAt !== rule.feedCursor?.publishedAt || cursor?.traceId !== rule.feedCursor?.traceId;
-    if (moved || backlog) {
-      await recordOtlpForwardProgress(pool, rule.id, { feedCursor: cursor, runAgainSoon: backlog });
-    }
+    // Also on failure: keep the progress made before it.
+    const errors = [
+      ...result.failed.map((failure) =>
+        `${failure.traceId}${failure.skipped ? " (skipped)" : ""}: ${failure.error}`
+      ),
+      ...(runError === undefined ? [] : [runError instanceof Error ? runError.message : String(runError)])
+    ];
+    await recordOtlpForwardRun(pool, rule.id, {
+      status: errors.length > 0 ? "error" : "success",
+      ...(errors.length > 0 && { error: errors.join("; ").slice(0, 2_000) }),
+      forwarded: result.forwarded,
+      feedCursor: { from: rule.feedCursor, to: cursor },
+      runAgainSoon: backlog
+    });
+  }
+}
+
+async function sendTrace(
+  fetchImpl: typeof fetch,
+  rule: OtlpForwardRule,
+  options: Pick<ForwardOtlpOptions, "destinationAuthHeader" | "requestTimeoutMs">,
+  trace: Parameters<typeof mapTraceToOtlpExportRequest>[0]
+): Promise<{ error?: undefined } | { error: string; permanent: boolean }> {
+  try {
+    const response = await fetchImpl(rule.destinationUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(options.destinationAuthHeader && { authorization: options.destinationAuthHeader })
+      },
+      body: JSON.stringify(mapTraceToOtlpExportRequest(trace)),
+      signal: AbortSignal.timeout(options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS)
+    });
+    await response.body?.cancel().catch(() => {});
+    if (response.ok) return {};
+    return {
+      error: `destination responded HTTP ${response.status}`,
+      permanent: isPermanentRejection(response.status)
+    };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error), permanent: false };
   }
 }
 

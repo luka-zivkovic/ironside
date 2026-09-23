@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DuckDBInstance } from "@duckdb/node-api";
 import type { ExportFormat } from "@ironside/db";
+import type { Score } from "@ironside/shared";
 import type { ExportedTrace } from "./exported-traces.js";
 
 // Stages exported traces on local disk while a run pages through the feed,
@@ -11,7 +12,8 @@ import type { ExportedTrace } from "./exported-traces.js";
 // - jsonl: native ingest events, one per line — trace-upsert, then that
 //   trace's observation-upserts and score-upserts. Bodies are domain objects
 //   without projectId, so lines POST straight back to /api/v1/ingest
-//   ({"events": [...]}, up to 500 per request) on any Ironside.
+//   ({"events": [...]}, up to 500 per request) on any Ironside; the API
+//   ignores each line's extra traceVersion, which orders snapshots.
 // - parquet: one file per table under traces/, observations/, and scores/,
 //   so a warehouse external table can point at each folder. Columns use
 //   explicit DuckDB types rather than inference, so every run writes the same
@@ -50,7 +52,8 @@ const TABLE_COLUMNS: Record<Table, Record<string, string>> = {
     model_parameters: "MAP(VARCHAR, VARCHAR)",
     input: "VARCHAR",
     output: "VARCHAR",
-    usage_details: "MAP(VARCHAR, BIGINT)",
+    // ClickHouse stores usage as UInt64; BIGINT would reject values above 2^63.
+    usage_details: "MAP(VARCHAR, UBIGINT)",
     cost_details: "MAP(VARCHAR, DOUBLE)",
     metadata: "MAP(VARCHAR, VARCHAR)",
     trace_version: "TIMESTAMPTZ"
@@ -102,13 +105,28 @@ export class ExportStaging {
     for (const exported of traces) {
       lines.traces.push(jsonLine(traceRow(exported)));
       lines.observations.push(...exported.observations.map((o) => jsonLine(observationRow(o, exported))));
-      lines.scores.push(...exported.scores.map((s) => jsonLine(scoreRow(s, exported))));
+      lines.scores.push(...exported.scores.map((s) => jsonLine(scoreRow(s, exported.traceVersion))));
     }
     for (const table of TABLES) {
       if (lines[table].length === 0) continue;
       await appendFile(this.stagedPath(table), lines[table].join(""));
       this.rowCounts[table] += lines[table].length;
     }
+  }
+
+  /** Scores re-sent on their own because they changed after their trace was exported. */
+  async appendScores(entries: { scores: Score[]; traceVersion: string }[]): Promise<void> {
+    const lines = entries.flatMap(({ scores, traceVersion }) =>
+      scores.map((score) =>
+        this.format === "jsonl"
+          ? jsonLine({ type: "score-upsert", body: withoutProjectId(score), traceVersion })
+          : jsonLine(scoreRow(score, traceVersion))
+      )
+    );
+    if (lines.length === 0) return;
+    const target = this.format === "jsonl" ? "events" : "scores";
+    await appendFile(this.stagedPath(target), lines.join(""));
+    if (target === "scores") this.rowCounts.scores += lines.length;
   }
 
   /** Produces the files to upload; `runName` is unique per run, such as export-<timestamp>. */
@@ -152,11 +170,11 @@ export class ExportStaging {
   }
 }
 
-function ingestEventLines(exported: ExportedTrace): string[] {
+function ingestEventLines({ trace, observations, scores, traceVersion }: ExportedTrace): string[] {
   return [
-    jsonLine({ type: "trace-upsert", body: withoutProjectId(exported.trace) }),
-    ...exported.observations.map((o) => jsonLine({ type: "observation-upsert", body: withoutProjectId(o) })),
-    ...exported.scores.map((s) => jsonLine({ type: "score-upsert", body: withoutProjectId(s) }))
+    jsonLine({ type: "trace-upsert", body: withoutProjectId(trace), traceVersion }),
+    ...observations.map((o) => jsonLine({ type: "observation-upsert", body: withoutProjectId(o), traceVersion })),
+    ...scores.map((s) => jsonLine({ type: "score-upsert", body: withoutProjectId(s), traceVersion }))
   ];
 }
 
@@ -214,7 +232,7 @@ function observationRow(
   };
 }
 
-function scoreRow(score: ExportedTrace["scores"][number], { traceVersion }: ExportedTrace): Record<string, unknown> {
+function scoreRow(score: Score, traceVersion: string): Record<string, unknown> {
   return {
     id: score.id,
     trace_id: score.traceId,

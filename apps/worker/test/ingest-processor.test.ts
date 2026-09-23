@@ -14,6 +14,7 @@ import {
   createRawRetentionIntents,
   listProjectEnvironments,
   listIngestFailures,
+  listTraceScoreActivities,
   markEvaluatorScoreReceiptStaged,
   publishEvaluatorTraceActivities,
   runMigrations as runPgMigrations
@@ -716,5 +717,47 @@ describe("LangFuse create and update in separate requests", () => {
     expect(JSON.parse(generation?.output ?? "null")).toEqual({ text: "hello" });
     // Model from the create plus usage from the update is enough to derive cost.
     expect(generation?.cost_details.total).toBeCloseTo(0.0000325, 9);
+  });
+});
+
+describe("score feed publication", () => {
+  it("moves the score feed only for traces a batch touched with scores alone", async () => {
+    const scoredOnly = `trace_${ulid()}`;
+    const withActivity = `trace_${ulid()}`;
+    const now = new Date().toISOString();
+    const score = (traceId: string): IngestBatch["events"][number] => ({
+      id: ulid(),
+      type: "score-upsert",
+      source: "native",
+      schemaVersion: INGEST_SCHEMA_VERSION,
+      idempotencyKey: ulid(),
+      body: { id: `score_${ulid()}`, traceId, name: "helpful", dataType: "numeric", value: 1, source: "api", metadata: {} }
+    });
+    const batch: IngestBatch = {
+      batchId: ulid(),
+      projectId,
+      receivedAt: now,
+      events: [
+        {
+          id: ulid(),
+          type: "trace-upsert",
+          source: "native",
+          schemaVersion: INGEST_SCHEMA_VERSION,
+          idempotencyKey: ulid(),
+          body: { id: withActivity, timestamp: now }
+        },
+        score(withActivity),
+        score(scoredOnly)
+      ]
+    };
+    const job = await storeAndEnqueue(batch);
+    await processBatch(job);
+    await job.remove();
+
+    const published = (await listTraceScoreActivities(pool, { projectId, limit: 1_000 })).map(
+      (entry) => entry.traceId
+    );
+    expect(published).toContain(scoredOnly);
+    expect(published).not.toContain(withActivity);
   });
 });

@@ -4,7 +4,7 @@ import {
   insertTraces,
   type ClickHouseClient
 } from "@ironside/clickhouse";
-import { publishEvaluatorTraceActivities } from "@ironside/db";
+import { publishEvaluatorTraceActivities, publishTraceScoreActivity } from "@ironside/db";
 import type { Observation, Score, Trace } from "@ironside/shared";
 import type { Pool } from "pg";
 import { ulid } from "ulid";
@@ -30,4 +30,20 @@ export async function insertPublishedTrace(
     activityId: `batch_${ulid()}`
   });
   return receivedAt;
+}
+
+/**
+ * Writes scores the way the ingest worker materializes a batch that carries
+ * only scores: rows first, then the score feed, since the trace feed must not
+ * move for annotations.
+ */
+export async function insertPublishedScores(
+  deps: { pool: Pool; clickhouse: ClickHouseClient },
+  input: { projectId: string; scores: Score[]; receivedAt?: string }
+): Promise<void> {
+  await insertScores(deps.clickhouse, input.scores, { eventTs: input.receivedAt ?? new Date().toISOString() });
+  await publishTraceScoreActivity(deps.pool, {
+    projectId: input.projectId,
+    traceIds: input.scores.map((score) => score.traceId)
+  });
 }

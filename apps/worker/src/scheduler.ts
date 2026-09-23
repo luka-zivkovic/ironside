@@ -122,7 +122,7 @@ export function startScheduler(options: SchedulerOptions): Scheduler {
     const due = await claimDueOtlpForwardRules(options.pool, claimBatchSize);
     for (const rule of due) {
       try {
-        await forwardOtlpTraces({
+        const result = await forwardOtlpTraces({
           pool: options.pool,
           clickhouse: options.clickhouse,
           rule,
@@ -131,7 +131,19 @@ export function startScheduler(options: SchedulerOptions): Scheduler {
             destinationAuthHeader: decryptSecret(rule.destinationAuthHeaderEncrypted)
           })
         });
-        onRunOutcome("otlp-forward", "success");
+        if (result.failed.length > 0) {
+          // The rule's last_run_error has the detail; surface it in logs and metrics too.
+          onError(
+            "otlp-forward",
+            new Error(
+              `rule ${rule.id}: destination did not accept ${result.failed.length} trace(s): ` +
+                result.failed.map((failure) => `${failure.traceId}: ${failure.error}`).join("; ")
+            )
+          );
+          onRunOutcome("otlp-forward", "error");
+        } else {
+          onRunOutcome("otlp-forward", "success");
+        }
       } catch (error) {
         onError("otlp-forward", error);
         onRunOutcome("otlp-forward", "error");

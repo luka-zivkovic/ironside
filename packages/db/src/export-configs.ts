@@ -41,6 +41,8 @@ export interface ExportConfig {
   nextRunAt: Date;
   /** Null until the first run exports anything; the next run starts at the beginning of the feed. */
   feedCursor: DestinationFeedCursor | null;
+  /** Position in trace_score_feed: scores that changed after their trace was exported. */
+  scoreFeedCursor: DestinationFeedCursor | null;
 }
 
 interface ExportConfigRow {
@@ -64,12 +66,18 @@ interface ExportConfigRow {
   next_run_at: Date;
   feed_cursor_published_at: Date | null;
   feed_cursor_trace_id: string | null;
+  score_cursor_trace_id: string | null;
+  score_cursor_published_at_text?: string | null;
 }
 
 /** Microsecond ISO, the precision evaluator_trace_feed.published_at carries; Date would truncate it to milliseconds. */
 export const FEED_CURSOR_COLUMNS = `
   to_char(feed_cursor_published_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
     as feed_cursor_published_at_text`;
+
+const EXPORT_CURSOR_COLUMNS = `${FEED_CURSOR_COLUMNS},
+  to_char(score_cursor_published_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+    as score_cursor_published_at_text`;
 
 export function feedCursorFromRow(row: {
   feed_cursor_published_at_text?: string | null;
@@ -100,7 +108,11 @@ function fromRow(row: ExportConfigRow & { feed_cursor_published_at_text?: string
     lastRunRowCount: row.last_run_row_count === null ? null : Number(row.last_run_row_count),
     pollIntervalSeconds: row.poll_interval_seconds,
     nextRunAt: row.next_run_at,
-    feedCursor: feedCursorFromRow(row)
+    feedCursor: feedCursorFromRow(row),
+    scoreFeedCursor:
+      row.score_cursor_published_at_text && row.score_cursor_trace_id !== null
+        ? { publishedAt: row.score_cursor_published_at_text, traceId: row.score_cursor_trace_id }
+        : null
   };
 }
 
@@ -129,7 +141,7 @@ export async function createExportConfig(
        destination_endpoint, destination_region, destination_access_key_id,
        destination_secret_access_key_encrypted
      ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-     returning *, ${FEED_CURSOR_COLUMNS}`,
+     returning *, ${EXPORT_CURSOR_COLUMNS}`,
     [
       input.id,
       input.projectId,
@@ -155,7 +167,7 @@ export async function getExportConfig(
   id: string
 ): Promise<ExportConfig | null> {
   const result = await pool.query<ExportConfigRow>(
-    `select *, ${FEED_CURSOR_COLUMNS} from export_configs where project_id = $1 and id = $2`,
+    `select *, ${EXPORT_CURSOR_COLUMNS} from export_configs where project_id = $1 and id = $2`,
     [projectId, id]
   );
   const row = result.rows[0];
@@ -164,7 +176,7 @@ export async function getExportConfig(
 
 export async function listExportConfigs(pool: Pool, projectId: string): Promise<ExportConfig[]> {
   const result = await pool.query<ExportConfigRow>(
-    `select *, ${FEED_CURSOR_COLUMNS} from export_configs where project_id = $1 order by created_at asc`,
+    `select *, ${EXPORT_CURSOR_COLUMNS} from export_configs where project_id = $1 order by created_at asc`,
     [projectId]
   );
   return result.rows.map(fromRow);
@@ -172,7 +184,7 @@ export async function listExportConfigs(pool: Pool, projectId: string): Promise<
 
 export async function listEnabledExportConfigs(pool: Pool): Promise<ExportConfig[]> {
   const result = await pool.query<ExportConfigRow>(
-    `select *, ${FEED_CURSOR_COLUMNS} from export_configs where enabled = true order by id asc`
+    `select *, ${EXPORT_CURSOR_COLUMNS} from export_configs where enabled = true order by id asc`
   );
   return result.rows.map(fromRow);
 }
@@ -195,7 +207,7 @@ export async function updateExportConfig(
          poll_interval_seconds = coalesce($4, poll_interval_seconds),
          updated_at = now()
      where id = $1 and project_id = $2
-     returning *, ${FEED_CURSOR_COLUMNS}`,
+     returning *, ${EXPORT_CURSOR_COLUMNS}`,
     [id, projectId, input.enabled ?? null, input.pollIntervalSeconds ?? null]
   );
   const row = result.rows[0];
@@ -236,7 +248,7 @@ export async function claimDueExportConfigs(
        limit $1
        for update skip locked
      )
-     returning *, ${FEED_CURSOR_COLUMNS}`,
+     returning *, ${EXPORT_CURSOR_COLUMNS}`,
     [limit]
   );
   return result.rows.map(fromRow);
@@ -244,9 +256,12 @@ export async function claimDueExportConfigs(
 
 /**
  * Records a run's outcome. A successful run also stores how far it read the
- * trace feed; a failed one leaves the position alone so the next run sends
- * the same traces again. `runAgainSoon` makes the next scheduler tick
- * continue a backlog the run stopped short of.
+ * trace and score feeds; a failed one leaves both positions alone so the next
+ * run sends the same traces again. A position is stored only if it still
+ * holds the value the run started from: with several worker replicas, a slow
+ * run can be claimed twice, and the later-finishing run must not move the
+ * position back. `runAgainSoon` makes the next scheduler tick continue a
+ * backlog the run stopped short of.
  */
 export async function recordExportRun(
   pool: Pool,
@@ -255,18 +270,22 @@ export async function recordExportRun(
     status: ExportRunStatus;
     error?: string;
     rowCount?: number;
-    feedCursor?: DestinationFeedCursor | null;
+    feedCursor?: { from: DestinationFeedCursor | null; to: DestinationFeedCursor | null };
+    scoreFeedCursor?: { from: DestinationFeedCursor | null; to: DestinationFeedCursor | null };
     runAgainSoon?: boolean;
   }
 ): Promise<void> {
-  const updateCursor = outcome.feedCursor !== undefined;
+  const feed = outcome.feedCursor;
+  const scores = outcome.scoreFeedCursor;
   await pool.query(
     `update export_configs
      set last_run_at = now(), last_run_status = $2, last_run_error = $3,
          last_run_row_count = $4,
-         feed_cursor_published_at = case when $5 then $6::timestamptz else feed_cursor_published_at end,
-         feed_cursor_trace_id = case when $5 then $7::text else feed_cursor_trace_id end,
-         next_run_at = case when $8 then now() else next_run_at end,
+         feed_cursor_published_at = case when $5 and ${unchanged("feed", 6)} then $8::timestamptz else feed_cursor_published_at end,
+         feed_cursor_trace_id = case when $5 and ${unchanged("feed", 6)} then $9::text else feed_cursor_trace_id end,
+         score_cursor_published_at = case when $10 and ${unchanged("score", 11)} then $13::timestamptz else score_cursor_published_at end,
+         score_cursor_trace_id = case when $10 and ${unchanged("score", 11)} then $14::text else score_cursor_trace_id end,
+         next_run_at = case when $15 then now() else next_run_at end,
          updated_at = now()
      where id = $1`,
     [
@@ -274,10 +293,23 @@ export async function recordExportRun(
       outcome.status,
       outcome.error ?? null,
       outcome.rowCount ?? null,
-      updateCursor,
-      outcome.feedCursor?.publishedAt ?? null,
-      outcome.feedCursor?.traceId ?? null,
+      feed !== undefined,
+      feed?.from?.publishedAt ?? null,
+      feed?.from?.traceId ?? null,
+      feed?.to?.publishedAt ?? null,
+      feed?.to?.traceId ?? null,
+      scores !== undefined,
+      scores?.from?.publishedAt ?? null,
+      scores?.from?.traceId ?? null,
+      scores?.to?.publishedAt ?? null,
+      scores?.to?.traceId ?? null,
       outcome.runAgainSoon ?? false
     ]
   );
+}
+
+/** SQL that is true while the stored cursor still equals the parameters at $n and $n+1. */
+function unchanged(kind: "feed" | "score", n: number): string {
+  return `${kind}_cursor_published_at is not distinct from $${n}::timestamptz
+    and ${kind}_cursor_trace_id is not distinct from $${n + 1}::text`;
 }

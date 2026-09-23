@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { DuckDBInstance } from "@duckdb/node-api";
 import { mapNativeEvents } from "@ironside/mappers";
-import { INGEST_SCHEMA_VERSION, type IngestEvent } from "@ironside/shared";
+import { INGEST_SCHEMA_VERSION, ingestRequestSchema, type IngestEvent } from "@ironside/shared";
 import { afterEach, describe, expect, it } from "vitest";
 import { ExportStaging } from "../src/exporters/duckdb-writer.js";
 import type { ExportedTrace } from "../src/exporters/exported-traces.js";
@@ -101,6 +101,9 @@ describe("ExportStaging — JSONL", () => {
       "observation-upsert"
     ]);
     expect(lines.every((line) => !("projectId" in line.body))).toBe(true);
+    expect(lines.every((line) => line.traceVersion === "2026-09-23T10:00:03.500Z")).toBe(true);
+    // The API accepts the lines as they are, ignoring traceVersion.
+    expect(ingestRequestSchema.safeParse({ events: lines }).success).toBe(true);
 
     // Replaying the file into a project goes through the same mapper as
     // POST /api/v1/ingest.
@@ -142,7 +145,7 @@ describe("ExportStaging — Parquet", () => {
     });
     const observationTypes = await query(`describe select * from read_parquet('${observations!.path}')`);
     expect(Object.fromEntries(observationTypes.map((row) => [row.column_name, row.column_type]))).toMatchObject({
-      usage_details: "MAP(VARCHAR, BIGINT)",
+      usage_details: "MAP(VARCHAR, UBIGINT)",
       cost_details: "MAP(VARCHAR, DOUBLE)",
       model_parameters: "MAP(VARCHAR, VARCHAR)"
     });
@@ -168,6 +171,21 @@ describe("ExportStaging — Parquet", () => {
         from read_parquet('${observations!.path}')`)
     ).toEqual([{ trace_id: "trace_a", input_tokens: "5", total_cost: 0.0000325, model: "gpt-4o" }]);
     expect(await query(`select count(*) as n from read_parquet('${scores!.path}')`)).toEqual([{ n: "1" }]);
+  });
+
+  it("accepts token counts up to ClickHouse's UInt64 range, which BIGINT rejects above 2^63", async () => {
+    const parquet = await staging("parquet");
+    const huge = exportedTrace("trace_a");
+    huge.observations = huge.observations.map((observation) => ({
+      ...observation,
+      usageDetails: { input_tokens: 1e19 }
+    }));
+    await parquet.append([huge]);
+    const [, observations] = await parquet.finish("export-run");
+
+    expect(
+      await query(`select usage_details['input_tokens'] as n from read_parquet('${observations!.path}')`)
+    ).toEqual([{ n: "10000000000000000000" }]);
   });
 
   it("keeps the same schema when every map in a run is empty, and skips a table with no rows", async () => {
