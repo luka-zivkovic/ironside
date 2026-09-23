@@ -1,0 +1,25 @@
+{
+  "name": "ironside",
+  "description": "Ironside — keep your AI traces in a store you control, understand what happened, and take the data anywhere.",
+  "owner": {
+    "name": "Luka Zivkovic"
+  },
+  "plugins": [
+    {
+      "name": "ironside",
+      "source": "./plugins/ironside",
+      "description": "Install a local Ironside trace store with a coding agent. One skill checks Git, Docker Compose v2, and port collisions, starts the Compose stack, verifies service health, guides owner setup and project creation, then instruments an application with the Node SDK or OTLP and confirms one trace in the viewer. Setup codes and credentials stay out of chat and Git; existing data and services are preserved.",
+      "version": "0.2.0",
+      "category": "development",
+      "keywords": [
+        "tracing",
+        "observability",
+        "llm",
+        "opentelemetry",
+        "self-hosted",
+        "docker",
+        "setup"
+      ]
+    }
+  ]
+}

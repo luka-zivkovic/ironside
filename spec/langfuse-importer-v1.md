@@ -52,4 +52,4 @@ Full-data conformance against the real account (same isolated project, cleared f
 
 ## Not yet done (follow-up, not blocking M5-02's DoD)
 
-~~No scheduler, cron, or API-triggered route~~ — **done since**: import source credentials + scheduling in M5-07 (spec/import-source-scheduling-v1.md); a periodic worker tick claims due sources and calls `runLangfuseImport`, exactly the coeval-poller-style pattern this note anticipated.
+~~No scheduler, cron, or API-triggered route~~ — **done since**: import source credentials + scheduling in M5-07 (spec/import-source-scheduling-v1.md); a periodic worker tick claims due sources and calls `runLangfuseImport`, exactly the rubrist-poller-style pattern this note anticipated.

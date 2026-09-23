@@ -172,9 +172,12 @@ describe("startScheduler", () => {
       onError: (subsystem, error) => errors.push({ subsystem, error })
     });
 
+    // runExport records the "error" status itself before throwing, and the
+    // scheduler awaits a second bookkeeping write before calling onError, so
+    // the status can be visible before the callback has fired. Wait for both.
     await waitFor(async () => {
       const updated = await getExportConfig(pool, projectId, exportConfig.id);
-      return updated?.lastRunStatus === "error";
+      return updated?.lastRunStatus === "error" && errors.some((e) => e.subsystem === "export");
     });
 
     const finalConfig = await getExportConfig(pool, projectId, exportConfig.id);

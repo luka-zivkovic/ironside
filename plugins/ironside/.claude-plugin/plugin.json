@@ -1,0 +1,19 @@
+{
+  "name": "ironside",
+  "displayName": "Ironside",
+  "description": "Install a local Ironside trace store with a coding agent. The setup skill checks Git, Docker Compose v2, and port collisions, clones or reuses a checkout, starts the Compose stack, verifies docker compose ps and the API health endpoint, guides owner setup and project creation, then instruments an application with the Node SDK or OTLP and confirms one trace in the viewer. It keeps setup codes and credentials out of chat and Git, preserves existing data and services, and asks before anything destructive.",
+  "version": "0.2.0",
+  "author": {
+    "name": "Luka Zivkovic"
+  },
+  "license": "MIT",
+  "keywords": [
+    "tracing",
+    "observability",
+    "llm",
+    "opentelemetry",
+    "self-hosted",
+    "docker",
+    "setup"
+  ]
+}

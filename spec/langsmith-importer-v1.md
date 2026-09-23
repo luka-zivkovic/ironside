@@ -8,7 +8,7 @@ Same rationale as the LangFuse importer (`spec/langfuse-importer-v1.md`): pull-b
 
 ## API verification note
 
-An existing sibling-codebase client (coeval) called `GET /runs` with `x-api-key` auth and a `project_name` query param. **This is not a documented LangSmith endpoint** — verified directly against the live OpenAPI spec at `api.smith.langchain.com/openapi.json`: no bare `GET /runs` listing endpoint exists. The only endpoint for listing/searching runs is `POST /api/v1/runs/query`, which filters by `session` (an array of project UUIDs, not a name string) and paginates via an opaque `cursor` string, not offset/limit.
+An existing sibling-codebase client (rubrist) called `GET /runs` with `x-api-key` auth and a `project_name` query param. **This is not a documented LangSmith endpoint** — verified directly against the live OpenAPI spec at `api.smith.langchain.com/openapi.json`: no bare `GET /runs` listing endpoint exists. The only endpoint for listing/searching runs is `POST /api/v1/runs/query`, which filters by `session` (an array of project UUIDs, not a name string) and paginates via an opaque `cursor` string, not offset/limit.
 
 The response's `cursors` field is typed in the OpenAPI schema only as a generic open string-keyed dict — the "next page" key name is **not recoverable from the spec alone**. Verified instead against the official `langsmith` SDK source (both JS `client.ts` and Python `client.py`, independently converging): both read `cursors.next`, treating a missing/falsy value as pagination exhaustion.
 
