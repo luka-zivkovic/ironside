@@ -41,7 +41,10 @@ const worker = createIngestWorker(
     storage,
     clickhouse,
     pool: pgPool,
-    retentionExecutionEnabled: config.rawRetentionExecutionEnabled,
+    // Always on, whatever RAW_RETENTION_EXECUTION_ENABLED says: an intent a
+    // worker already started executing must never have its batch
+    // re-materialized, even after deletion is switched off.
+    retentionExecutionEnabled: true,
     onDeadLetter: (count) => metrics.eventsDeadLettered.inc(count),
     onEnvironmentRegistryOverflow: (count) =>
       metrics.environmentRegistryOverflow.inc({ source: "live" }, count)
@@ -74,7 +77,8 @@ const recovery = startPendingIngestRecovery({
   storage,
   queue,
   pool: pgPool,
-  retentionExecutionEnabled: config.rawRetentionExecutionEnabled,
+  // Always on; see the ingest processor above.
+  retentionExecutionEnabled: true,
   intervalMs: config.ingestRecoveryIntervalMs,
   batchSize: config.ingestRecoveryBatchSize,
   beforeTerminalFailure: (message) =>
@@ -114,7 +118,16 @@ const rawRetention = config.rawRetentionExecutionEnabled
               `blocked=${result.blocked} skipped=${result.skipped} examined=${result.examined}`
           );
         }
-        metrics.schedulerRuns.inc({ subsystem: "raw-retention", outcome: "success" });
+        for (const failure of result.errors) {
+          console.error(`[raw-retention] project=${failure.projectId}: ${failure.message}`);
+        }
+        if (result.errorCount > result.errors.length) {
+          console.error(`[raw-retention] ${result.errorCount - result.errors.length} more error(s) not shown`);
+        }
+        metrics.schedulerRuns.inc({
+          subsystem: "raw-retention",
+          outcome: result.errorCount > 0 ? "error" : "success"
+        });
       },
       onError: (error) => {
         metrics.schedulerRuns.inc({ subsystem: "raw-retention", outcome: "error" });

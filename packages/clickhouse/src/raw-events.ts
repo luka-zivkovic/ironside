@@ -105,6 +105,35 @@ export async function getRetentionVisibleTraceIds(
   if (traceIds.length > 10_000) {
     throw new Error("raw retention visibility check is capped at 10000 trace ids");
   }
+  const visible = new Set<string>();
+  for (const chunk of traceIdChunks(traceIds)) {
+    for (const traceId of await getRetentionVisibleTraceIdChunk(client, projectId, chunk)) {
+      visible.add(traceId);
+    }
+  }
+  return visible;
+}
+
+/**
+ * ClickHouse's HTTP interface rejects a query parameter longer than
+ * http_max_field_value_size (128 KiB by default), about 3,700 trace ids, so
+ * large id sets are queried in chunks well under it.
+ */
+const TRACE_ID_PARAM_CHUNK = 1_000;
+
+function traceIdChunks(traceIds: string[]): string[][] {
+  const chunks: string[][] = [];
+  for (let start = 0; start < traceIds.length; start += TRACE_ID_PARAM_CHUNK) {
+    chunks.push(traceIds.slice(start, start + TRACE_ID_PARAM_CHUNK));
+  }
+  return chunks;
+}
+
+async function getRetentionVisibleTraceIdChunk(
+  client: ClickHouseClient,
+  projectId: string,
+  traceIds: string[]
+): Promise<Set<string>> {
   const result = await client.query({
     query: `
       select distinct trace_id
@@ -243,6 +272,20 @@ export async function getRetentionExpiredTraceIds(
   if (traceIds.length > 10_000) {
     throw new Error("raw retention marker verification is capped at 10000 trace ids");
   }
+  const expired = new Set<string>();
+  for (const chunk of traceIdChunks(traceIds)) {
+    for (const traceId of await getRetentionExpiredTraceIdChunk(client, projectId, chunk)) {
+      expired.add(traceId);
+    }
+  }
+  return expired;
+}
+
+async function getRetentionExpiredTraceIdChunk(
+  client: ClickHouseClient,
+  projectId: string,
+  traceIds: string[]
+): Promise<Set<string>> {
   const result = await client.query({
     query: `
       select trace_id

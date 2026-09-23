@@ -160,7 +160,8 @@ services:
       # Deletes raw event objects once they are past their project's
       # retention (spec/raw-retention-intents-v1.md). Set to false to keep raw
       # events indefinitely.
-      RAW_RETENTION_EXECUTION_ENABLED: ${RAW_RETENTION_EXECUTION_ENABLED:-true}
+      RAW_RETENTION_EXECUTION_ENABLED: ${RAW_RETENTION_EXECUTION_ENABLED-true}
+      RAW_RETENTION_SWEEP_INTERVAL_MS: ${RAW_RETENTION_SWEEP_INTERVAL_MS:-900000}
       # Optional bearer token for the worker's own :9464/metrics listener.
       # The port is deliberately NOT published — scrape it from inside the
       # compose network, or add a ports mapping if scraping externally

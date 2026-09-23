@@ -3,6 +3,7 @@ import { createClickHouseClient, runMigrations as runChMigrations } from "@irons
 import {
   createOtlpForwardRule,
   getOtlpForwardRule,
+  updateOtlpForwardRule,
   runMigrations as runPgMigrations,
   type OtlpForwardRule
 } from "@ironside/db";
@@ -68,6 +69,19 @@ afterAll(async () => {
   await clickhouse.close();
   await new Promise<void>((resolve) => server.close(() => resolve()));
 });
+
+/**
+ * A saved rule, disabled: forwardOtlpTraces ignores `enabled`, and disabled
+ * rules stay out of reach of the scheduler tests, which claim every due rule
+ * in the shared database and would otherwise run it concurrently.
+ */
+async function createDisabledRule(
+  input: Omit<Parameters<typeof createOtlpForwardRule>[1], "projectId">
+): Promise<OtlpForwardRule> {
+  const created = await createOtlpForwardRule(pool, { ...input, projectId });
+  await updateOtlpForwardRule(pool, projectId, created.id, { enabled: false });
+  return (await getOtlpForwardRule(pool, projectId, created.id))!;
+}
 
 /** An unsaved rule starting at the beginning of the feed; progress writes to a missing id are no-ops. */
 function rule(overrides: Partial<OtlpForwardRule> = {}): OtlpForwardRule {
@@ -177,9 +191,8 @@ describe("forwardOtlpTraces", () => {
         trace: { id, projectId, timestamp: new Date().toISOString(), tags: [marker], metadata: {} }
       });
     }
-    const stored = await createOtlpForwardRule(pool, {
+    const stored = await createDisabledRule({
       id: `rule_${ulid()}`,
-      projectId,
       name: "flaky destination",
       destinationUrl: serverUrl,
       filter: { tags: [marker] }
@@ -229,9 +242,8 @@ describe("forwardOtlpTraces", () => {
         trace: { id, projectId, timestamp: new Date().toISOString(), tags: [marker], metadata: {} }
       });
     }
-    const stored = await createOtlpForwardRule(pool, {
+    const stored = await createDisabledRule({
       id: `rule_${ulid()}`,
-      projectId,
       name: "picky destination",
       destinationUrl: serverUrl,
       filter: { tags: [marker] }

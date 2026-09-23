@@ -26,8 +26,7 @@ export interface Config {
   /**
    * Raw event objects past their project's retention are deleted automatically
    * (the sweep) and by the operator command. On unless set to anything other
-   * than exactly "true"; every worker must agree, because it also makes ingest
-   * coordinate with deletion.
+   * than exactly "true". Ingest coordinates with deletion regardless.
    */
   rawRetentionExecutionEnabled: boolean;
   /** How often the raw retention sweep runs, in ms. */
@@ -65,8 +64,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ingestRecoveryIntervalMs: Number(env.INGEST_RECOVERY_INTERVAL_MS ?? 30_000),
     ingestRecoveryBatchSize: Number(env.INGEST_RECOVERY_BATCH_SIZE ?? 1_000),
     rawRetentionExecutionEnabled: (env.RAW_RETENTION_EXECUTION_ENABLED ?? "true") === "true",
-    rawRetentionSweepIntervalMs: Number(env.RAW_RETENTION_SWEEP_INTERVAL_MS ?? 15 * 60 * 1000),
+    rawRetentionSweepIntervalMs: timerIntervalMs(env.RAW_RETENTION_SWEEP_INTERVAL_MS, 15 * 60 * 1000),
     metricsPort: Number(env.METRICS_PORT ?? 9464),
     metricsToken: env.METRICS_TOKEN ?? null
   };
+}
+
+/**
+ * A positive interval within setTimeout's range (larger values fire after
+ * 1 ms); anything else, including an empty string, takes the default.
+ */
+function timerIntervalMs(value: string | undefined, fallback: number): number {
+  const parsed = value === undefined || value.trim() === "" ? Number.NaN : Number(value);
+  return Number.isFinite(parsed) && parsed >= 1 ? Math.min(parsed, 2 ** 31 - 1) : fallback;
 }

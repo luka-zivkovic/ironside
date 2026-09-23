@@ -126,8 +126,8 @@ All configuration is environment variables, set directly on the `api`/`worker` s
 | `LIFECYCLE_PLAN_PROJECT_ID` | unset | Optional exact project scope for the lifecycle plan; useful on installations above the project cap |
 | `RAW_RETENTION_PROJECT_ID` | unset | Required exact project for the operator-run, non-destructive raw-retention intent preparer |
 | `RAW_RETENTION_OBJECT_KEYS_JSON` | unset | Explicit JSON array of canonical raw object keys to validate and prepare; capped at 100 objects / 1 GiB / 10,000 aggregate trace refs, with separately bounded sidecar and diagnostic reads, and never read from the lifecycle manifest |
-| `RAW_RETENTION_EXECUTION_ENABLED` | `true` | Deletes raw event objects once they are past their project's retention: the automatic sweep, the operator executor, and the ingest coordination guard that keeps a late job from resurrecting deleted data. Any value other than exactly `true` disables all three and keeps raw events indefinitely; set it identically on every worker replica. Enabled workers need `DeleteObject` on `raw/*` |
-| `RAW_RETENTION_SWEEP_INTERVAL_MS` | `900000` | How often the raw retention sweep runs (15 minutes). Each sweep examines at most 1,000 expired objects per project and stops starting new work after 5 minutes; the next sweep continues from there |
+| `RAW_RETENTION_EXECUTION_ENABLED` | `true` | Deletes raw event objects once they are past their project's retention, through the automatic sweep and the operator executor. Any value other than exactly `true`, including an empty value, disables both and keeps raw events indefinitely; set it identically on every worker replica. Enabled workers need `DeleteObject` on `raw/*`. The self-host bundle also reads `IRONSIDE_RAW_RETENTION_ENABLED`. Ingest always coordinates with deletion, so switching it off never lets a delayed job restore data a deletion already started to remove |
+| `RAW_RETENTION_SWEEP_INTERVAL_MS` | `900000` | How often the raw retention sweep runs (15 minutes; `IRONSIDE_RAW_RETENTION_SWEEP_INTERVAL_MS` in the self-host bundle). Each sweep examines at most 1,000 expired objects per project, starts with a different project each time, and stops starting new work after 5 minutes; the next sweep continues from there. Invalid values fall back to the default |
 | `RAW_RETENTION_INTENT_IDS_JSON` | unset | Explicit JSON array of 1–10 reviewed intent ids for the executor; no discovery or manifest input |
 
 **Change the default credentials before exposing this to anything but `localhost`.** `docker-compose.yml` ships with the same `ironside`/`ironside`/`ironside123` placeholder credentials across Postgres, ClickHouse, and MinIO for local-dev convenience — these are not safe defaults for a reachable deployment.
@@ -231,6 +231,14 @@ on boot. Then verify health, owner sign-in, ingest, query, queue recovery, and
 scheduled work. Concurrent starts are safe, in-flight queue jobs survive
 ordinary worker restarts, and durable pending-ingest intents reconstruct lost
 Redis jobs.
+
+**Upgrading from 0.3.0 starts deleting raw event objects.** Raw retention is
+on by default from the next release: within 15 minutes of the first boot, the
+worker begins deleting raw event objects whose receive day is past their
+project's retention (default 90 days). To keep raw events, set
+`RAW_RETENTION_EXECUTION_ENABLED=false` (in the self-host bundle,
+`IRONSIDE_RAW_RETENTION_ENABLED=false` also works) on every worker before
+upgrading.
 
 Downgrades are not supported: an older release refuses to start on a schema a
 newer release migrated. To go back, restore the pre-upgrade backup. See

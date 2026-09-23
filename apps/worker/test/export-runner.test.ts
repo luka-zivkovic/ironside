@@ -9,6 +9,7 @@ import {
   getExportConfig,
   recordExportRun,
   runMigrations as runPgMigrations,
+  updateExportConfig,
   type ExportConfig,
   type ExportFilter,
   type ExportFormat
@@ -80,7 +81,7 @@ async function newExportConfig(
   projectId: string,
   options: { format?: ExportFormat; filter?: ExportFilter; accessKeyId?: string } = {}
 ): Promise<ExportConfig> {
-  return createExportConfig(pool, {
+  const created = await createExportConfig(pool, {
     id: `export_${ulid()}`,
     projectId,
     name: "test export",
@@ -93,6 +94,11 @@ async function newExportConfig(
     destinationAccessKeyId: options.accessKeyId ?? config.storage.accessKeyId,
     destinationSecretAccessKeyEncrypted: "unused-in-this-test"
   });
+  // runExport ignores `enabled`. Disabled, the config stays out of reach of
+  // the scheduler tests, which claim every due config in the shared database
+  // and would otherwise run it concurrently and move its position.
+  await updateExportConfig(pool, projectId, created.id, { enabled: false });
+  return created;
 }
 
 async function run(exportConfig: ExportConfig, quietPeriodSeconds = 0) {

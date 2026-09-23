@@ -216,6 +216,33 @@ export async function listRawRetentionIntents(
   return result.rows.map(fromRow);
 }
 
+/**
+ * Intents in one state after `afterId`, in id order (ids are ULID-based, so
+ * roughly preparation order). Lets a caller rotate through a set whose oldest
+ * members may stay blocked, instead of rereading the same first page.
+ */
+export async function listRawRetentionIntentsAfter(
+  pool: Pool,
+  projectId: string,
+  state: RawRetentionIntentState,
+  afterId: string | null,
+  limit: number
+): Promise<RawRetentionIntent[]> {
+  if (!Number.isInteger(limit) || limit < 1 || limit > RAW_RETENTION_PREPARATION_MAX_OBJECTS) {
+    throw new Error(
+      `raw retention intent list limit must be between 1 and ${RAW_RETENTION_PREPARATION_MAX_OBJECTS}`
+    );
+  }
+  const result = await pool.query<RawRetentionIntentRow>(
+    `select * from raw_retention_intents
+     where project_id = $1 and state = $2 and ($3::text is null or id > $3::text)
+     order by id asc
+     limit $4`,
+    [projectId, state, afterId, limit]
+  );
+  return result.rows.map(fromRow);
+}
+
 export async function getRawRetentionIntent(
   pool: Pool,
   projectId: string,

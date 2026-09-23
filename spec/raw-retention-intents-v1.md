@@ -85,11 +85,10 @@ docker compose exec \
   worker node apps/worker/dist/src/scripts/raw-retention-execute.js --execute
 ```
 
-`RAW_RETENTION_EXECUTION_ENABLED` must be `true` (the default) on every worker,
-so each ingest processor participates in the per-object advisory-lock/tombstone
-guard; with it enabled, every ingest batch takes that lock. All API and worker
-replicas must run a build with this guard before any worker deletes raw
-objects.
+Execution requires `RAW_RETENTION_EXECUTION_ENABLED` to be `true` (the
+default). Every ingest batch takes the per-object advisory-lock/tombstone
+guard regardless of the flag. All API and worker replicas must run a build
+with this guard before any worker deletes raw objects.
 
 The executing credentials — the worker's own for the sweep, or an operator's
 for the command — need the ordinary pending/failed sidecar contract plus
@@ -151,14 +150,27 @@ with every check, lock, and irreversible ordering unchanged.
   trace, a pending batch, an ambiguous ref-less object — stays and is revisited.
 - A per-project cursor, held in worker memory, lets the next sweep continue
   where the budget stopped (1,000 objects per project, 5 minutes per sweep).
-  Reaching the cutoff clears it, so the next sweep starts again from the
-  oldest day and revisits skipped objects. A restart only restarts the cycle.
+  The cursor moves past a page only after the page is handled. Reaching the
+  cutoff clears it, so the next sweep starts again from the oldest day and
+  revisits skipped objects. A restart only restarts the cycle.
+- Each sweep starts with a different project, so the shared time budget
+  cannot starve later projects, and resumes `executing` intents in rotation,
+  so permanently blocked ones cannot hide later ones.
+- Failures stay local. A page the preparer or executor rejects as a whole
+  (for example, over the 10,000 aggregate trace-reference cap) is split until
+  single objects remain; a single object that still fails is recorded and
+  skipped until the next cycle. When every object on a page fails, the cause
+  is shared (a store outage, most likely): the project is recorded as failed
+  and its cursor stays put. Either way the sweep continues with the next
+  project, and the worker logs the errors.
 - If another replica holds the executor lock, the sweep stops and retries on
   its next interval.
 
 Setting the flag to anything other than exactly `true` on every worker disables
-the sweep, the operator executor, and ingest coordination, and keeps raw events
-indefinitely. Throughput is bounded by the per-object executor work; an
+the sweep and the operator executor and keeps raw events indefinitely. Ingest
+and recovery always take the per-object lock and honor `executing`/`complete`
+intents, whatever the flag says, so switching deletion off never lets a
+delayed job resurrect rows an already-started deletion removed. Throughput is bounded by the per-object executor work; an
 installation ingesting many small batches can fall behind, and its backlog is
 visible in the lifecycle plan.
 
