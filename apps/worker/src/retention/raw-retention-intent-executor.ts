@@ -92,8 +92,9 @@ class RetentionVetoError extends Error {
 }
 
 /**
- * Executes only explicitly named durable intents. There is intentionally no
- * discovery, lifecycle-manifest input, scheduler hook, or all-project mode.
+ * Executes only explicitly named durable intents and does no discovery of its
+ * own. Its callers — the operator command and the automatic sweep
+ * (raw-retention-sweep.ts) — each pass exact intent ids for one project.
  */
 export async function executeRawRetentionIntents(
   options: RawRetentionIntentExecutorOptions

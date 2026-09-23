@@ -14,6 +14,7 @@ import {
   settlePublishedEvaluatorTraceRefs
 } from "./processors/ingest.js";
 import { startPendingIngestRecovery } from "./recovery/recovery-loop.js";
+import { startRawRetentionSweep } from "./retention/raw-retention-sweep.js";
 import { verifyPendingIngestStorage } from "./recovery/storage-permissions.js";
 import { startScheduler } from "./scheduler.js";
 
@@ -96,6 +97,37 @@ const recovery = startPendingIngestRecovery({
 });
 console.log("ironside-worker: ingest recovery running");
 
+// Deletes raw event objects once they are past their project's retention;
+// see spec/raw-retention-intents-v1.md.
+const rawRetention = config.rawRetentionExecutionEnabled
+  ? startRawRetentionSweep({
+      pool: pgPool,
+      clickhouse,
+      storage,
+      queue,
+      defaultRetentionDays: config.defaultRetentionDays,
+      intervalMs: config.rawRetentionSweepIntervalMs,
+      onResult: (result) => {
+        if (result.deleted > 0 || result.prepared > 0) {
+          console.log(
+            `[raw-retention] deleted=${result.deleted} prepared=${result.prepared} ` +
+              `blocked=${result.blocked} skipped=${result.skipped} examined=${result.examined}`
+          );
+        }
+        metrics.schedulerRuns.inc({ subsystem: "raw-retention", outcome: "success" });
+      },
+      onError: (error) => {
+        metrics.schedulerRuns.inc({ subsystem: "raw-retention", outcome: "error" });
+        console.error("[raw-retention] sweep failed:", error);
+      }
+    })
+  : null;
+console.log(
+  config.rawRetentionExecutionEnabled
+    ? "ironside-worker: raw retention sweep running"
+    : "ironside-worker: raw retention disabled (RAW_RETENTION_EXECUTION_ENABLED is not true); raw events are kept"
+);
+
 // Drives scheduled exports, OTLP forwards, webhooks, and retention — see
 // scheduler.ts for why a plain interval loop (not a second BullMQ queue)
 // is sufficient here.
@@ -118,6 +150,7 @@ console.log(`ironside-worker: metrics on :${config.metricsPort}/metrics`);
 async function shutdown(): Promise<void> {
   scheduler.stop();
   recovery.stop();
+  rawRetention?.stop();
   metricsServer.close();
   await worker.close();
   await queue.close();

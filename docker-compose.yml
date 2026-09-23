@@ -157,9 +157,10 @@ services:
       LIFECYCLE_PLAN_PROJECT_ID: ${LIFECYCLE_PLAN_PROJECT_ID:-}
       INGEST_RECOVERY_INTERVAL_MS: ${INGEST_RECOVERY_INTERVAL_MS:-30000}
       INGEST_RECOVERY_BATCH_SIZE: ${INGEST_RECOVERY_BATCH_SIZE:-1000}
-      # Destructive raw retention remains off unless an operator opts in and
-      # also invokes the separate command with --execute and exact intent ids.
-      RAW_RETENTION_EXECUTION_ENABLED: ${RAW_RETENTION_EXECUTION_ENABLED:-false}
+      # Deletes raw event objects once they are past their project's
+      # retention (spec/raw-retention-intents-v1.md). Set to false to keep raw
+      # events indefinitely.
+      RAW_RETENTION_EXECUTION_ENABLED: ${RAW_RETENTION_EXECUTION_ENABLED:-true}
       # Optional bearer token for the worker's own :9464/metrics listener.
       # The port is deliberately NOT published — scrape it from inside the
       # compose network, or add a ports mapping if scraping externally

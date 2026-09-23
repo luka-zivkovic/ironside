@@ -60,6 +60,7 @@ export {
   createRawRetentionIntents,
   getRawRetentionIntent,
   getRawRetentionIntentsByIds,
+  getRawRetentionIntentsForObjects,
   listRawRetentionIntents,
   withRawRetentionExecutionLock,
   withRawRetentionObjectLock,

@@ -247,6 +247,29 @@ export async function getRawRetentionIntentsByIds(
   return result.rows.map(fromRow);
 }
 
+/** Existing intents for a bounded set of raw objects, keyed by object key. */
+export async function getRawRetentionIntentsForObjects(
+  pool: Pool,
+  projectId: string,
+  objectKeys: string[]
+): Promise<Map<string, RawRetentionIntent>> {
+  if (objectKeys.length === 0) return new Map();
+  if (objectKeys.length > RAW_RETENTION_PREPARATION_MAX_OBJECTS) {
+    throw new Error(
+      `raw retention intent lookup is capped at ${RAW_RETENTION_PREPARATION_MAX_OBJECTS} objects`
+    );
+  }
+  const result = await pool.query<RawRetentionIntentRow>(
+    `select * from raw_retention_intents
+     where project_id = $1 and object_key = any($2::text[])`,
+    [projectId, objectKeys]
+  );
+  return new Map(result.rows.map((row) => {
+    const intent = fromRow(row);
+    return [intent.objectKey, intent];
+  }));
+}
+
 /**
  * Serializes destructive raw-retention commands across worker replicas.
  * Session locks require a pinned client and an explicit unlock in finally.

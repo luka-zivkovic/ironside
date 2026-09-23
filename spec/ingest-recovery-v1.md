@@ -84,7 +84,9 @@ Its pending object uses the reserved `pending-ingest/.internal/probes/`
 subprefix so running reconcilers ignore it.
 Production credentials require bucket listing plus `PutObject`,
 `GetObject`/`HeadObject`, and `DeleteObject` for `pending-ingest/*`; failed-batch
-diagnostics require Put/Get/Delete on `failed-ingest/*`. Keep delete denied for
-`raw/*` to preserve the forensic archive. A bucket-wide Object Lock/default WORM
-retention policy is incompatible with deletable sidecars in this single-bucket
-version; use prefix-scoped IAM immutability for `raw/*` instead.
+diagnostics require Put/Get/Delete on `failed-ingest/*`. Raw retention, on by
+default, additionally needs delete on `raw/*` (`spec/raw-retention-intents-v1.md`);
+deny it only when `RAW_RETENTION_EXECUTION_ENABLED` is false. A bucket-wide
+Object Lock/default WORM retention policy is incompatible with deletable
+sidecars in this single-bucket version; use prefix-scoped IAM immutability for
+`raw/*` instead.

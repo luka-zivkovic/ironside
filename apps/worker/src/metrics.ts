@@ -49,7 +49,7 @@ export function createWorkerMetrics(queue: Queue<QueueMessage>): WorkerMetrics {
   });
   const schedulerRuns = new Counter({
     name: "ironside_scheduler_runs_total",
-    help: "Scheduled runs by subsystem (export/otlp-forward/webhook/import/environment-registry/retention) and outcome",
+    help: "Scheduled runs by subsystem (export/otlp-forward/webhook/import/environment-registry/retention/raw-retention) and outcome",
     labelNames: ["subsystem", "outcome"] as const,
     registers: [registry]
   });
