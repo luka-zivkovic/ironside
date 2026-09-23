@@ -12,6 +12,8 @@ docker compose up -d --build
 
 This builds the `api`/`worker`/`web` images locally and starts the whole stack. First boot takes a few minutes (image builds + Postgres/ClickHouse initialization); subsequent `docker compose up` runs are fast, since Docker caches the image layers and the infra containers keep their data in named volumes (`pgdata`, `chdata`, `miniodata`).
 
+The checked-in `docker-compose.yml` is a local stack with fixed development credentials, so it publishes every port on `127.0.0.1` only. Docker-published ports bypass host firewalls such as ufw on Linux, so do not widen the infrastructure ports. To reach the web app or API from another machine, set `IRONSIDE_BIND_ADDRESS` (for example `0.0.0.0`) to publish only `api` and `web` on that interface, put a TLS reverse proxy on the host in front of `127.0.0.1:8080`, or use the [generic single-host release bundle](#generic-single-host-release-bundle), which generates real secrets.
+
 `api` and `worker` each verify the same current Postgres/ClickHouse baseline on boot and ensure the `ironside-raw` object storage bucket exists, so there's no separate schema step to run by hand. This pre-launch release supports clean database installs only; founder-owned test instances are recreated when either baseline changes. See [Database schema lifecycle](pre-production-schema.md).
 
 Once every container reports healthy (`docker compose ps`), generate a short-lived, one-time owner setup code from the host:

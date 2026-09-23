@@ -1,6 +1,12 @@
-# Ironside local/self-host stack. Ports are offset to coexist with a local
+# Ironside local development stack. Ports are offset to coexist with a local
 # rubrist instance (postgres 5433 vs 5432) and to avoid the ClickHouse native
 # port clashing with MinIO's default 9000.
+#
+# Every port is published on 127.0.0.1 only. The infrastructure services use
+# fixed local-only passwords, and on Linux Docker-published ports bypass host
+# firewalls such as ufw, so they are never exposed beyond this machine. Set
+# IRONSIDE_BIND_ADDRESS to publish api and web on another interface; for a
+# server, use deploy/self-host instead (docs/self-hosting.md).
 services:
   postgres:
     image: postgres:16
@@ -9,7 +15,7 @@ services:
       POSTGRES_PASSWORD: ironside
       POSTGRES_DB: ironside
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -25,8 +31,8 @@ services:
       CLICKHOUSE_PASSWORD: ironside
       CLICKHOUSE_DB: ironside
     ports:
-      - "8123:8123"
-      - "9000:9000"
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9000:9000"
     volumes:
       - chdata:/var/lib/clickhouse
       # Enables the native BACKUP/RESTORE statements (backups.allowed_path)
@@ -49,7 +55,7 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6380:6379"
+      - "127.0.0.1:6380:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -63,8 +69,8 @@ services:
       MINIO_ROOT_USER: ironside
       MINIO_ROOT_PASSWORD: ironside123
     ports:
-      - "9010:9000"
-      - "9011:9001"
+      - "127.0.0.1:9010:9000"
+      - "127.0.0.1:9011:9001"
     volumes:
       - miniodata:/data
     healthcheck:
@@ -116,7 +122,7 @@ services:
       # trace. Unset = no link. Read by the web app at runtime.
       IRONSIDE_RUBRIST_URL: ${IRONSIDE_RUBRIST_URL:-}
     ports:
-      - "8788:8788"
+      - "${IRONSIDE_BIND_ADDRESS:-127.0.0.1}:8788:8788"
     depends_on:
       postgres:
         condition: service_healthy
@@ -177,7 +183,7 @@ services:
       context: .
       dockerfile: apps/web/Dockerfile
     ports:
-      - "8080:80"
+      - "${IRONSIDE_BIND_ADDRESS:-127.0.0.1}:8080:80"
     depends_on:
       - api
 

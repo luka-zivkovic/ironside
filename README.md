@@ -95,7 +95,7 @@ cd ironside
 docker compose up -d --build
 ```
 
-This starts the full stack — Postgres, ClickHouse, Redis, MinIO, plus the `api`, `worker`, and `web` containers — with migrations and object storage setup handled automatically on boot. Once `docker compose ps` shows everything healthy, generate the one-time owner setup code:
+This starts the full stack — Postgres, ClickHouse, Redis, MinIO, plus the `api`, `worker`, and `web` containers — with migrations and object storage setup handled automatically on boot. Every port is published on `127.0.0.1` only, because the checked-in stack uses development credentials; to run Ironside on a server, use the [self-host bundle](docs/self-hosting.md#generic-single-host-release-bundle). Once `docker compose ps` shows everything healthy, generate the one-time owner setup code:
 
 ```sh
 docker compose exec api node apps/api/dist/src/scripts/owner-setup.js

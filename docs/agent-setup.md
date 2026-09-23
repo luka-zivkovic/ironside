@@ -69,7 +69,8 @@ MinIO, and the API, worker, and web services.
 | API | `http://localhost:8788` | Native ingestion, OTLP, integrations, and health. |
 
 These are localhost development defaults. Compose also maps infrastructure
-ports and uses development credentials. Review
+ports and uses development credentials, so every port is published on
+`127.0.0.1` only. Review
 [production considerations](self-hosting.md#production-considerations) before
 exposing an installation on a network.
 
