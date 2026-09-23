@@ -1,6 +1,6 @@
 import type { ObjectStorage } from "@ironside/storage";
 import type { QueueMessage } from "@ironside/shared";
-import { DEFAULT_TRACE_QUIET_PERIOD_SECONDS } from "@ironside/shared";
+import { DEFAULT_TRACE_QUIET_PERIOD_SECONDS, type ViewerConfigResponse } from "@ironside/shared";
 import type { Queue } from "bullmq";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
@@ -14,7 +14,8 @@ import {
   ownerProjectAuth,
   ownerSessionAuth,
   trustedBrowserMutation,
-  type OwnerProjectEnv
+  type OwnerProjectEnv,
+  type OwnerSessionEnv
 } from "./middleware/owner-session.js";
 import { rateLimit } from "./middleware/rate-limit.js";
 import { exportsRoutes } from "./routes/exports.js";
@@ -52,6 +53,8 @@ export interface AppDeps extends HealthDeps {
   defaultTraceQuietPeriodSeconds?: number;
   /** Bearer token gating GET /metrics; null/undefined disables the endpoint entirely (404). */
   metricsToken?: string | null;
+  /** Optional Rubrist web base URL surfaced to the owner viewer; null/undefined hides the link. */
+  rubristUrl?: string | null;
   /** Per-project limit for the raw-events lookup (requests/minute). Defaults to RAW_EVENTS_RATE_LIMIT_PER_MINUTE. */
   rawEventsRateLimitPerMinute?: number;
 }
@@ -172,6 +175,16 @@ export function createApp(deps: AppDeps): Hono<AuthEnv> {
   ownerProjects.use("*", trustedBrowserMutation(deps.webOrigins));
   ownerProjects.route("/", projectsRoutes({ pool: deps.pgPool }));
 
+  // Deployment-level runtime settings for the web viewer. Owner-session only;
+  // the static web bundle stays environment-independent.
+  const viewerConfig = new Hono<OwnerSessionEnv>();
+  viewerConfig.use("*", ownerSessionAuth(deps.pgPool, ownerSessionOptions));
+  viewerConfig.get("/", (c) => {
+    const response: ViewerConfigResponse = { rubristUrl: deps.rubristUrl ?? null };
+    return c.json(response, 200);
+  });
+  app.route("/api/v1/viewer-config", viewerConfig);
+
   const ownerProject = new Hono<OwnerProjectEnv>();
   ownerProject.use("*", ownerProjectAuth(deps.pgPool));
   ownerProject.route("/", projectQuotasRoutes({ pool: deps.pgPool }));
@@ -258,7 +271,7 @@ export function createApp(deps: AppDeps): Hono<AuthEnv> {
   app.route("/api/v1", evaluatorScore);
 
   // LangFuse compat reads: GET /api/public/traces[/:id] — LangFuse's own
-  // fetch API paths, consumed by coeval's poller (M8) and any other
+  // fetch API paths, consumed by rubrist's poller (M8) and any other
   // LangFuse-reading client. Mounted BEFORE the write group so Hono
   // resolves the GETs here; no rate limit, matching the native query
   // routes' convention above.
@@ -279,7 +292,7 @@ export function createApp(deps: AppDeps): Hono<AuthEnv> {
   // endpoint URL (not Ironside's /api/v1/* convention) — matching it
   // exactly is the whole point, so a client pointing LANGFUSE_BASEURL at
   // this host works with zero code changes. /api/public/scores (M8) is
-  // coeval's verdict sync-back target.
+  // rubrist's verdict sync-back target.
   const langfuseCompat = new Hono<AuthEnv>();
   langfuseCompat.use("/public/ingestion/*", machineAuth(deps.pgPool, deps.redis, "ingest"));
   langfuseCompat.use("/public/scores/*", machineAuth(deps.pgPool, deps.redis, "scores:write"));

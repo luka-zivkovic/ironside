@@ -88,4 +88,4 @@ This package is the ergonomic Node.js integration and supports Ironside-specific
 
 ## License
 
-[Ironside Sustainable Use License v1.0](./LICENSE.md), including its SDK Integration Exception for embedding and distributing this package as part of commercial applications that send telemetry to Ironside.
+[MIT License](./LICENSE.md).

@@ -15,7 +15,7 @@ import type { AuthEnv } from "../middleware/auth.js";
 
 // LangFuse-shaped READ endpoints (M8): GET /api/public/traces and
 // GET /api/public/traces/{id}, matching LangFuse's own public API paths and
-// response shapes so existing LangFuse consumers — coeval's poller, and
+// response shapes so existing LangFuse consumers — rubrist's poller, and
 // Ironside's own LangFuse importer (a deliberate self-conformance target:
 // pointing runLangfuseImport at an Ironside host must work) — read traces
 // out of Ironside with zero code changes. The write-side counterparts
@@ -64,11 +64,11 @@ const listQuerySchema = z.object({
 });
 
 // Optional fields that are unset OMIT the key rather than emitting an
-// explicit null. Found empirically on first live contact with coeval (the
+// explicit null. Found empirically on first live contact with rubrist (the
 // M8 consumer): its LangFuse trace schema types optional fields as
 // z.string().optional() — absent is fine, an explicit null fails
 // validation and the whole poll errors out. Omission is the compatible
-// intersection: optional-tolerant consumers (coeval, Ironside's own
+// intersection: optional-tolerant consumers (rubrist, Ironside's own
 // importer whose schema is .nullable().optional()) all accept it.
 function traceItem(row: TraceDetailRow) {
   const input = safeJsonParse(row.input);

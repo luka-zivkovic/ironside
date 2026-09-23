@@ -242,11 +242,11 @@ const evaluatorScoreRoute: RouteCase = {
       body: JSON.stringify({
         id: `score_${ulid()}`,
         traceId: `trace_${ulid()}`,
-        name: "coeval_assessment/support-quality",
+        name: "rubrist_assessment/support-quality",
         value: 1,
         assessmentLabel: "pass",
         evaluator: {
-          provider: "coeval",
+          provider: "rubrist",
           versionId: "skillv_1",
           criterionKey: "support-quality"
         }

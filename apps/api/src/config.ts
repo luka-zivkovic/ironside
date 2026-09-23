@@ -32,6 +32,8 @@ export interface Config {
   defaultTraceQuietPeriodSeconds: number;
   /** Bearer token required to scrape GET /metrics. Unset = the endpoint is disabled entirely (404) — instance metrics are never exposed unauthenticated on the public API port. */
   metricsToken: string | null;
+  /** Optional Rubrist web base URL; when set, the trace viewer links each trace to Rubrist. */
+  rubristUrl: string | null;
 }
 
 function positiveInteger(value: string | undefined, fallback: number, name: string): number {
@@ -60,6 +62,32 @@ function exactWebOrigins(value: string | undefined): string[] {
     }
   }
   return [...new Set(origins)];
+}
+
+// An absolute http(s) base, optionally with a path prefix for a Rubrist served
+// under a subpath. Query, fragment, and userinfo are rejected because the
+// viewer appends its own path and query to this value.
+export function optionalRubristUrl(value: string | undefined): string | null {
+  const trimmed = value?.trim() ?? "";
+  if (!trimmed) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error(`IRONSIDE_RUBRIST_URL must be an absolute http(s) URL: ${trimmed}`);
+  }
+  if (
+    !(["http:", "https:"] as string[]).includes(parsed.protocol) ||
+    parsed.username ||
+    parsed.password ||
+    parsed.search ||
+    parsed.hash
+  ) {
+    throw new Error(
+      `IRONSIDE_RUBRIST_URL must be an absolute http(s) URL without credentials, query, or fragment: ${trimmed}`
+    );
+  }
+  return `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, "");
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -108,6 +136,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     defaultTraceQuietPeriodSeconds: Number(
       env.DEFAULT_TRACE_QUIET_PERIOD_SECONDS ?? DEFAULT_TRACE_QUIET_PERIOD_SECONDS
     ),
-    metricsToken: env.METRICS_TOKEN ?? null
+    metricsToken: env.METRICS_TOKEN ?? null,
+    rubristUrl: optionalRubristUrl(env.IRONSIDE_RUBRIST_URL)
   };
 }

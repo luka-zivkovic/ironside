@@ -1,6 +1,6 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 
-// Ported from coeval's apps/api/src/lib/encryption.ts (same author, same
+// Ported from rubrist's apps/api/src/lib/encryption.ts (same author, same
 // pattern) — encrypts destination credentials (export S3 secret keys,
 // OTLP forward auth headers, webhook signing secrets) at the application
 // layer before they reach Postgres, so a database dump/leak never exposes

@@ -1,9 +1,9 @@
 {
   "name": "ironside-monorepo",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "The system of record for AI interaction data: ingest, store, and export LLM traces.",
-  "license": "SEE LICENSE IN LICENSE.md",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/luka-zivkovic/ironside.git"

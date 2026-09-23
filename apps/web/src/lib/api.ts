@@ -8,6 +8,7 @@ import {
   listTracesResponseSchema,
   listProjectsResponseSchema,
   traceTreeResponseSchema,
+  viewerConfigResponseSchema,
   type AggregatesResponse,
   type CreatedMachineCredential,
   type CreatedProjectWithCredential,
@@ -17,7 +18,8 @@ import {
   type MachineCredentialPreset,
   type ListProjectsResponse,
   type ListTracesResponse,
-  type TraceTreeResponse
+  type TraceTreeResponse,
+  type ViewerConfigResponse
 } from "@ironside/shared/browser";
 
 const API_BASE = import.meta.env.VITE_API_URL ?? "";
@@ -120,6 +122,23 @@ export async function fetchAggregates(
   const response = await apiFetch(`${projectPath(projectId, "/traces/aggregates")}${query ? `?${query}` : ""}`);
   if (!response.ok) throw await apiErrorFromResponse(response, "Failed to fetch aggregates");
   return aggregatesResponseSchema.parse(await response.json());
+}
+
+// Deployment-level viewer settings change only on API restart, so one
+// successful response is reused for the page lifetime. Failures are not
+// cached; optional integrations simply stay hidden.
+let viewerConfigRequest: Promise<ViewerConfigResponse> | null = null;
+export function fetchViewerConfig(): Promise<ViewerConfigResponse> {
+  viewerConfigRequest ??= apiFetch("/api/v1/viewer-config")
+    .then(async (response) => {
+      if (!response.ok) throw await apiErrorFromResponse(response, "Failed to load viewer settings");
+      return viewerConfigResponseSchema.parse(await response.json());
+    })
+    .catch((error: unknown) => {
+      viewerConfigRequest = null;
+      throw error;
+    });
+  return viewerConfigRequest;
 }
 
 export interface HealthReport {
