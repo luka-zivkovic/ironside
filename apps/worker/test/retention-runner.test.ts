@@ -30,7 +30,9 @@ const pool = new Pool({
 const adminClickhouse = createClickHouseClient(config.clickhouse);
 const clickhouse = createClickHouseClient({ ...config.clickhouse, database: namespace });
 
-vi.setConfig({ testTimeout: 15_000 });
+// Full retention passes issue synchronous ClickHouse mutations; allow them
+// to finish on shared CI runners instead of closing clients mid-mutation.
+vi.setConfig({ testTimeout: 60_000 });
 
 let organizationId: string;
 
