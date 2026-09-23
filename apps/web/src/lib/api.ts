@@ -1,5 +1,8 @@
 import {
   aggregatesResponseSchema,
+  modelPricesResponseSchema,
+  type ModelPriceOverrideInput,
+  type ModelPricesResponse,
   createdMachineCredentialSchema,
   createdProjectWithCredentialSchema,
   listMachineCredentialsResponseSchema,
@@ -190,6 +193,25 @@ export async function createProject(name: string): Promise<CreatedProjectWithCre
   });
   if (!response.ok) throw await apiErrorFromResponse(response, "Failed to create project");
   return createdProjectWithCredentialSchema.parse(await response.json());
+}
+
+export async function fetchModelPrices(projectId: string): Promise<ModelPricesResponse> {
+  const response = await apiFetch(projectPath(projectId, "/model-prices"));
+  if (!response.ok) throw await apiErrorFromResponse(response, "Failed to load model prices");
+  return modelPricesResponseSchema.parse(await response.json());
+}
+
+export async function replaceModelPrices(
+  projectId: string,
+  overrides: ModelPriceOverrideInput[]
+): Promise<ModelPricesResponse> {
+  const response = await apiFetch(projectPath(projectId, "/model-prices"), {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ overrides })
+  });
+  if (!response.ok) throw await apiErrorFromResponse(response, "Failed to save model prices");
+  return modelPricesResponseSchema.parse(await response.json());
 }
 
 export async function fetchMachineCredentials(projectId: string): Promise<ListMachineCredentialsResponse> {

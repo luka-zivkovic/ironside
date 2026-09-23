@@ -39,6 +39,9 @@ importers:
       '@ironside/mappers':
         specifier: workspace:*
         version: link:../../packages/mappers
+      '@ironside/pricing':
+        specifier: workspace:*
+        version: link:../../packages/pricing
       '@ironside/queue':
         specifier: workspace:*
         version: link:../../packages/queue
@@ -188,6 +191,9 @@ importers:
       '@ironside/mappers':
         specifier: workspace:*
         version: link:../../packages/mappers
+      '@ironside/pricing':
+        specifier: workspace:*
+        version: link:../../packages/pricing
       '@ironside/queue':
         specifier: workspace:*
         version: link:../../packages/queue
@@ -265,6 +271,12 @@ importers:
       zod:
         specifier: ^4.4.1
         version: 4.4.3
+
+  packages/pricing:
+    dependencies:
+      '@ironside/shared':
+        specifier: workspace:*
+        version: link:../shared
 
   packages/queue:
     dependencies:

@@ -40,6 +40,7 @@ COPY --from=build /repo/packages/clickhouse/dist ./packages/clickhouse/dist
 COPY --from=build /repo/packages/queue/dist ./packages/queue/dist
 COPY --from=build /repo/packages/storage/dist ./packages/storage/dist
 COPY --from=build /repo/packages/mappers/dist ./packages/mappers/dist
+COPY --from=build /repo/packages/pricing/dist ./packages/pricing/dist
 COPY --from=build /repo/apps/api/dist ./apps/api/dist
 
 EXPOSE 8788

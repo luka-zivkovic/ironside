@@ -128,7 +128,7 @@ export OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf
 export OTEL_EXPORTER_OTLP_TRACES_HEADERS="authorization=Bearer%20${IRONSIDE_API_KEY}"
 ```
 
-Use the signal-specific `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`; Ironside's route is `/v1/otel/traces`, not the usual base-endpoint-derived `/v1/traces`. Standard `gen_ai.*` model, usage, operation, and request attributes are mapped into typed Ironside fields, while all attributes are retained in metadata. OTLP has no standard representation for computed cost or eval/human-feedback scores, so applications that need those should use the SDK or native JSON ingest alongside it. See [`spec/integration-contract-v1.md`](./spec/integration-contract-v1.md) and [`spec/otlp-ingest-v1.md`](./spec/otlp-ingest-v1.md).
+Use the signal-specific `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`; Ironside's route is `/v1/otel/traces`, not the usual base-endpoint-derived `/v1/traces`. Standard `gen_ai.*` model, usage, operation, and request attributes are mapped into typed Ironside fields, while all attributes are retained in metadata. OTLP has no standard representation for computed cost or eval/human-feedback scores; Ironside derives cost from token usage and the model name at ingest ([`spec/cost-pricing-v1.md`](./spec/cost-pricing-v1.md)), and applications that need scores or an exact provider-billed cost should use the SDK or native JSON ingest alongside it. See [`spec/integration-contract-v1.md`](./spec/integration-contract-v1.md) and [`spec/otlp-ingest-v1.md`](./spec/otlp-ingest-v1.md).
 
 For Node.js applications, the `ironside` package is the ergonomic native integration. Install it with your provider's SDK:
 

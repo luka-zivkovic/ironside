@@ -30,6 +30,7 @@ import type { Job } from "bullmq";
 import type { Pool } from "pg";
 import { ulid } from "ulid";
 import { observeTraceEnvironments } from "../environments/environment-registry.js";
+import { enrichObservationCosts } from "./cost-enrichment.js";
 
 export interface IngestProcessorDeps {
   storage: ObjectStorage;
@@ -197,6 +198,13 @@ export function createIngestProcessor(deps: IngestProcessorDeps) {
       ...langfuseObservations
     ];
     const scores = [...nativeRows.scores, ...langfuseScores];
+
+    // Derive cost where the source reported usage and a model but no cost.
+    // Client-sent cost is never touched; a project override or the vendored
+    // price table fills the gap so direct SDK/OTLP/native ingest gets the
+    // same cost coverage imports already carry (spec/cost-pricing-v1.md).
+    await enrichObservationCosts(deps.pool, projectId, observations);
+
     const traceIds = [
       ...new Set([
         ...traces.map((trace) => trace.id),
