@@ -47,6 +47,8 @@ export {
   listObservationsForTrace,
   listTracesByIds,
   listObservationsByIds,
+  listObservationsForTraces,
+  listScoresForTraces,
   listScoresForTrace,
   getAggregates,
   exportTraces,

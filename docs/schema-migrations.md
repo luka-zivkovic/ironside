@@ -95,6 +95,7 @@ Changes after 0.3.0 are separate migrations:
 | Migration | Change |
 |---|---|
 | Postgres `0002_project_model_prices` | Project model-price overrides for derived cost (spec/cost-pricing-v1.md) |
+| Postgres `0003_destination_feed_cursors` | Trace-feed positions for scheduled exports and OTLP forward rules (spec/scheduled-export-v1.md) |
 
 Protocol compatibility is a separate concern and is not removed by this policy.
 Ironside still accepts supported OTLP and LangFuse wire shapes because those are

@@ -1,17 +1,12 @@
-import {
-  listObservationsByIds,
-  listTracesByIds,
-  type ClickHouseClient,
-  type ObservationRow,
-  type TraceDetailRow
-} from "@ironside/clickhouse";
-import { safeJsonParse, type MappedLangfuseRows } from "@ironside/mappers";
+import { listObservationsByIds, listTracesByIds, type ClickHouseClient } from "@ironside/clickhouse";
+import type { MappedLangfuseRows } from "@ironside/mappers";
 import {
   COST_MODEL_METADATA_KEY,
   COST_SOURCE_METADATA_KEY,
   COST_TABLE_METADATA_KEY
 } from "@ironside/pricing";
-import type { Observation, ObservationLevel, ObservationType, Trace } from "@ironside/shared";
+import type { Observation, Trace } from "@ironside/shared";
+import { observationFromStoredRow, traceFromStoredRow } from "../lib/stored-rows.js";
 
 const COST_METADATA_KEYS = [COST_SOURCE_METADATA_KEY, COST_MODEL_METADATA_KEY, COST_TABLE_METADATA_KEY];
 
@@ -111,46 +106,4 @@ function fillUnprovided<Row extends object>(
     if (!provided.has(key) && stored[key] !== undefined) merged[key] = stored[key];
   }
   return merged;
-}
-
-export function traceFromStoredRow(projectId: string, row: TraceDetailRow): Trace {
-  return {
-    id: row.id,
-    projectId,
-    timestamp: row.timestamp,
-    tags: row.tags,
-    metadata: row.metadata,
-    ...(row.name !== null && { name: row.name }),
-    ...(row.user_id !== null && { userId: row.user_id }),
-    ...(row.session_id !== null && { sessionId: row.session_id }),
-    ...(row.environment !== null && { environment: row.environment }),
-    ...(row.release !== null && { release: row.release }),
-    ...(row.version !== null && { version: row.version }),
-    ...(row.input !== null && { input: safeJsonParse(row.input) }),
-    ...(row.output !== null && { output: safeJsonParse(row.output) })
-  };
-}
-
-/** Empty maps are how absent usage/cost/parameters are stored, so they read back as absent. */
-export function observationFromStoredRow(projectId: string, row: ObservationRow): Observation {
-  return {
-    id: row.id,
-    traceId: row.trace_id,
-    projectId,
-    type: row.type as ObservationType,
-    startTime: row.start_time,
-    level: row.level as ObservationLevel,
-    metadata: row.metadata,
-    ...(row.parent_observation_id !== null && { parentObservationId: row.parent_observation_id }),
-    ...(row.name !== null && { name: row.name }),
-    ...(row.end_time !== null && { endTime: row.end_time }),
-    ...(row.status_message !== null && { statusMessage: row.status_message }),
-    ...(row.model !== null && { model: row.model }),
-    ...(Object.keys(row.model_parameters).length > 0 && { modelParameters: row.model_parameters }),
-    ...(row.input !== null && { input: safeJsonParse(row.input) }),
-    ...(row.output !== null && { output: safeJsonParse(row.output) }),
-    ...(Object.keys(row.usage_details).length > 0 && { usageDetails: row.usage_details }),
-    ...(Object.keys(row.cost_details).length > 0 && { costDetails: row.cost_details }),
-    ...(row.completion_start_time !== null && { completionStartTime: row.completion_start_time })
-  };
 }

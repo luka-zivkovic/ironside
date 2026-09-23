@@ -1,4 +1,4 @@
-import { copyFileSync, mkdtempSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +10,11 @@ import { runMigrations } from "../src/migrate.js";
 const connectionString =
   process.env.DATABASE_URL ?? "postgres://ironside:ironside@localhost:5433/ironside";
 const shippedMigrationsDir = fileURLToPath(new URL("../migrations", import.meta.url));
+/** Every migration this release ships, in order. */
+const currentMigrationIds = readdirSync(shippedMigrationsDir)
+  .filter((file) => file.endsWith(".sql"))
+  .sort()
+  .map((file) => file.replace(/\.sql$/, ""));
 
 /** A migrations directory holding only the files a v0.3.0 install applied. */
 function v030MigrationsDir(): string {
@@ -58,7 +63,7 @@ describe("Postgres upgrades", () => {
     const applied = await pool.query<{ id: string }>(
       `select id from ironside_migrations order by id collate "C"`
     );
-    expect(applied.rows.map((row) => row.id)).toEqual(["0001_baseline", "0002_project_model_prices"]);
+    expect(applied.rows.map((row) => row.id)).toEqual(currentMigrationIds);
     const projects = await pool.query("select id, name from projects");
     expect(projects.rows).toEqual([{ id: "proj_1", name: "upgrade-project" }]);
     await pool.query(
@@ -74,10 +79,7 @@ describe("Postgres upgrades", () => {
     await Promise.all(Array.from({ length: 4 }, () => runMigrations(pool)));
 
     const applied = await pool.query<{ id: string }>("select id from ironside_migrations");
-    expect(applied.rows.map((row) => row.id).sort()).toEqual([
-      "0001_baseline",
-      "0002_project_model_prices"
-    ]);
+    expect(applied.rows.map((row) => row.id).sort()).toEqual(currentMigrationIds);
   });
 
   it("refuses to start on a schema a newer release migrated, naming the unknown migration", async () => {

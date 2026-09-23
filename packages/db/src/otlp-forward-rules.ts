@@ -1,5 +1,10 @@
 import type { Pool } from "pg";
-import type { ExportFilter } from "./export-configs.js";
+import {
+  FEED_CURSOR_COLUMNS,
+  feedCursorFromRow,
+  type DestinationFeedCursor,
+  type ExportFilter
+} from "./export-configs.js";
 
 export interface OtlpForwardRule {
   id: string;
@@ -12,6 +17,8 @@ export interface OtlpForwardRule {
   enabled: boolean;
   pollIntervalSeconds: number;
   nextRunAt: Date;
+  /** Null until the first trace is forwarded; the next run starts at the beginning of the feed. */
+  feedCursor: DestinationFeedCursor | null;
 }
 
 interface OtlpForwardRuleRow {
@@ -24,6 +31,8 @@ interface OtlpForwardRuleRow {
   enabled: boolean;
   poll_interval_seconds: number;
   next_run_at: Date;
+  feed_cursor_trace_id: string | null;
+  feed_cursor_published_at_text?: string | null;
 }
 
 function fromRow(row: OtlpForwardRuleRow): OtlpForwardRule {
@@ -36,7 +45,8 @@ function fromRow(row: OtlpForwardRuleRow): OtlpForwardRule {
     filter: row.filter,
     enabled: row.enabled,
     pollIntervalSeconds: row.poll_interval_seconds,
-    nextRunAt: row.next_run_at
+    nextRunAt: row.next_run_at,
+    feedCursor: feedCursorFromRow(row)
   };
 }
 
@@ -57,7 +67,7 @@ export async function createOtlpForwardRule(
   const result = await pool.query<OtlpForwardRuleRow>(
     `insert into otlp_forward_rules (id, project_id, name, destination_url, destination_auth_header_encrypted, filter)
      values ($1, $2, $3, $4, $5, $6)
-     returning *`,
+     returning *, ${FEED_CURSOR_COLUMNS}`,
     [
       input.id,
       input.projectId,
@@ -78,7 +88,7 @@ export async function getOtlpForwardRule(
   id: string
 ): Promise<OtlpForwardRule | null> {
   const result = await pool.query<OtlpForwardRuleRow>(
-    "select * from otlp_forward_rules where project_id = $1 and id = $2",
+    `select *, ${FEED_CURSOR_COLUMNS} from otlp_forward_rules where project_id = $1 and id = $2`,
     [projectId, id]
   );
   const row = result.rows[0];
@@ -87,7 +97,7 @@ export async function getOtlpForwardRule(
 
 export async function listOtlpForwardRules(pool: Pool, projectId: string): Promise<OtlpForwardRule[]> {
   const result = await pool.query<OtlpForwardRuleRow>(
-    "select * from otlp_forward_rules where project_id = $1 order by created_at asc",
+    `select *, ${FEED_CURSOR_COLUMNS} from otlp_forward_rules where project_id = $1 order by created_at asc`,
     [projectId]
   );
   return result.rows.map(fromRow);
@@ -95,7 +105,7 @@ export async function listOtlpForwardRules(pool: Pool, projectId: string): Promi
 
 export async function listEnabledOtlpForwardRules(pool: Pool): Promise<OtlpForwardRule[]> {
   const result = await pool.query<OtlpForwardRuleRow>(
-    "select * from otlp_forward_rules where enabled = true order by id asc"
+    `select *, ${FEED_CURSOR_COLUMNS} from otlp_forward_rules where enabled = true order by id asc`
   );
   return result.rows.map(fromRow);
 }
@@ -118,7 +128,7 @@ export async function updateOtlpForwardRule(
          poll_interval_seconds = coalesce($4, poll_interval_seconds),
          updated_at = now()
      where id = $1 and project_id = $2
-     returning *`,
+     returning *, ${FEED_CURSOR_COLUMNS}`,
     [id, projectId, input.enabled ?? null, input.pollIntervalSeconds ?? null]
   );
   const row = result.rows[0];
@@ -148,8 +158,33 @@ export async function claimDueOtlpForwardRules(
        limit $1
        for update skip locked
      )
-     returning *`,
+     returning *, ${FEED_CURSOR_COLUMNS}`,
     [limit]
   );
   return result.rows.map(fromRow);
+}
+
+/**
+ * Stores how far forwarding got through the trace feed. `runAgainSoon`
+ * makes the next scheduler tick continue a backlog the run stopped short of.
+ */
+export async function recordOtlpForwardProgress(
+  pool: Pool,
+  id: string,
+  progress: { feedCursor: DestinationFeedCursor | null; runAgainSoon?: boolean }
+): Promise<void> {
+  await pool.query(
+    `update otlp_forward_rules
+     set feed_cursor_published_at = $2::timestamptz,
+         feed_cursor_trace_id = $3::text,
+         next_run_at = case when $4 then now() else next_run_at end,
+         updated_at = now()
+     where id = $1`,
+    [
+      id,
+      progress.feedCursor?.publishedAt ?? null,
+      progress.feedCursor?.traceId ?? null,
+      progress.runAgainSoon ?? false
+    ]
+  );
 }

@@ -1,10 +1,10 @@
 import type { ObservationRow } from "@ironside/clickhouse";
 import type { Observation, Trace } from "@ironside/shared";
 import { describe, expect, it } from "vitest";
+import { observationFromStoredRow } from "../src/lib/stored-rows.js";
 import {
   fillUnprovidedObservationFields,
-  fillUnprovidedTraceFields,
-  observationFromStoredRow
+  fillUnprovidedTraceFields
 } from "../src/processors/langfuse-merge.js";
 
 const DERIVED_COST_METADATA = {

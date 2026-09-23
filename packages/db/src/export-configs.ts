@@ -13,6 +13,12 @@ export interface ExportFilter {
   metadataValue?: string;
 }
 
+/** Position in the durable trace feed (evaluator_trace_feed), ordered by (publishedAt, traceId). */
+export interface DestinationFeedCursor {
+  publishedAt: string;
+  traceId: string;
+}
+
 export interface ExportConfig {
   id: string;
   projectId: string;
@@ -33,6 +39,8 @@ export interface ExportConfig {
   lastRunRowCount: number | null;
   pollIntervalSeconds: number;
   nextRunAt: Date;
+  /** Null until the first run exports anything; the next run starts at the beginning of the feed. */
+  feedCursor: DestinationFeedCursor | null;
 }
 
 interface ExportConfigRow {
@@ -54,9 +62,25 @@ interface ExportConfigRow {
   last_run_row_count: string | null; // bigint comes back as string over node-postgres
   poll_interval_seconds: number;
   next_run_at: Date;
+  feed_cursor_published_at: Date | null;
+  feed_cursor_trace_id: string | null;
 }
 
-function fromRow(row: ExportConfigRow): ExportConfig {
+/** Microsecond ISO, the precision evaluator_trace_feed.published_at carries; Date would truncate it to milliseconds. */
+export const FEED_CURSOR_COLUMNS = `
+  to_char(feed_cursor_published_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+    as feed_cursor_published_at_text`;
+
+export function feedCursorFromRow(row: {
+  feed_cursor_published_at_text?: string | null;
+  feed_cursor_trace_id: string | null;
+}): DestinationFeedCursor | null {
+  return row.feed_cursor_published_at_text && row.feed_cursor_trace_id !== null
+    ? { publishedAt: row.feed_cursor_published_at_text, traceId: row.feed_cursor_trace_id }
+    : null;
+}
+
+function fromRow(row: ExportConfigRow & { feed_cursor_published_at_text?: string | null }): ExportConfig {
   return {
     id: row.id,
     projectId: row.project_id,
@@ -75,7 +99,8 @@ function fromRow(row: ExportConfigRow): ExportConfig {
     lastRunError: row.last_run_error,
     lastRunRowCount: row.last_run_row_count === null ? null : Number(row.last_run_row_count),
     pollIntervalSeconds: row.poll_interval_seconds,
-    nextRunAt: row.next_run_at
+    nextRunAt: row.next_run_at,
+    feedCursor: feedCursorFromRow(row)
   };
 }
 
@@ -104,7 +129,7 @@ export async function createExportConfig(
        destination_endpoint, destination_region, destination_access_key_id,
        destination_secret_access_key_encrypted
      ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-     returning *`,
+     returning *, ${FEED_CURSOR_COLUMNS}`,
     [
       input.id,
       input.projectId,
@@ -130,7 +155,7 @@ export async function getExportConfig(
   id: string
 ): Promise<ExportConfig | null> {
   const result = await pool.query<ExportConfigRow>(
-    "select * from export_configs where project_id = $1 and id = $2",
+    `select *, ${FEED_CURSOR_COLUMNS} from export_configs where project_id = $1 and id = $2`,
     [projectId, id]
   );
   const row = result.rows[0];
@@ -139,7 +164,7 @@ export async function getExportConfig(
 
 export async function listExportConfigs(pool: Pool, projectId: string): Promise<ExportConfig[]> {
   const result = await pool.query<ExportConfigRow>(
-    "select * from export_configs where project_id = $1 order by created_at asc",
+    `select *, ${FEED_CURSOR_COLUMNS} from export_configs where project_id = $1 order by created_at asc`,
     [projectId]
   );
   return result.rows.map(fromRow);
@@ -147,7 +172,7 @@ export async function listExportConfigs(pool: Pool, projectId: string): Promise<
 
 export async function listEnabledExportConfigs(pool: Pool): Promise<ExportConfig[]> {
   const result = await pool.query<ExportConfigRow>(
-    "select * from export_configs where enabled = true order by id asc"
+    `select *, ${FEED_CURSOR_COLUMNS} from export_configs where enabled = true order by id asc`
   );
   return result.rows.map(fromRow);
 }
@@ -170,7 +195,7 @@ export async function updateExportConfig(
          poll_interval_seconds = coalesce($4, poll_interval_seconds),
          updated_at = now()
      where id = $1 and project_id = $2
-     returning *`,
+     returning *, ${FEED_CURSOR_COLUMNS}`,
     [id, projectId, input.enabled ?? null, input.pollIntervalSeconds ?? null]
   );
   const row = result.rows[0];
@@ -211,22 +236,48 @@ export async function claimDueExportConfigs(
        limit $1
        for update skip locked
      )
-     returning *`,
+     returning *, ${FEED_CURSOR_COLUMNS}`,
     [limit]
   );
   return result.rows.map(fromRow);
 }
 
+/**
+ * Records a run's outcome. A successful run also stores how far it read the
+ * trace feed; a failed one leaves the position alone so the next run sends
+ * the same traces again. `runAgainSoon` makes the next scheduler tick
+ * continue a backlog the run stopped short of.
+ */
 export async function recordExportRun(
   pool: Pool,
   id: string,
-  outcome: { status: ExportRunStatus; error?: string; rowCount?: number }
+  outcome: {
+    status: ExportRunStatus;
+    error?: string;
+    rowCount?: number;
+    feedCursor?: DestinationFeedCursor | null;
+    runAgainSoon?: boolean;
+  }
 ): Promise<void> {
+  const updateCursor = outcome.feedCursor !== undefined;
   await pool.query(
     `update export_configs
      set last_run_at = now(), last_run_status = $2, last_run_error = $3,
-         last_run_row_count = $4, updated_at = now()
+         last_run_row_count = $4,
+         feed_cursor_published_at = case when $5 then $6::timestamptz else feed_cursor_published_at end,
+         feed_cursor_trace_id = case when $5 then $7::text else feed_cursor_trace_id end,
+         next_run_at = case when $8 then now() else next_run_at end,
+         updated_at = now()
      where id = $1`,
-    [id, outcome.status, outcome.error ?? null, outcome.rowCount ?? null]
+    [
+      id,
+      outcome.status,
+      outcome.error ?? null,
+      outcome.rowCount ?? null,
+      updateCursor,
+      outcome.feedCursor?.publishedAt ?? null,
+      outcome.feedCursor?.traceId ?? null,
+      outcome.runAgainSoon ?? false
+    ]
   );
 }

@@ -803,3 +803,60 @@ export async function getAggregates(
     latency_p99: durationRow?.latency_p99 ?? null
   };
 }
+
+/** Observations for a page of traces, project-scoped, oldest-first per trace. Batch form of listObservationsForTrace. */
+export async function listObservationsForTraces(
+  client: ClickHouseClient,
+  projectId: string,
+  traceIds: string[]
+): Promise<ObservationRow[]> {
+  const uniqueTraceIds = [...new Set(traceIds)].filter(Boolean);
+  if (uniqueTraceIds.length === 0) return [];
+  const result = await client.query({
+    // Same Map value casts as listObservationsForTrace.
+    query: `
+      select id, trace_id, parent_observation_id, type, name, start_time, end_time,
+             level, status_message, model, model_parameters, input, output,
+             mapApply((k, v) -> (k, toFloat64(v)), usage_details) as usage_details,
+             mapApply((k, v) -> (k, toFloat64(v)), cost_details) as cost_details,
+             completion_start_time, metadata
+      from observations final
+      where project_id = {projectId:String} and trace_id in {traceIds:Array(String)}
+      order by trace_id asc, start_time asc, id asc
+    `,
+    query_params: { projectId, traceIds: uniqueTraceIds },
+    format: "JSONEachRow"
+  });
+  const rows = await result.json<ObservationRow>();
+  return rows.map((row) => ({
+    ...row,
+    start_time: fromClickHouseDateTime(row.start_time),
+    end_time: row.end_time ? fromClickHouseDateTime(row.end_time) : null,
+    completion_start_time: row.completion_start_time
+      ? fromClickHouseDateTime(row.completion_start_time)
+      : null
+  }));
+}
+
+/** Scores for a page of traces, project-scoped, oldest-first per trace. Batch form of listScoresForTrace. */
+export async function listScoresForTraces(
+  client: ClickHouseClient,
+  projectId: string,
+  traceIds: string[]
+): Promise<ScoreRow[]> {
+  const uniqueTraceIds = [...new Set(traceIds)].filter(Boolean);
+  if (uniqueTraceIds.length === 0) return [];
+  const result = await client.query({
+    query: `
+      select id, trace_id, observation_id, name, data_type, value, string_value,
+             source, comment, timestamp, metadata
+      from scores final
+      where project_id = {projectId:String} and trace_id in {traceIds:Array(String)}
+      order by trace_id asc, timestamp asc, id asc
+    `,
+    query_params: { projectId, traceIds: uniqueTraceIds },
+    format: "JSONEachRow"
+  });
+  const rows = await result.json<ScoreRow>();
+  return rows.map((row) => ({ ...row, timestamp: fromClickHouseDateTime(row.timestamp) }));
+}

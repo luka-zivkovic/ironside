@@ -1,4 +1,4 @@
-import { createClickHouseClient, insertTraces, runMigrations as runChMigrations } from "@ironside/clickhouse";
+import { createClickHouseClient, runMigrations as runChMigrations } from "@ironside/clickhouse";
 import {
   createExportConfig,
   createOtlpForwardRule,
@@ -15,6 +15,7 @@ import { ulid } from "ulid";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/config.js";
 import { startScheduler, type Scheduler } from "../src/scheduler.js";
+import { insertPublishedTrace } from "./support/published-traces.js";
 
 // These are real end-to-end integration tests (real ClickHouse/Postgres/
 // MinIO, real DuckDB writes for the export path) driven by a poll loop
@@ -96,19 +97,9 @@ async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 10_000): P
 describe("startScheduler", () => {
   it("claims a due export config, decrypts its secret, runs the export, and records success", async () => {
     const marker = `sched_export_${ulid()}`;
-    await insertTraces(
-      clickhouse,
-      [
-        {
-          id: `trace_${marker}`,
-          projectId,
-          timestamp: new Date().toISOString(),
-          tags: [marker],
-          metadata: {}
-        }
-      ],
-      { eventTs: new Date().toISOString() }
-    );
+    await insertPublishedTrace({ pool, clickhouse }, {
+      trace: { id: `trace_${marker}`, projectId, timestamp: new Date().toISOString(), tags: [marker], metadata: {} }
+    });
 
     const exportConfig = await createExportConfig(pool, {
       id: `export_${ulid()}`,
@@ -147,6 +138,10 @@ describe("startScheduler", () => {
   });
 
   it("records a failure (not a crash) when a claimed export's destination is unreachable, and still advances next_run_at", async () => {
+    // A published trace, so the run has something to upload.
+    await insertPublishedTrace({ pool, clickhouse }, {
+      trace: { id: `trace_sched_fail_${ulid()}`, projectId, timestamp: new Date().toISOString(), tags: [], metadata: {} }
+    });
     const exportConfig = await createExportConfig(pool, {
       id: `export_${ulid()}`,
       projectId,
@@ -238,11 +233,9 @@ describe("startScheduler", () => {
     });
     // A second, healthy config proves the bad row doesn't block others.
     const marker = `sched_decrypt_${ulid()}`;
-    await insertTraces(
-      clickhouse,
-      [{ id: `trace_${marker}`, projectId, timestamp: new Date().toISOString(), tags: [marker], metadata: {} }],
-      { eventTs: new Date().toISOString() }
-    );
+    await insertPublishedTrace({ pool, clickhouse }, {
+      trace: { id: `trace_${marker}`, projectId, timestamp: new Date().toISOString(), tags: [marker], metadata: {} }
+    });
     const healthyConfig = await createExportConfig(pool, {
       id: `export_${ulid()}`,
       projectId,
