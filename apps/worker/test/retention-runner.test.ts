@@ -19,8 +19,16 @@ import {
 import { loadConfig } from "../src/config.js";
 
 const config = loadConfig();
-const pool = new Pool({ connectionString: config.databaseUrl });
-const clickhouse = createClickHouseClient(config.clickhouse);
+// Retention enumerates every project and drops whole monthly partitions.
+// A unique project alone cannot isolate it from concurrent importer tests.
+const namespace = `retention_test_${ulid().toLowerCase()}`;
+const adminPool = new Pool({ connectionString: config.databaseUrl });
+const pool = new Pool({
+  connectionString: config.databaseUrl,
+  options: `-c search_path=${namespace}`
+});
+const adminClickhouse = createClickHouseClient(config.clickhouse);
+const clickhouse = createClickHouseClient({ ...config.clickhouse, database: namespace });
 
 vi.setConfig({ testTimeout: 15_000 });
 
@@ -40,6 +48,8 @@ async function seedProject(name: string, retentionDays: number | null): Promise<
 }
 
 beforeAll(async () => {
+  await adminPool.query(`create schema ${namespace}`);
+  await adminClickhouse.command({ query: `create database ${namespace}` });
   await runPgMigrations(pool);
   await runChMigrations(clickhouse);
   organizationId = `org_${ulid()}`;
@@ -47,9 +57,15 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  await pool.query("delete from organizations where name = 'retention-runner-test-org'");
   await pool.end();
   await clickhouse.close();
+  try {
+    await adminPool.query(`drop schema if exists ${namespace} cascade`);
+    await adminClickhouse.command({ query: `drop database if exists ${namespace} sync` });
+  } finally {
+    await adminPool.end();
+    await adminClickhouse.close();
+  }
 });
 
 describe("runRetention", () => {
