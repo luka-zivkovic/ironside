@@ -62,9 +62,11 @@ by Coolify, and trustctl does not update a Coolify Service.
 Every tagged release (`vX.Y.Z`) runs the build, typecheck, and test suite,
 validates the generic Compose checksum and render, and then publishes
 multi-architecture `ghcr.io/luka-zivkovic/ironside-{api,worker,web}:X.Y.Z`
-images. The `0.2.0` images are public and anonymously pullable today (amd64
-and arm64), so `0.2.0` is the first version installable this way; `0.1.0`
-predates the public-image contract. The release tag is immutable; a `sha-<full commit>` tag is published
+images. The `0.3.0` images are the current release and are public and
+anonymously pullable (amd64 and arm64). `0.2.0` was the first version
+installable this way; `0.3.0` changed the clean-install baselines, so install it
+fresh rather than updating a `0.2.0` instance. `0.1.0` predates the
+public-image contract. The release tag is immutable; a `sha-<full commit>` tag is published
 for traceability. To use published images instead of building from source,
 use the [generic single-host bundle](../deploy/self-host/compose.yaml), the
 [Coolify stack](../deploy/coolify.yaml), or replace each `build:` block with
@@ -73,11 +75,11 @@ its matching exact `image:` reference.
 ```yaml
 services:
   api:
-    image: ghcr.io/luka-zivkovic/ironside-api:0.2.0
+    image: ghcr.io/luka-zivkovic/ironside-api:0.3.0
   worker:
-    image: ghcr.io/luka-zivkovic/ironside-worker:0.2.0
+    image: ghcr.io/luka-zivkovic/ironside-worker:0.3.0
   web:
-    image: ghcr.io/luka-zivkovic/ironside-web:0.2.0
+    image: ghcr.io/luka-zivkovic/ironside-web:0.3.0
 ```
 
 After every image publishes, the workflow pulls those exact tags into the
