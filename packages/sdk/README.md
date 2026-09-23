@@ -81,6 +81,19 @@ await ironside.shutdown();
 
 Instrumentation calls buffer events and do not block application requests. Call `flush()` at a lifecycle boundary when needed, and always call `shutdown()` during graceful process termination so buffered and in-flight events finish sending. Failed background batches are reported through `onError`; they are not thrown into the instrumented request path.
 
+### Delivery and retries
+
+A batch that fails with a network error, `408`, `429`, or a `5xx` response is retried with exponential backoff; a server `Retry-After` header sets the wait instead. Retries are safe: every event carries a client-generated id, so a batch the server already accepted updates the same records rather than duplicating them. Other `4xx` responses are not retried. A batch is reported through `onError` only after its last attempt fails.
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `maxRetries` | `5` | Retries after the first attempt; `0` disables retrying. |
+| `retryDelayMs` | `500` | Base backoff delay, doubled on each retry. |
+| `maxQueuedEvents` | `10000` | Events held in memory while sends are pending. New events beyond it are dropped and reported through `onError` on the next flush. |
+| `shutdownTimeoutMs` | `10000` | Longest `shutdown()` waits for sends and retries. When it expires, the pending request is cancelled and unsent batches are reported through `onError`. |
+
+A pending retry keeps the Node.js process alive the same way an in-flight request does. In serverless functions, set `shutdownTimeoutMs` below the platform's function timeout.
+
 `recordGenerateTextResult()` is available for results returned by the Vercel AI SDK. `uploadMedia()` stores binary content separately and returns an `ironside://media/...` reference suitable for trace input or output.
 
 ## Choosing an integration
