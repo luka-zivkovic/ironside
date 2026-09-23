@@ -58,7 +58,7 @@ async function resolveLimit(pool: Pool, redis: Redis, projectId: string, default
 /**
  * Fixed-window per-project rate limiter, backed by the same shared Redis
  * instance every route already gets via machineAuth — no separate
- * connection pool, no in-memory per-process state (unlike coeval's
+ * connection pool, no in-memory per-process state (unlike rubrist's
  * hand-rolled in-memory token bucket, explicitly marked there as a
  * stopgap because it doesn't share state across horizontally-scaled
  * instances or survive restarts; ironside already has shared Redis

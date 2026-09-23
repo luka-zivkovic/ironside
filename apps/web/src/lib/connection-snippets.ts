@@ -60,7 +60,7 @@ export LANGFUSE_SECRET_KEY="\${IRONSIDE_API_KEY}"`
 curl --fail-with-body --request POST \\
   --header "Authorization: Bearer \${IRONSIDE_API_KEY}" \\
   --header "Content-Type: application/json" \\
-  --data '{"id":"<assessment-id>","traceId":"<trace-id>","name":"quality","value":1,"assessmentLabel":"pass","evaluator":{"provider":"coeval","versionId":"<version-id>","criterionKey":"quality"}}' \\
+  --data '{"id":"<assessment-id>","traceId":"<trace-id>","name":"quality","value":1,"assessmentLabel":"pass","evaluator":{"provider":"rubrist","versionId":"<version-id>","criterionKey":"quality"}}' \\
   "${base}/api/v1/evaluator/scores"`
     }
   ];

@@ -28,40 +28,47 @@ function observation(id: string, children: ObservationNode[] = []): ObservationN
   };
 }
 
+const project: Project = {
+  id: "project_test",
+  organizationId: "org_test",
+  name: "Test",
+  createdAt: "2026-08-25T00:00:00.000Z",
+  rateLimitPerMinute: null,
+  retentionDays: null,
+  traceQuietPeriodSeconds: null
+};
+
+function trace(): TraceTreeResponse {
+  return {
+    id: "trace_test",
+    timestamp: "2026-08-25T00:00:00.000Z",
+    name: "Trace",
+    userId: null,
+    sessionId: null,
+    environment: null,
+    release: null,
+    version: null,
+    tags: [],
+    metadata: {},
+    input: null,
+    output: null,
+    observations: [observation("parent", [observation("child")]), observation("sibling")]
+  };
+}
+
+function render(rubristUrl?: string | null, record: TraceTreeResponse = trace()): string {
+  return renderToStaticMarkup(
+    createElement(MemoryRouter, null,
+      createElement(ActiveProjectProvider, { project, projects: [project] },
+        createElement(TraceRecordView, { trace: record, rubristUrl })
+      )
+    )
+  );
+}
+
 describe("TraceRecordView", () => {
   it("renders a labelled single-select tree with one roving tab stop", () => {
-    const project: Project = {
-      id: "project_test",
-      organizationId: "org_test",
-      name: "Test",
-      createdAt: "2026-08-25T00:00:00.000Z",
-      rateLimitPerMinute: null,
-      retentionDays: null,
-      traceQuietPeriodSeconds: null
-    };
-    const trace: TraceTreeResponse = {
-      id: "trace_test",
-      timestamp: "2026-08-25T00:00:00.000Z",
-      name: "Trace",
-      userId: null,
-      sessionId: null,
-      environment: null,
-      release: null,
-      version: null,
-      tags: [],
-      metadata: {},
-      input: null,
-      output: null,
-      observations: [observation("parent", [observation("child")]), observation("sibling")]
-    };
-
-    const html = renderToStaticMarkup(
-      createElement(MemoryRouter, null,
-        createElement(ActiveProjectProvider, { project, projects: [project] },
-          createElement(TraceRecordView, { trace })
-        )
-      )
-    );
+    const html = render();
 
     expect(html).toContain('role="tree"');
     expect(html.match(/role="treeitem"/g)).toHaveLength(3);
@@ -72,5 +79,20 @@ describe("TraceRecordView", () => {
     expect(html).toContain('aria-selected="false"');
     expect(html).toContain("hover:bg-card-2");
     expect(html).toContain("trace-tree-row");
+  });
+
+  it("hides the Rubrist link unless the operator configured a Rubrist URL", () => {
+    expect(render()).not.toContain("Open in Rubrist");
+    expect(render(null)).not.toContain("Open in Rubrist");
+  });
+
+  it("links the trace to Rubrist using the evaluator project and trace identity", () => {
+    const html = render("https://rubrist.example.com/app", { ...trace(), id: "trace/with space" });
+    expect(html).toContain("Open in Rubrist");
+    expect(html).toContain(
+      'href="https://rubrist.example.com/app/links/trace?source=ironside&amp;project=project_test&amp;trace=trace%2Fwith+space"'
+    );
+    expect(html).toContain('target="_blank"');
+    expect(html).toContain('rel="noopener noreferrer"');
   });
 });

@@ -91,14 +91,14 @@ export function langfuseRoutes(deps: LangfuseDeps): Hono<AuthEnv> {
   });
 
   // POST /api/public/scores — LangFuse's score-create endpoint, the write
-  // half of the M8 coeval integration: coeval's feedback-sync worker posts
-  // judge verdicts here ({id, traceId, name: "coeval_verdict", value,
+  // half of the M8 rubrist integration: rubrist's feedback-sync worker posts
+  // judge verdicts here ({id, traceId, name: "rubrist_verdict", value,
   // comment, metadata}) exactly as it would to a real LangFuse host.
   // Reuses the native score-upsert envelope path — the route translates
   // LangFuse's score body into a domain-shaped score-upsert event, and the
   // existing worker native mapper inserts it; no worker changes needed.
   // Replays with the same id are harmless upserts (ReplacingMergeTree
-  // dedups on id), so there's no 409-on-duplicate: callers like coeval
+  // dedups on id), so there's no 409-on-duplicate: callers like rubrist
   // treat any 2xx as success and their idempotency ids simply converge.
   app.post("/public/scores", async (c) => {
     const parsed = langfuseCreateScoreSchema.safeParse(await c.req.json().catch(() => null));

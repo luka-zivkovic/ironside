@@ -23,7 +23,7 @@ OpenTelemetry to connect your application.
   </picture>
 </p>
 
-Ironside focuses on **trace storage, a viewer, and data integrations**. Bring your own evaluation and prompt-management tools. Ironside exposes a native, versioned settled-trace feed for evaluator systems such as [Coeval](https://github.com/luka-zivkovic/coeval), while retaining LangFuse-compatible fetch and score APIs for existing tools.
+Ironside focuses on **trace storage, a viewer, and data integrations**. Bring your own evaluation and prompt-management tools. Ironside exposes a native, versioned settled-trace feed for evaluator systems such as [Rubrist](https://github.com/luka-zivkovic/rubrist), while retaining LangFuse-compatible fetch and score APIs for existing tools.
 
 ## Where Ironside fits
 
@@ -33,14 +33,21 @@ job; none requires the others.
 | Tool | Job | Status with Ironside |
 | --- | --- | --- |
 | **Ironside** (this repo) | Records what your AI did: traces via the SDK, JSON, or OTLP; LangFuse-compatible read and score APIs; a native `ironside/evaluator/v1` settled-trace feed. | Current. |
-| [Coeval](https://github.com/luka-zivkovic/coeval) | Turns failures into evaluators checked against human judgment. | Current: consumes Ironside's evaluator feed, verified end to end ([`spec/langfuse-fetch-v1.md`](./spec/langfuse-fetch-v1.md), [`spec/evaluator-integration-v1.md`](./spec/evaluator-integration-v1.md)). |
-| [Dailies](https://github.com/luka-zivkovic/dailies) | Decides whether an AI change meets release rules from evidence such as Coeval receipts. | No direct Ironside integration; Dailies consumes Coeval evidence. |
+| [Rubrist](https://github.com/luka-zivkovic/rubrist) | Turns failures into evaluators checked against human judgment. | Current: consumes Ironside's evaluator feed, verified end to end ([`spec/langfuse-fetch-v1.md`](./spec/langfuse-fetch-v1.md), [`spec/evaluator-integration-v1.md`](./spec/evaluator-integration-v1.md)). |
+| [Dailies](https://github.com/luka-zivkovic/dailies) | Decides whether an AI change meets release rules from evidence such as Rubrist receipts. | No direct Ironside integration; Dailies consumes Rubrist evidence. |
 | [Casefile](https://github.com/luka-zivkovic/casefile) | Inspects agent skills and plugins before installation. | No Ironside integration; it is the scanner used to check this repo's plugin. |
 | [Overclock](https://github.com/luka-zivkovic/overclock) | Coding-agent skills, including optional Claude Code and Codex session importers for Ironside. | Current: the importers write to an existing Ironside instance ([session capture](docs/agent-setup.md#capture-coding-agent-sessions)). |
 
-The intent is that traces in Ironside can feed Coeval, and Coeval's evidence
+The intent is that traces in Ironside can feed Rubrist, and Rubrist's evidence
 can feed Dailies, without any of the three owning the others' data. That is a
 direction, not a commitment; see each repository for its own status.
+
+Ironside and Rubrist can also link to each other's views. Set the optional
+`IRONSIDE_RUBRIST_URL` on the API to show an **Open in Rubrist** link on each
+trace. Rubrist, or any other tool, can link back to a trace at the stable URL
+`<Ironside web base>/projects/<projectId>/traces/<traceId>`. Both link
+shapes are defined in
+[`spec/evaluator-integration-v1.md`](./spec/evaluator-integration-v1.md#viewer-deep-links).
 
 Status: pre-release, under active development. See [ROADMAP.md](./ROADMAP.md). Licensed under the [MIT License](./LICENSE.md).
 
@@ -166,11 +173,11 @@ includes Claude Code and Codex session importers and a pi tracing extension.
 See [session capture](docs/agent-setup.md#capture-coding-agent-sessions) for the
 separate installation path.
 
-For evaluation tools inside your harness, [Coeval](https://github.com/luka-zivkovic/coeval)
+For evaluation tools inside your harness, [Rubrist](https://github.com/luka-zivkovic/rubrist)
 can consume Ironside's native evaluator feed and exposes its own
-[stdio MCP server](https://github.com/luka-zivkovic/coeval/tree/main/tools/mcp).
-That connection uses a **Coeval project key**. Ironside's **Integration**
-credential is configured separately in Coeval to read traces and write scores.
+[stdio MCP server](https://github.com/luka-zivkovic/rubrist/tree/main/tools/mcp).
+That connection uses a **Rubrist project key**. Ironside's **Integration**
+credential is configured separately in Rubrist to read traces and write scores.
 
 ## Architecture
 

@@ -1,5 +1,5 @@
 # Ironside local/self-host stack. Ports are offset to coexist with a local
-# coeval instance (postgres 5433 vs 5432) and to avoid the ClickHouse native
+# rubrist instance (postgres 5433 vs 5432) and to avoid the ClickHouse native
 # port clashing with MinIO's default 9000.
 services:
   postgres:
@@ -112,6 +112,9 @@ services:
       # Changing it orphans already-encrypted credentials — see the backup
       # caveat in docs/self-hosting.md.
       IRONSIDE_ENCRYPTION_SECRET: ${IRONSIDE_ENCRYPTION_SECRET:-}
+      # Optional Rubrist web base URL; set to show "Open in Rubrist" on each
+      # trace. Unset = no link. Read by the web app at runtime.
+      IRONSIDE_RUBRIST_URL: ${IRONSIDE_RUBRIST_URL:-}
     ports:
       - "8788:8788"
     depends_on:
