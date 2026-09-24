@@ -3,9 +3,13 @@ import type { Observation, Trace } from "@ironside/shared";
 import { describe, expect, it } from "vitest";
 import { observationFromStoredRow } from "../src/lib/stored-rows.js";
 import {
-  fillUnprovidedObservationFields,
-  fillUnprovidedTraceFields
+  instant,
+  mergeByRecency,
+  mergeObservationByRecency
 } from "../src/processors/langfuse-merge.js";
+
+const EARLIER = instant("2026-09-23T10:00:00.000Z");
+const LATER = instant("2026-09-23T10:00:03.000Z");
 
 const DERIVED_COST_METADATA = {
   "ironside:cost_source": "table",
@@ -13,7 +17,8 @@ const DERIVED_COST_METADATA = {
   "ironside:cost_table": "2026-09-11"
 };
 
-function storedGeneration(overrides: Partial<Observation> = {}): Observation {
+/** The row a create maps to: everything a generation starts with. */
+function createRow(overrides: Partial<Observation> = {}): Observation {
   return {
     id: "obs_1",
     traceId: "trace_1",
@@ -29,134 +34,187 @@ function storedGeneration(overrides: Partial<Observation> = {}): Observation {
   };
 }
 
-describe("fillUnprovidedTraceFields", () => {
-  it("takes every field the update did not send from the stored trace, and keeps what it did send", () => {
+/** The row an update-only request maps to: its start time is a placeholder (the update's time). */
+function updateRow(overrides: Partial<Observation> = {}): Observation {
+  return {
+    id: "obs_1",
+    traceId: "trace_1",
+    projectId: "proj_x",
+    type: "generation",
+    startTime: "2026-09-23T10:00:03.000Z",
+    endTime: "2026-09-23T10:00:03.000Z",
+    level: "default",
+    metadata: {},
+    output: { text: "hello" },
+    usageDetails: { input_tokens: 5, output_tokens: 2 },
+    ...overrides
+  };
+}
+
+const CREATE_SENT = new Set<keyof Observation>(["id", "traceId", "projectId", "type", "name", "model", "startTime", "input", "metadata"]);
+const UPDATE_SENT = new Set<keyof Observation>(["id", "traceId", "projectId", "type", "endTime", "output", "usageDetails"]);
+
+function sentAt(fields: Iterable<keyof Observation>, at: string): Record<string, string> {
+  return Object.fromEntries([...fields].map((field) => [field, at]));
+}
+
+describe("mergeByRecency", () => {
+  it("fills an update's missing fields from an older create processed after it, keeping the update's values", () => {
+    const merged = mergeObservationByRecency(createRow(), CREATE_SENT, EARLIER, {
+      row: updateRow(),
+      version: LATER,
+      sentAt: sentAt(UPDATE_SENT, LATER)
+    });
+
+    expect(merged.row).toMatchObject({
+      name: "llm-call",
+      model: "gpt-4o",
+      input: [{ role: "user", content: "hi" }],
+      // The create's real start time replaces the update's placeholder.
+      startTime: "2026-09-23T10:00:00.000Z",
+      endTime: "2026-09-23T10:00:03.000Z",
+      output: { text: "hello" },
+      usageDetails: { input_tokens: 5, output_tokens: 2 },
+      metadata: { team: "sales" }
+    });
+    expect(merged.sentAt).toMatchObject({ startTime: EARLIER, name: EARLIER, output: LATER });
+  });
+
+  it("gives a field both batches sent the value from the later-received batch, whichever is processed last", () => {
+    const later = updateRow({ metadata: { team: "support" } });
+    const laterSent = new Set<keyof Observation>([...UPDATE_SENT, "metadata"]);
+
+    const olderProcessedLast = mergeObservationByRecency(createRow(), CREATE_SENT, EARLIER, {
+      row: later,
+      version: LATER,
+      sentAt: sentAt(laterSent, LATER)
+    });
+    const newerProcessedLast = mergeObservationByRecency(later, laterSent, LATER, {
+      row: createRow(),
+      version: EARLIER,
+      sentAt: sentAt(CREATE_SENT, EARLIER)
+    });
+
+    expect(olderProcessedLast.row.metadata).toEqual({ team: "support" });
+    expect(newerProcessedLast.row.metadata).toEqual({ team: "support" });
+    expect(olderProcessedLast.row).toEqual(newerProcessedLast.row);
+  });
+
+  it("counts a stored row's non-empty fields as sent at its version when no field times were recorded", () => {
     const stored: Trace = {
       id: "trace_1",
       projectId: "proj_x",
       timestamp: "2026-09-23T10:00:00.000Z",
       name: "checkout",
-      userId: "user_1",
-      tags: ["prod"],
-      metadata: { team: "sales" },
-      input: { question: "hi" },
-      output: { answer: "old" }
-    };
-    const incoming: Trace = {
-      id: "trace_1",
-      projectId: "proj_x",
-      timestamp: "2026-09-23T10:00:03.000Z",
       tags: [],
       metadata: {},
-      output: { answer: "new" }
+      output: { answer: "old" }
     };
-    const merged = fillUnprovidedTraceFields(incoming, new Set(["id", "projectId", "output"]), stored);
-    expect(merged).toEqual({ ...stored, output: { answer: "new" } });
+    const olderIncoming: Trace = { ...stored, name: "renamed", tags: ["prod"], output: { answer: "older" } };
+
+    const merged = mergeByRecency(olderIncoming, new Set<keyof Trace>(["id", "projectId", "name", "tags", "output"]), EARLIER, {
+      row: stored,
+      version: LATER,
+      sentAt: undefined
+    });
+
+    // Stored values win as the later ones; empty tags are a default, so the incoming ones fill them.
+    expect(merged.row).toMatchObject({ name: "checkout", output: { answer: "old" }, tags: ["prod"] });
+  });
+
+  it("keeps a stored placeholder when neither side sent the field", () => {
+    const merged = mergeObservationByRecency(updateRow({ startTime: "2026-09-23T10:00:09.000Z" }), UPDATE_SENT, LATER, {
+      row: updateRow(),
+      version: EARLIER,
+      sentAt: sentAt(UPDATE_SENT, EARLIER)
+    });
+    expect(merged.row.startTime).toBe("2026-09-23T10:00:03.000Z");
+    expect(merged.sentAt.startTime).toBeUndefined();
   });
 });
 
-describe("fillUnprovidedObservationFields", () => {
-  it("restores name, model, input, and start time an update did not send", () => {
-    const incoming: Observation = {
-      id: "obs_1",
-      traceId: "trace_1",
-      projectId: "proj_x",
-      type: "generation",
-      startTime: "2026-09-23T10:00:03.000Z",
-      endTime: "2026-09-23T10:00:03.000Z",
-      level: "default",
-      metadata: {},
-      output: { text: "hello" }
-    };
-    const merged = fillUnprovidedObservationFields(
-      incoming,
-      new Set(["id", "traceId", "projectId", "type", "endTime", "output"]),
-      storedGeneration()
-    );
-    expect(merged).toMatchObject({
-      name: "llm-call",
-      model: "gpt-4o",
-      startTime: "2026-09-23T10:00:00.000Z",
-      endTime: "2026-09-23T10:00:03.000Z",
-      input: [{ role: "user", content: "hi" }],
-      output: { text: "hello" },
-      metadata: { team: "sales" }
-    });
-  });
-
-  it("drops a derived cost and its provenance when the update sends new usage, so cost is derived again", () => {
-    const stored = storedGeneration({
-      usageDetails: { input_tokens: 5, output_tokens: 2 },
-      costDetails: { input: 0.0000125, output: 0.00002, total: 0.0000325 },
-      metadata: { team: "sales", ...DERIVED_COST_METADATA }
-    });
-    const incoming: Observation = {
-      ...storedGeneration(),
-      usageDetails: { input_tokens: 50, output_tokens: 20 },
-      metadata: {}
-    };
-    const merged = fillUnprovidedObservationFields(
-      incoming,
-      new Set(["id", "traceId", "projectId", "type", "usageDetails"]),
-      stored
-    );
-    expect(merged.usageDetails).toEqual({ input_tokens: 50, output_tokens: 20 });
-    expect(merged.costDetails).toBeUndefined();
-    expect(merged.metadata).toEqual({ team: "sales" });
-  });
-
-  it("keeps a derived cost and restores its provenance when the update only replaces metadata", () => {
-    const stored = storedGeneration({
+describe("mergeObservationByRecency — cost", () => {
+  it("drops a derived cost and its provenance when a later batch sends new usage, so cost is derived again", () => {
+    const stored = createRow({
       usageDetails: { input_tokens: 5, output_tokens: 2 },
       costDetails: { total: 0.0000325 },
       metadata: { team: "sales", ...DERIVED_COST_METADATA }
     });
-    const incoming: Observation = { ...storedGeneration(), metadata: { team: "support" } };
-    const merged = fillUnprovidedObservationFields(
-      incoming,
-      new Set(["id", "traceId", "projectId", "type", "metadata"]),
-      stored
+    const merged = mergeObservationByRecency(
+      updateRow({ usageDetails: { input_tokens: 50, output_tokens: 20 } }),
+      UPDATE_SENT,
+      LATER,
+      { row: stored, version: EARLIER, sentAt: sentAt([...CREATE_SENT, "usageDetails"], EARLIER) }
     );
-    expect(merged.costDetails).toEqual({ total: 0.0000325 });
-    expect(merged.metadata).toEqual({ team: "support", ...DERIVED_COST_METADATA });
+    expect(merged.row.usageDetails).toEqual({ input_tokens: 50, output_tokens: 20 });
+    expect(merged.row.costDetails).toBeUndefined();
+    expect(merged.row.metadata).toEqual({ team: "sales" });
   });
 
-  it("carries a client-sent cost forward unchanged even when usage changes — only derived costs are recomputed", () => {
-    const stored = storedGeneration({
-      usageDetails: { input_tokens: 5 },
-      costDetails: { total: 1.5 }
+  it("keeps a derived cost when the batch that sent other usage is older than the stored usage", () => {
+    const stored = createRow({
+      usageDetails: { input_tokens: 5, output_tokens: 2 },
+      costDetails: { total: 0.0000325 },
+      metadata: { team: "sales", ...DERIVED_COST_METADATA }
     });
-    const incoming: Observation = { ...storedGeneration(), usageDetails: { input_tokens: 50 } };
-    const merged = fillUnprovidedObservationFields(
-      incoming,
-      new Set(["id", "traceId", "projectId", "type", "usageDetails"]),
-      stored
+    const merged = mergeObservationByRecency(
+      updateRow({ usageDetails: { input_tokens: 1, output_tokens: 1 } }),
+      UPDATE_SENT,
+      EARLIER,
+      { row: stored, version: LATER, sentAt: sentAt([...CREATE_SENT, "usageDetails"], LATER) }
     );
-    expect(merged.costDetails).toEqual({ total: 1.5 });
+    expect(merged.row.usageDetails).toEqual({ input_tokens: 5, output_tokens: 2 });
+    expect(merged.row.costDetails).toEqual({ total: 0.0000325 });
   });
-});
 
-describe("fillUnprovidedObservationFields — a client cost after a derived one", () => {
-  it("drops the derived-cost labels so a later usage update keeps the client's cost", () => {
-    const derived = storedGeneration({
+  it("keeps a derived cost and restores its provenance when a later batch only replaces metadata", () => {
+    const stored = createRow({
+      usageDetails: { input_tokens: 5, output_tokens: 2 },
+      costDetails: { total: 0.0000325 },
+      metadata: { team: "sales", ...DERIVED_COST_METADATA }
+    });
+    const merged = mergeObservationByRecency(
+      createRow({ metadata: { team: "support" } }),
+      new Set<keyof Observation>(["id", "traceId", "projectId", "type", "metadata"]),
+      LATER,
+      { row: stored, version: EARLIER, sentAt: sentAt([...CREATE_SENT, "usageDetails"], EARLIER) }
+    );
+    expect(merged.row.costDetails).toEqual({ total: 0.0000325 });
+    expect(merged.row.metadata).toEqual({ team: "support", ...DERIVED_COST_METADATA });
+  });
+
+  it("keeps a client-sent cost, and drops derived labels carried over from stored metadata, so later usage cannot replace it", () => {
+    const derived = createRow({
       usageDetails: { input_tokens: 1000, output_tokens: 500 },
       costDetails: { total: 0.0075 },
       metadata: { team: "sales", ...DERIVED_COST_METADATA }
     });
-    const clientCost = fillUnprovidedObservationFields(
-      { ...storedGeneration(), costDetails: { total: 0.5 }, metadata: {} },
-      new Set(["id", "traceId", "projectId", "type", "costDetails"]),
-      derived
+    const clientCost = mergeObservationByRecency(
+      updateRow({ costDetails: { total: 0.5 } }),
+      new Set<keyof Observation>(["id", "traceId", "projectId", "type", "costDetails"]),
+      LATER,
+      { row: derived, version: EARLIER, sentAt: sentAt([...CREATE_SENT, "usageDetails"], EARLIER) }
     );
-    expect(clientCost.costDetails).toEqual({ total: 0.5 });
-    expect(clientCost.metadata).toEqual({ team: "sales" });
+    expect(clientCost.row.costDetails).toEqual({ total: 0.5 });
+    expect(clientCost.row.metadata).toEqual({ team: "sales" });
 
-    const laterUsage = fillUnprovidedObservationFields(
-      { ...storedGeneration(), usageDetails: { input_tokens: 1200, output_tokens: 600 }, metadata: {} },
-      new Set(["id", "traceId", "projectId", "type", "usageDetails"]),
-      clientCost
+    const evenLater = instant("2026-09-23T10:00:09.000Z");
+    const laterUsage = mergeObservationByRecency(
+      updateRow({ usageDetails: { input_tokens: 1200, output_tokens: 600 } }),
+      UPDATE_SENT,
+      evenLater,
+      { row: clientCost.row, version: LATER, sentAt: clientCost.sentAt }
     );
-    expect(laterUsage.costDetails).toEqual({ total: 0.5 });
+    expect(laterUsage.row.costDetails).toEqual({ total: 0.5 });
+  });
+});
+
+describe("instant", () => {
+  it("normalizes ISO and ClickHouse renderings to comparable microsecond strings", () => {
+    expect(instant("2026-09-23T10:00:00.123Z")).toBe("2026-09-23T10:00:00.123000Z");
+    expect(instant("2026-09-23 10:00:00.123456")).toBe("2026-09-23T10:00:00.123456Z");
+    expect(instant("2026-09-23 10:00:00")).toBe("2026-09-23T10:00:00.000000Z");
+    expect(instant("2026-09-23T10:00:00.123Z") < instant("2026-09-23 10:00:00.123001")).toBe(true);
   });
 });
 

@@ -59,6 +59,8 @@ export {
   type SettledTraceVersionRow,
   type SettledTraceVersionCursor,
   type TraceDetailRow,
+  type StoredTraceRow,
+  type StoredObservationRow,
   type VersionedTraceDetailRow,
   type VersionedTraceSummaryRow,
   type TraceRawAnchorRow,

@@ -112,6 +112,16 @@ export {
 } from "./otlp-forward-rules.js";
 export { publishTraceScoreActivity, listTraceScoreActivities } from "./trace-score-feed.js";
 export {
+  withLangfuseMergeLocks,
+  closeLangfuseMergeLocks,
+  getLangfuseFieldSentAt,
+  recordLangfuseFieldSentAt,
+  purgeLangfuseFieldSentAtOlderThan,
+  langfuseEntityKey,
+  type LangfuseEntityKind,
+  type LangfuseFieldSentAt
+} from "./langfuse-field-provenance.js";
+export {
   createWebhookRule,
   getWebhookRule,
   listWebhookRules,

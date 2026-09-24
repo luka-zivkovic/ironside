@@ -80,16 +80,27 @@ time or timestamp defaults to the update's event time.
   `tags`, or `metadata`, an observation's `startTime`, `level`, or
   `metadata`, and the `type` guessed for the untyped `observation-*` alias
   do not count as received.
-- Before cost enrichment, the worker reads the stored trace and observation
-  rows for those ids (one row per id, the most recently written) and fills
-  every field the request did not send from them
-  (`apps/worker/src/processors/langfuse-merge.ts`). A stored cost that
-  Ironside derived is dropped when the update sends new usage or a new model,
-  so it is derived again from the merged values; a client-sent cost is
-  carried forward unchanged.
-
-Residual race: the merge reads committed rows, so it covers the normal order in
-which the earlier request was materialized first. If two requests for the same
-record are processed concurrently, or the later one is processed first, each
-can still miss the other's fields, and the row with the higher `event_ts`
-wins. Closing that needs per-record serialization and is not implemented.
+- The worker merges each incoming row into the stored one field by field
+  (`apps/worker/src/processors/langfuse-merge.ts`), in any processing order:
+  - **Serialized per record.** Before reading the stored rows it takes a
+    Postgres advisory lock per trace and observation id, from a dedicated
+    lock pool, and holds it until the merged rows are written and their field
+    times recorded. Two batches for one record never merge concurrently.
+  - **By recency.** `langfuse_field_provenance` (Postgres migration `0005`)
+    records, per record, the receive time of the batch that last sent each
+    field. A field both sides sent takes the later-received batch's value; a
+    field only one side sent takes that side's value; a field neither sent
+    keeps the stored placeholder. An update-only row's placeholder start time
+    therefore gives way to the create's real one even when the create is
+    processed later. A stored row with no recorded times (older data)
+    counts its non-empty fields as sent at its stored version. Recorded times
+    older than 30 days are pruned by retention.
+  - **Last write wins the tie.** A merged row whose stored version is newer
+    than its batch is written with the stored version (`event_ts`, exact to
+    the microsecond). ReplacingMergeTree keeps the most recently inserted row
+    among equal versions, so the merged row wins, and the trace's latest
+    activity, the settlement clock for evaluators and exports, does not move.
+  - **Derived cost stays consistent.** A stored cost Ironside derived is
+    dropped when the merge takes newer usage or a newer model, so it is
+    derived again from the merged values; a client-sent cost is kept, and
+    derived-cost labels carried over from stored metadata are removed from it.

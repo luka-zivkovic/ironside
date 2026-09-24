@@ -629,6 +629,10 @@ export async function listObservationsForTrace(
  */
 const SKIP_INDEXES_WITH_FINAL = { use_skip_indexes_if_final: 1 } as const;
 
+/** A stored row with its exact ReplacingMergeTree version, as ClickHouse renders DateTime64(6). */
+export type StoredTraceRow = TraceDetailRow & { event_ts: string };
+export type StoredObservationRow = ObservationRow & { event_ts: string };
+
 /**
  * Stored traces for these ids, project-scoped: one row per id, the most
  * recently written. A partial update is merged into this row before it is
@@ -639,12 +643,12 @@ export async function listTracesByIds(
   client: ClickHouseClient,
   projectId: string,
   traceIds: string[]
-): Promise<TraceDetailRow[]> {
+): Promise<StoredTraceRow[]> {
   if (traceIds.length === 0) return [];
   const result = await client.query({
     query: `
       select id, timestamp, name, user_id, session_id, environment, release, version,
-             tags, metadata, input, output
+             tags, metadata, input, output, toString(event_ts) as event_ts
       from traces final
       where project_id = {projectId:String} and id in {traceIds:Array(String)}
       order by id, event_ts desc
@@ -654,7 +658,7 @@ export async function listTracesByIds(
     clickhouse_settings: SKIP_INDEXES_WITH_FINAL,
     format: "JSONEachRow"
   });
-  const rows = await result.json<TraceDetailRow>();
+  const rows = await result.json<StoredTraceRow>();
   return rows.map((row) => ({ ...row, timestamp: fromClickHouseDateTime(row.timestamp) }));
 }
 
@@ -667,7 +671,7 @@ export async function listObservationsByIds(
   client: ClickHouseClient,
   projectId: string,
   observations: { id: string; traceId: string }[]
-): Promise<ObservationRow[]> {
+): Promise<StoredObservationRow[]> {
   if (observations.length === 0) return [];
   const result = await client.query({
     // Same Map value casts as listObservationsForTrace.
@@ -676,7 +680,7 @@ export async function listObservationsByIds(
              level, status_message, model, model_parameters, input, output,
              mapApply((k, v) -> (k, toFloat64(v)), usage_details) as usage_details,
              mapApply((k, v) -> (k, toFloat64(v)), cost_details) as cost_details,
-             completion_start_time, metadata
+             completion_start_time, metadata, toString(event_ts) as event_ts
       from observations final
       where project_id = {projectId:String}
         and trace_id in {traceIds:Array(String)}
@@ -692,7 +696,7 @@ export async function listObservationsByIds(
     clickhouse_settings: SKIP_INDEXES_WITH_FINAL,
     format: "JSONEachRow"
   });
-  const rows = await result.json<ObservationRow>();
+  const rows = await result.json<StoredObservationRow>();
   return rows.map((row) => ({
     ...row,
     start_time: fromClickHouseDateTime(row.start_time),

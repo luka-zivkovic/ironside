@@ -1,6 +1,7 @@
 import { createClickHouseClient, runMigrations as runChMigrations } from "@ironside/clickhouse";
 import {
   closeEvaluatorLifecycleFence,
+  closeLangfuseMergeLocks,
   runMigrations as runPgMigrations
 } from "@ironside/db";
 import { createIngestQueue, createIngestWorker } from "@ironside/queue";
@@ -168,6 +169,7 @@ async function shutdown(): Promise<void> {
   await worker.close();
   await queue.close();
   await closeEvaluatorLifecycleFence(pgPool);
+  await closeLangfuseMergeLocks(pgPool);
   await pgPool.end();
   await clickhouse.close();
   storage.close();

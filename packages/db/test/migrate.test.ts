@@ -61,6 +61,10 @@ describe("runMigrations (postgres)", () => {
       {
         id: "0004_trace_score_feed_and_forward_status",
         checksum: "4e675fbf1e7b7122c27b66c35e1f1737e77670753865be50709e81265da2683e"
+      },
+      {
+        id: "0005_langfuse_field_provenance",
+        checksum: "98ad7a712c91f83c8167c80d509140a9f2b7e04a1d6d263b2b61ab6c82fbe771"
       }
     ]);
     expect((await pool.query("select to_regclass('api_keys') as table_name")).rows).toEqual([

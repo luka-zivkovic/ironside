@@ -19,6 +19,13 @@ import { toClickHouseDateTime } from "./datetime.js";
  */
 export interface InsertOptions {
   eventTs: string;
+  /**
+   * Per-row version overrides by row id, as ClickHouse renders DateTime64(6)
+   * ("YYYY-MM-DD HH:MM:SS.ffffff"), passed through exactly. A merged LangFuse
+   * row whose stored version is newer than its batch is written with that
+   * version: on a tie ReplacingMergeTree keeps the most recently inserted row.
+   */
+  rowEventTs?: ReadonlyMap<string, string>;
 }
 
 /**
@@ -185,7 +192,7 @@ export async function insertTraces(
       metadata: t.metadata,
       input: t.input !== undefined ? JSON.stringify(t.input) : null,
       output: t.output !== undefined ? JSON.stringify(t.output) : null,
-      event_ts: eventTs
+      event_ts: options.rowEventTs?.get(t.id) ?? eventTs
     })),
     format: "JSONEachRow"
   });
@@ -221,7 +228,7 @@ export async function insertObservations(
         ? toClickHouseDateTime(o.completionStartTime)
         : null,
       metadata: o.metadata,
-      event_ts: eventTs
+      event_ts: options.rowEventTs?.get(o.id) ?? eventTs
     })),
     format: "JSONEachRow"
   });

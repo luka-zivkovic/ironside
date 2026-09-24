@@ -2,6 +2,7 @@ import {
   createClickHouseClient,
   getTrace,
   getTraceRawIndex,
+  getVersionedTrace,
   hasPendingTraceRawRefs,
   insertRawEventRefs,
   insertTraces,
@@ -717,6 +718,136 @@ describe("LangFuse create and update in separate requests", () => {
     expect(JSON.parse(generation?.output ?? "null")).toEqual({ text: "hello" });
     // Model from the create plus usage from the update is enough to derive cost.
     expect(generation?.cost_details.total).toBeCloseTo(0.0000325, 9);
+  });
+});
+
+describe("LangFuse create and update processed out of order or concurrently", () => {
+  function langfuseBatch(receivedAt: string, events: unknown[]): IngestBatch {
+    return {
+      batchId: ulid(),
+      projectId,
+      receivedAt,
+      events: [
+        {
+          id: ulid(),
+          type: "langfuse-ingestion",
+          source: "langfuse",
+          schemaVersion: INGEST_SCHEMA_VERSION,
+          idempotencyKey: ulid(),
+          body: { batch: events }
+        }
+      ]
+    };
+  }
+
+  /** The two requests the LangFuse SDK sends for one model call that spans a flush. */
+  function requestsForOneCall(startedAt: Date, endedAt: Date) {
+    const traceId = `trace_${ulid()}`;
+    const generationId = `gen_${ulid()}`;
+    const create = langfuseBatch(startedAt.toISOString(), [
+      {
+        id: ulid(),
+        timestamp: startedAt.toISOString(),
+        type: "trace-create",
+        body: { id: traceId, timestamp: startedAt.toISOString(), name: "checkout", userId: "user_1", input: { q: "hi" } }
+      },
+      {
+        id: ulid(),
+        timestamp: startedAt.toISOString(),
+        type: "generation-create",
+        body: {
+          id: generationId,
+          traceId,
+          name: "llm-call",
+          model: "gpt-4o",
+          startTime: startedAt.toISOString(),
+          input: [{ role: "user", content: "hi" }]
+        }
+      }
+    ]);
+    const update = langfuseBatch(endedAt.toISOString(), [
+      {
+        id: ulid(),
+        timestamp: endedAt.toISOString(),
+        type: "generation-update",
+        body: {
+          id: generationId,
+          traceId,
+          name: null,
+          input: null,
+          endTime: endedAt.toISOString(),
+          output: { text: "hello" },
+          usage: { promptTokens: 5, completionTokens: 2 }
+        }
+      },
+      {
+        id: ulid(),
+        timestamp: endedAt.toISOString(),
+        type: "trace-create",
+        body: { id: traceId, output: { a: "hello" } }
+      }
+    ]);
+    return { traceId, generationId, create, update };
+  }
+
+  async function expectComplete(
+    call: ReturnType<typeof requestsForOneCall>,
+    startedAt: Date,
+    endedAt: Date
+  ): Promise<void> {
+    const trace = await getTrace(clickhouse, projectId, call.traceId);
+    expect(trace).toMatchObject({ name: "checkout", user_id: "user_1", timestamp: startedAt.toISOString() });
+    expect(JSON.parse(trace?.input ?? "null")).toEqual({ q: "hi" });
+    expect(JSON.parse(trace?.output ?? "null")).toEqual({ a: "hello" });
+    const observations = await listObservationsForTrace(clickhouse, projectId, call.traceId);
+    expect(observations).toHaveLength(1);
+    expect(observations[0]).toMatchObject({
+      name: "llm-call",
+      model: "gpt-4o",
+      start_time: startedAt.toISOString(),
+      end_time: endedAt.toISOString(),
+      usage_details: { input_tokens: 5, output_tokens: 2 }
+    });
+    expect(JSON.parse(observations[0]?.input ?? "null")).toEqual([{ role: "user", content: "hi" }]);
+    expect(JSON.parse(observations[0]?.output ?? "null")).toEqual({ text: "hello" });
+    expect(observations[0]?.cost_details.total).toBeCloseTo(0.0000325, 9);
+  }
+
+  async function run(batch: IngestBatch): Promise<void> {
+    const job = await storeAndEnqueue(batch);
+    await processBatch(job);
+    await job.remove();
+  }
+
+  it("builds the complete record when the update's request is processed before the create's", async () => {
+    const startedAt = new Date(Date.now() - 10_000);
+    const endedAt = new Date(startedAt.getTime() + 3_000);
+    const call = requestsForOneCall(startedAt, endedAt);
+
+    await run(call.update);
+    await run(call.create);
+
+    await expectComplete(call, startedAt, endedAt);
+    // The late create did not move the trace's latest activity.
+    expect((await getVersionedTrace(clickhouse, projectId, call.traceId))?.trace_version).toBe(
+      endedAt.toISOString()
+    );
+  });
+
+  it("builds the complete record when both requests are processed at the same time", async () => {
+    const calls = Array.from({ length: 8 }, (_, index) => {
+      const startedAt = new Date(Date.now() - 20_000 - index * 1_000);
+      const endedAt = new Date(startedAt.getTime() + 3_000);
+      return { startedAt, endedAt, ...requestsForOneCall(startedAt, endedAt) };
+    });
+    const jobs = await Promise.all(
+      calls.flatMap((call) => [storeAndEnqueue(call.create), storeAndEnqueue(call.update)])
+    );
+
+    await Promise.all(jobs.map((job) => processBatch(job)));
+    await Promise.all(jobs.map((job) => job.remove()));
+
+    for (const call of calls) await expectComplete(call, call.startedAt, call.endedAt);
   });
 });
 
