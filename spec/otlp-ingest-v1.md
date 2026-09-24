@@ -8,7 +8,7 @@ Accept OpenTelemetry traces over OTLP/HTTP and map them, including the `gen_ai.*
 
 ## Endpoint
 
-`POST /v1/otel/traces`. The path is top level, not under `/api/v1`, matching where OTel exporters send traces and how other platforms expose OTLP separately from their native API. Clients configure the signal-specific traces endpoint (`spec/integration-contract-v1.md`).
+`POST /v1/otel/traces`. The path is top level, not under `/api/v1`, like other platforms that expose OTLP separately from their native API. It is not the exporters' default `/v1/traces` path, so the endpoint must be configured. Clients configure the signal-specific traces endpoint (`spec/integration-contract-v1.md`).
 
 - Authentication: a project machine credential with the `ingest` capability, as a bearer token (`spec/scoped-machine-credentials-v1.md`). Requests count against the project's shared write rate limit (`spec/rate-limiting-quotas-retention-v1.md`).
 - Encodings: `Content-Type: application/x-protobuf`, which most exporters send by default, or `application/json`. Any other content type returns 415.

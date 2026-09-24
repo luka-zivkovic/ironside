@@ -14,7 +14,7 @@ Status: implemented. Owner: `packages/clickhouse/src/queries.ts` (`buildTraceCon
 | `minDurationMs` (integer ≥ 0) | have a duration of at least this many milliseconds |
 | `minCost` (≥ 0, USD) | have a total cost of at least this |
 
-The existing `from`, `to`, `userId`, `sessionId`, `environment`, `tags` and `metadataKey`/`metadataValue` filters are unchanged. An empty or blank value (`?minCost=`) leaves a filter unset; an invalid value is a `400`. The explorer never sends a value the API would reject.
+The existing `from`, `to`, `userId`, `sessionId`, `environment`, `tags` and `metadataKey`/`metadataValue` filters are unchanged. An empty or blank value (`?minCost=`) leaves a filter unset; an invalid value is a `400`. The explorer's inputs keep values within these limits, and it cuts search and model text from a shared link to the limit; other hand-edited URL values can still be rejected.
 
 Inputs and outputs are searched as their stored JSON text. A search for text that JSON escapes (a quote, a backslash, a line break) must be written in its escaped form.
 
@@ -39,3 +39,7 @@ The trace explorer shows a search box and level, model, minimum latency (seconds
 ## Cost
 
 The observation-based filters scan the project's observations. Observations are partitioned by their own start time rather than the trace's timestamp, so the time range does not prune that scan. The page figures are one grouped query over at most 100 trace ids, using the observations' `trace_id` skip index.
+
+## Verified
+
+`apps/api/test/trace-search.test.ts` runs the list and aggregates routes against real ClickHouse and Postgres. It covers each filter alone and combined, with the aggregates counting the same traces as the list, the per-trace figures (including traces with no observations and no ended observation), an exact decimal cost floor, blank values leaving filters unset, and invalid values returning 400. `apps/web/test/trace-filters.test.ts` covers the URL round trip, floor parsing and limits, the conversion to API units, and clearing. The explorer was also checked in a browser against a seeded project: the columns, a search combined with the level filter, and the summary tiles following the filters.

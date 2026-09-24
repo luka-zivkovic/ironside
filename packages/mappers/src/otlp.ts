@@ -54,6 +54,15 @@ export interface MappedOtlpRows {
   observations: Observation[];
 }
 
+/**
+ * A token count as the usage column stores it (an unsigned integer). A double,
+ * negative or non-finite attribute value would otherwise fail the insert of
+ * every row in the batch, whatever its source; it is rounded, or dropped.
+ */
+function tokenCount(value: number | undefined): number | undefined {
+  return value !== undefined && Number.isFinite(value) && value >= 0 ? Math.round(value) : undefined;
+}
+
 export function mapOtlpTraceRequest(
   projectId: string,
   request: OtlpExportTraceServiceRequest
@@ -98,8 +107,8 @@ export function mapOtlpTraceRequest(
       getAttributeString(attrs, GEN_AI_RESPONSE_MODEL);
     const provider = getAttributeString(attrs, GEN_AI_PROVIDER_NAME) ??
       getAttributeString(attrs, GEN_AI_SYSTEM_LEGACY);
-    const inputTokens = getAttributeNumber(attrs, GEN_AI_USAGE_INPUT_TOKENS);
-    const outputTokens = getAttributeNumber(attrs, GEN_AI_USAGE_OUTPUT_TOKENS);
+    const inputTokens = tokenCount(getAttributeNumber(attrs, GEN_AI_USAGE_INPUT_TOKENS));
+    const outputTokens = tokenCount(getAttributeNumber(attrs, GEN_AI_USAGE_OUTPUT_TOKENS));
     const input = extractGenAiMessages(attrs, GEN_AI_INPUT_MESSAGES, "input", messageProjectionBudget);
     const output = extractGenAiMessages(attrs, GEN_AI_OUTPUT_MESSAGES, "output", messageProjectionBudget);
     const modelParameters = extractModelParameters(attrs);

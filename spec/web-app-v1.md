@@ -29,7 +29,7 @@ Canonical routes are `/projects/:projectId/traces`, `/projects/:projectId/traces
 
 The app calls the API with relative paths unless `VITE_API_URL` is set at build time. In development, the Vite server (port 5174) proxies `/api`, `/v1` and `/health` to `http://localhost:8788`; in the container, nginx proxies the same paths to the `api` service (`spec/self-host-release-v1.md`). Both are same-origin, so CORS applies only when the app is served from a different origin than the API.
 
-The API's CORS middleware (`hono/cors`) allows exactly the origins in `WEB_ORIGINS` (comma-separated, default `http://localhost:5174`), with credentials, the `Content-Type` and `Authorization` headers, the `GET`, `POST`, `PATCH`, `DELETE` and `OPTIONS` methods, and a 600-second preflight cache. Each origin must be an exact `http(s)` origin with no path or wildcard; the API refuses to start otherwise. Owner-session mutations additionally require an allowed `Origin` and reject cross-site Fetch Metadata (`spec/owner-auth-v1.md`).
+The API's CORS middleware (`hono/cors`) allows exactly the origins in `WEB_ORIGINS` (comma-separated, default `http://localhost:5174`), with credentials, the `Content-Type` and `Authorization` headers, the `GET`, `POST`, `PUT`, `PATCH`, `DELETE` and `OPTIONS` methods, and a 600-second preflight cache. Each origin must be an exact `http(s)` origin with no path or wildcard; the API refuses to start otherwise. Owner-session mutations additionally require an allowed `Origin` and reject cross-site Fetch Metadata (`spec/owner-auth-v1.md`).
 
 ## Design tokens
 
@@ -45,5 +45,5 @@ The API's CORS middleware (`hono/cors`) allows exactly the origins in `WEB_ORIGI
 - #63–#65 moved the app to owner sessions, project-explicit URLs and scoped machine credentials; CORS now allows credentials for the configured origins only.
 - #66 added the project-wide environment selector and observed-environment management (`spec/environments-v1.md`). Media rendering, safe Markdown payload rendering, Rubrist deep links, model prices, and trace search with its summary tiles were added by their own specs.
 - The first design used a separate graphite palette with dark mode as the default. The app now shares Rubrist's paper and ink tokens with its own steel-blue accent, and defaults to light.
-- The M7-01 check verified the wire contract against a live stack but not browser rendering, because no browser tool was available. The trace explorer has since been checked in a real browser as part of the search and filters work (`spec/trace-search-v1.md`).
+- The M7-01 check verified the wire contract against a live stack but not browser rendering, because no browser tool was available. The trace explorer has since been checked in a real browser as part of the search and filters work.
 - Still open: no automated full-browser end-to-end suite drives owner setup, project creation, ingestion, filtering and trace navigation in one scenario.

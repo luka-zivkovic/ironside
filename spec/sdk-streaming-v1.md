@@ -4,7 +4,7 @@ Status: implemented. Owner: `packages/sdk/src/wrappers/streaming.ts`, `packages/
 
 ## Purpose
 
-`wrapOpenAI` and `wrapAnthropic` record streamed calls (`create({ ..., stream: true })`) as generations, with output, tool calls and usage, without changing what the caller receives. Chat applications usually stream, so a wrapper that only recorded non-streaming calls would miss most real traffic.
+`wrapOpenAI` and `wrapAnthropic` record streamed calls (`create({ ..., stream: true })`) as generations, with output, tool calls and usage, without changing the stream the caller receives. The wrapped `create` returns a plain `Promise`, so the SDK's `APIPromise` helpers (`.withResponse()`, `.asResponse()`) are not available through a wrapper. Chat applications usually stream, so a wrapper that only recorded non-streaming calls would miss most real traffic.
 
 ## Instrumentation
 

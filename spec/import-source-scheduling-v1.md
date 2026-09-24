@@ -66,5 +66,6 @@ A run imports at most 20 pages of 50 traces. A larger history continues on the n
 - `upsertImportSource` first used `coalesce($5, $6)` for the optional poll interval. node-postgres sends an untyped `null` as text, so the insert failed with a type error; the DB tests caught it, and `$5::integer` fixed it.
 - Review found that dispatch used the decrypted blob's own `provider` behind an `as` cast, so a blob disagreeing with the row ran the wrong importer. Dispatch now uses the row's column plus the explicit mismatch check, with a regression test.
 - The scheduler tests first pointed sources at an unroutable TEST-NET-1 address, which can hang for a full TCP connect timeout; they now use the closed local port `127.0.0.1:9`, which fails at once.
-- Issue #64 moved the routes from the flat `/api/v1/import-sources` to the owner-session `/api/v1/projects/:projectId/import-sources`.- The retention cutoff step and the recovery pass were added when imports moved onto the evaluator publication barrier (`spec/evaluator-integration-v1.md`).
+- Issue #64 moved the routes from the flat `/api/v1/import-sources` to the owner-session `/api/v1/projects/:projectId/import-sources`.
+- The retention cutoff step and the recovery pass were added when imports moved onto the evaluator publication barrier (`spec/evaluator-integration-v1.md`).
 - Still open: there is no way to rotate credentials or change a LangSmith source's `sessionIds` without reconnecting with a full `POST`; `PATCH` covers only `enabled` and `pollIntervalSeconds`.

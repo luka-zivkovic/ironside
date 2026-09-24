@@ -70,14 +70,21 @@ const otlpEventSchema = z.object({
   attributes: z.array(otlpAttributeSchema).optional()
 });
 
+/**
+ * A span timestamp: fixed64 nanoseconds as decimal text. Checked here because
+ * the mapper converts it to a date, and anything else would fail the whole
+ * ingest job instead of this one export; 20 digits covers the fixed64 range.
+ */
+const unixNanoSchema = z.string().regex(/^\d{1,20}$/, "must be unsigned integer nanoseconds");
+
 export const otlpSpanSchema = z.object({
   traceId: z.string(),
   spanId: z.string(),
   parentSpanId: z.string().optional(),
   name: z.string().optional(),
   kind: z.number().optional(),
-  startTimeUnixNano: z.string(),
-  endTimeUnixNano: z.string().optional(),
+  startTimeUnixNano: unixNanoSchema,
+  endTimeUnixNano: unixNanoSchema.optional(),
   attributes: z.array(otlpAttributeSchema).optional(),
   status: otlpStatusSchema.optional(),
   events: z.array(otlpEventSchema).optional()

@@ -59,13 +59,13 @@ This route serves bytes and a content type chosen by a client from the API origi
 
 ## Viewer
 
-The trace view scans the serialized input and output of the trace and of each observation for references (`MEDIA_REF_PATTERN` in `apps/web/src/lib/api.ts`), so a reference at any nesting depth is found. Each distinct id is fetched once through the owner-session read route as a blob and shown through an object URL, which is revoked on unmount. `image/*` content renders inline as an image, other types as a download link, and a failed fetch as the note `media <id>: unavailable`. References in metadata are not previewed.
+The trace view scans the serialized input and output of the trace and of each observation for references (`MEDIA_REF_PATTERN` in `apps/web/src/lib/api.ts`), so a reference at any nesting depth is found. Each distinct id in a payload is fetched once through the owner-session read route as a blob and shown through an object URL, which is revoked on unmount. `image/*` content renders inline as an image, other types as a download link, and a failed fetch as the note `media <id>: unavailable`. References in metadata are not previewed.
 
 ## Limits
 
 - 10 MiB per asset, the shared request body limit.
 - No listing endpoint: an asset is reachable only through a reference.
-- Retention never deletes media. Lifecycle planning reports only the registered asset count and size (`summarizeMediaStorage`, `spec/lifecycle-planning-v1.md`), because a content-addressed asset can be reused by newer traces and there is no authoritative record of which traces reference which assets.
+- Retention never deletes media. Lifecycle planning reports only the registered asset count, size and oldest creation time (`summarizeMediaStorage`, `spec/lifecycle-planning-v1.md`), because a content-addressed asset can be reused by newer traces and there is no authoritative record of which traces reference which assets.
 
 ## Verified
 

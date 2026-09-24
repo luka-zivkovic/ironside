@@ -20,7 +20,7 @@ Each run delivers one webhook for every **matching settled trace version publish
 
 Each `(rule, trace, version)` is delivered successfully exactly once. A failed attempt stays retryable; "exactly once" never means one attempt.
 
-`webhook_deliveries` holds one row per tuple under a unique constraint, with `status` `pending | delivered | failed`. Before sending, `claimWebhookDelivery` claims the tuple in one atomic upsert:
+`webhook_deliveries` holds one row per tuple under a unique constraint, with `status` `pending | delivered | failed | covered` (`covered` is described under "Upgrading from 0.3.0"). Before sending, `claimWebhookDelivery` claims the tuple in one atomic upsert:
 
 ```sql
 insert into webhook_deliveries
@@ -54,7 +54,7 @@ The position advances past every delivered, already-delivered, or non-matching e
 
 ## SSRF guard
 
-`destinationUrl` is customer-supplied, so each run first resolves it and rejects loopback, link-local, private and reserved addresses (`apps/worker/src/lib/ssrf-guard.ts`, `assertPublicHttpDestination`), checking the resolved addresses rather than the hostname string. IPv4-mapped IPv6 addresses are checked by extracting the embedded IPv4 address, including the hex-group form Node's `URL` parser produces (`::ffff:172.20.1.1` becomes `::ffff:ac14:101`). A rejected destination fails the run and is recorded on the rule. Requests do not follow redirects: a 3xx response is a failed delivery, because its target was never checked. The check runs once per run and each request resolves the hostname again, so DNS rebinding between the two is not caught. Tests opt out with `allowPrivateDestinations: true` to reach a local server; production code never sets it.
+`destinationUrl` is customer-supplied, so each run first resolves it and rejects loopback (`127/8`, `::1`), private (`10/8`, `172.16/12`, `192.168/16`, `fc00::/7`), link-local (`169.254/16`, `fe80::`), `0/8` and unspecified (`::`) addresses (`apps/worker/src/lib/ssrf-guard.ts`, `assertPublicHttpDestination`), checking the resolved addresses rather than the hostname string. IPv4-mapped IPv6 addresses are checked by extracting the embedded IPv4 address, including the hex-group form Node's `URL` parser produces (`::ffff:172.20.1.1` becomes `::ffff:ac14:101`). A rejected destination fails the run and is recorded on the rule. Requests do not follow redirects: a 3xx response is a failed delivery, because its target was never checked. The check runs once per run and each request resolves the hostname again, so DNS rebinding between the two is not caught. Tests opt out with `allowPrivateDestinations: true` to reach a local server; production code never sets it.
 
 ## Upgrading from 0.3.0
 

@@ -4,7 +4,7 @@ Status: implemented. Owner: `packages/sdk/src/`, `packages/mappers/src/otlp.ts`,
 
 ## Purpose
 
-Direct ingest into Ironside, through the `ironside` package, OTLP/HTTP, or native JSON, is the primary product path. LangFuse and LangSmith compatibility endpoints and importers exist for teams migrating from another platform and are not the recommended basis for new instrumentation. This spec states what each direct path captures, so the primary path does not fall behind the migration tooling on data completeness. `spec/integration-contract-v1.md` sets the role of each surface.
+Direct ingest into Ironside, through the `ironside` package, OTLP/HTTP, or native JSON, is the primary product path. LangFuse-compatible endpoints and the LangFuse and LangSmith importers exist for teams migrating from another platform and are not the recommended basis for new instrumentation. This spec states what each direct path captures, so the primary path does not fall behind the migration tooling on data completeness. `spec/integration-contract-v1.md` sets the role of each surface.
 
 ## Roles
 
@@ -58,7 +58,7 @@ The wrappers do not compute cost; the worker derives it from usage and model. A 
 
 ## Verified
 
-`packages/sdk/test/client.test.ts` covers `trace.score()` and `observation.score()`, including a `value` of 0 and a categorical score, compile-time rejection of a score with neither or both values (`@ts-expect-error`), and `environment`, `release` and `version` through both `trace()` and `update()`. `packages/sdk/test/wrappers.test.ts` covers `modelParameters` capture, present and absent, for `wrapOpenAI`, `wrapAnthropic` and `recordGenerateTextResult`. `packages/mappers/test/otlp.test.ts` covers the `gen_ai.request.*` mapping and its absence. `packages/mappers/test/native.test.ts` covers rejection of a native score with neither value.
+`packages/sdk/test/client.test.ts` covers `trace.score()` and `observation.score()`, including a `value` of 0 and a categorical score, compile-time rejection of a score with neither or both values (`@ts-expect-error`), and `environment`, `release` and `version` through both `trace()` and `update()`. `packages/sdk/test/wrappers.test.ts` covers `modelParameters` capture for `wrapOpenAI`, `wrapAnthropic` and `recordGenerateTextResult`. `packages/mappers/test/otlp.test.ts` covers the `gen_ai.request.*` mapping and its absence. `packages/mappers/test/native.test.ts` covers rejection of a native score with neither value.
 
 ## History
 

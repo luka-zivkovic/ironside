@@ -48,16 +48,16 @@ The queue gauges are sampled at scrape time: prom-client's async `collect()` cal
 
 | `subsystem` | One run is | Counted as `error` when |
 |---|---|---|
-| `export` | a claimed export config | the run or its setup throws |
-| `otlp-forward` | a claimed forward rule | the run throws, or any trace failed or was skipped |
-| `webhook` | a claimed webhook rule | the run throws, or a delivery failed |
+| `export` | a claimed export config | the run or its setup throws, or the claim query fails |
+| `otlp-forward` | a claimed forward rule | the run throws, any trace failed or was skipped, or the claim query fails |
+| `webhook` | a claimed webhook rule | the run throws, a delivery failed, or the claim query fails |
 | `import` | a claimed import source | the run or its setup throws, or the imports tick itself fails |
 | `environment-registry` | a claimed rebuild chunk | the chunk throws, or the claim query fails |
 | `retention` | a `runRetention` pass | the pass throws |
 | `ingest-recovery` | an ingest recovery pass | the pass throws |
 | `raw-retention` | a raw retention sweep, only while raw retention is enabled | the sweep throws or reports any project or object error |
 
-Failures recovering abandoned evaluator imports are reported only through the scheduler's `onError` and are not counted. See `spec/scheduler-v1.md` for where each run records its outcome.
+A failure recovering one abandoned evaluator import goes only to the scheduler's `onError`; a failed recovery query counts as an `import` error. See `spec/scheduler-v1.md` for where each run records its outcome.
 
 ## Configuration
 

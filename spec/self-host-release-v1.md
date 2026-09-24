@@ -44,7 +44,7 @@ Every `api` and `worker` start applies pending Postgres and ClickHouse migration
 - Infrastructure uses fixed development credentials (`ironside`/`ironside`, MinIO `ironside123`), so every published port binds to `127.0.0.1`: Postgres `5433`, ClickHouse `8123` and `9000`, Redis `6380`, MinIO `9010` (S3) and `9011` (console). The offsets let the stack run beside a local Rubrist (Postgres `5432`) and keep ClickHouse's native port off MinIO's default `9000`.
 - `api` (`8788`) and `web` (`8080`) bind to `IRONSIDE_BIND_ADDRESS`, default `127.0.0.1`. Infrastructure ports are never widened, because Docker-published ports bypass host firewalls such as ufw on Linux. The worker's metrics port is not published.
 - `api` and `worker` depend on all four infrastructure services with `condition: service_healthy`; `web` starts after `api`.
-- `api` sets `WEB_ORIGINS=http://localhost:8080` and `AUTH_INSECURE_COOKIES=true` (overridable), because the stack is plain HTTP on localhost.
+- `api` sets `WEB_ORIGINS=http://localhost:8080` and `AUTH_INSECURE_COOKIES=true` (the latter overridable), because the stack is plain HTTP on localhost.
 - Postgres, ClickHouse and MinIO persist in the `pgdata`, `chdata` and `miniodata` volumes; Redis is not persisted. ClickHouse mounts `docker/clickhouse-backups.xml` to enable native `BACKUP`/`RESTORE`.
 - Worker retention and recovery settings default to the values in `docs/self-hosting.md`; raw event retention is on (`RAW_RETENTION_EXECUTION_ENABLED=true`, see `spec/raw-retention-intents-v1.md`).
 
