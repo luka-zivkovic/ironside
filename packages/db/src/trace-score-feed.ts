@@ -50,6 +50,27 @@ export async function publishTraceScoreActivity(
   }
 }
 
+/**
+ * Removes score feed entries older than their project's retention whose trace
+ * never reached the trace feed (scores for a trace id that never arrived).
+ * Entries for traces in the trace feed are removed with them
+ * (deleteEvaluatorTraceFeedEntries); nothing else would remove these.
+ */
+export async function pruneStaleTraceScoreFeed(pool: Pool, defaultRetentionDays: number): Promise<number> {
+  const result = await pool.query(
+    `delete from trace_score_feed as score
+      using projects
+      where projects.id = score.project_id
+        and score.published_at < now() - make_interval(days => coalesce(projects.retention_days, $1))
+        and not exists (
+              select 1 from evaluator_trace_feed as feed
+               where feed.project_id = score.project_id and feed.trace_id = score.trace_id
+            )`,
+    [defaultRetentionDays]
+  );
+  return result.rowCount ?? 0;
+}
+
 /** Score feed entries after `cursor`, in commit order; positions carry microsecond precision. */
 export async function listTraceScoreActivities(
   pool: Pool,

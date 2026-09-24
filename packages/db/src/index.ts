@@ -110,7 +110,11 @@ export {
   type CreateOtlpForwardRuleInput,
   type UpdateOtlpForwardRuleInput
 } from "./otlp-forward-rules.js";
-export { publishTraceScoreActivity, listTraceScoreActivities } from "./trace-score-feed.js";
+export {
+  publishTraceScoreActivity,
+  listTraceScoreActivities,
+  pruneStaleTraceScoreFeed
+} from "./trace-score-feed.js";
 export {
   withLangfuseMergeLocks,
   closeLangfuseMergeLocks,
