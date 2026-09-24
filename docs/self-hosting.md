@@ -227,5 +227,15 @@ boot. Concurrent first starts are safe, in-flight queue jobs survive ordinary
 worker restarts, and durable pending-ingest intents reconstruct lost Redis
 jobs within one current instance.
 
+**0.3.1 changes only the MinIO image.** MinIO no longer publishes public
+images: `quay.io/minio/minio` refuses anonymous pulls, so a 0.3.0 installation
+keeps running from its cached image but cannot pull it again. 0.3.1 uses
+Chainguard's build of MinIO, pinned by digest, and runs it as root like the
+official image did, so it opens the existing data volume. The build is MinIO
+`RELEASE.2026-09-22T19-25-18Z`, a year newer than the image it replaces, and
+there is no going back to the old image; back up MinIO first.
+The baselines are unchanged: take the 0.3.1 `compose.yaml` (the change is in
+the Compose file) and set the version to 0.3.1.
+
 Coolify-specific installation, backup coverage, and version-change steps are
 in [the Coolify runbook](coolify.md).

@@ -79,6 +79,15 @@ and web move together, then verify health and the primary ingest/read paths.
 When either baseline changes, create a new clean Coolify Service and preserve
 the old disposable Service only as long as its test data is useful.
 
+0.3.1 changes only the MinIO image, so both baselines are unchanged. A
+Service created from 0.3.0 also needs the 0.3.1 `deploy/coolify.yaml` as its
+Compose file: its saved Compose names `quay.io/minio/minio`, which MinIO no
+longer serves publicly, so any redeploy that pulls images fails. The new file
+uses Chainguard's build of MinIO (`RELEASE.2026-09-22T19-25-18Z`, a year newer
+than the image it replaces), pinned by digest and run as root, which opens the
+existing MinIO volume; back it up first. Keep the Service's
+environment variables and set `IRONSIDE_VERSION=0.3.1`.
+
 Do not use **Pull Latest Images & Restart** for Ironside. Exact semantic-version
 tags are immutable, so a normal redeploy is enough. Pulling a mutable tag can
 silently combine a new app, a schema migration, and changed dependencies.

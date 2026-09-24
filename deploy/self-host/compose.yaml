@@ -158,7 +158,12 @@ services:
       retries: 20
 
   minio:
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # MinIO no longer publishes public images, so this is Chainguard's build of
+    # MinIO (RELEASE.2026-09-22T19-25-18Z), pinned by digest. It runs as root
+    # like the official image did: its default user (65532) cannot write a
+    # data volume the official image created, and MinIO then refuses to start.
+    image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
+    user: "0"
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
