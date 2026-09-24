@@ -834,6 +834,44 @@ describe("LangFuse create and update processed out of order or concurrently", ()
     );
   });
 
+  it("leaves one row per record when the late create moves its start to the previous day", async () => {
+    // The update's placeholder start time falls after midnight UTC, the real one before.
+    const midnight = new Date(new Date().toISOString().slice(0, 10) + "T00:00:00.000Z");
+    const startedAt = new Date(midnight.getTime() - 2_000);
+    const endedAt = new Date(midnight.getTime() + 2_000);
+    const call = requestsForOneCall(startedAt, endedAt);
+
+    await run(call.update);
+    await run(call.create);
+
+    await expectComplete(call, startedAt, endedAt);
+    const rows = await clickhouse.query({
+      query: `select
+                (select count() from traces final where project_id = {projectId:String} and id = {traceId:String}) as traces,
+                (select count() from observations final where project_id = {projectId:String} and id = {generationId:String}) as observations`,
+      query_params: { projectId, traceId: call.traceId, generationId: call.generationId },
+      format: "JSONEachRow"
+    });
+    expect(await rows.json()).toEqual([{ traces: "1", observations: "1" }]);
+  });
+
+  it("builds the complete record when the update's batch is retried after failing before its field times were recorded", async () => {
+    const startedAt = new Date(Date.now() - 10_000);
+    const endedAt = new Date(startedAt.getTime() + 3_000);
+    const call = requestsForOneCall(startedAt, endedAt);
+
+    await run(call.update);
+    // The rows are written, the field times are not: as if the job failed in between.
+    await pool.query("delete from langfuse_field_provenance where project_id = $1 and entity_id = any($2)", [
+      projectId,
+      [call.traceId, call.generationId]
+    ]);
+    await run(call.update);
+    await run(call.create);
+
+    await expectComplete(call, startedAt, endedAt);
+  });
+
   it("builds the complete record when both requests are processed at the same time", async () => {
     const calls = Array.from({ length: 8 }, (_, index) => {
       const startedAt = new Date(Date.now() - 20_000 - index * 1_000);

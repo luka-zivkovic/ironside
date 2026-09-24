@@ -122,6 +122,25 @@ describe("mergeByRecency", () => {
     expect(merged.row).toMatchObject({ name: "checkout", output: { answer: "old" }, tags: ["prod"] });
   });
 
+  it("does not count a retried batch's own placeholders as sent when its field times were never recorded", () => {
+    // The update's first attempt wrote its row, then failed before recording field times.
+    const retried = mergeObservationByRecency(updateRow(), UPDATE_SENT, LATER, {
+      row: updateRow(),
+      version: LATER,
+      sentAt: undefined
+    });
+    expect(retried.sentAt.startTime).toBeUndefined();
+    expect(retried.sentAt.level).toBeUndefined();
+
+    const withCreate = mergeObservationByRecency(createRow(), CREATE_SENT, EARLIER, {
+      row: retried.row,
+      version: LATER,
+      sentAt: retried.sentAt
+    });
+    expect(withCreate.row.startTime).toBe("2026-09-23T10:00:00.000Z");
+    expect(withCreate.row.name).toBe("llm-call");
+  });
+
   it("keeps a stored placeholder when neither side sent the field", () => {
     const merged = mergeObservationByRecency(updateRow({ startTime: "2026-09-23T10:00:09.000Z" }), UPDATE_SENT, LATER, {
       row: updateRow(),

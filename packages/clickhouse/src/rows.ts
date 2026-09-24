@@ -169,6 +169,55 @@ export async function tombstoneExpiredImportedTraceSnapshot(
   ]);
 }
 
+/**
+ * Deletes the row a trace left under an old sort key. The key includes the
+ * day of the trace's timestamp, so a row written with a timestamp on another
+ * day does not replace the old one. Pass the same options as the moved row's
+ * insert: the deletion then carries a version at least the old row's, and on
+ * a tie the later insert, this deletion, wins.
+ */
+export async function deleteMovedTraceRows(
+  client: ClickHouseClient,
+  rows: { projectId: string; id: string; timestamp: string }[],
+  options: InsertOptions
+): Promise<void> {
+  if (rows.length === 0) return;
+  const eventTs = toClickHouseDateTime(options.eventTs);
+  await client.insert({
+    table: "traces",
+    values: rows.map((row) => ({
+      project_id: row.projectId,
+      id: row.id,
+      timestamp: toClickHouseDateTime(row.timestamp),
+      event_ts: options.rowEventTs?.get(row.id) ?? eventTs,
+      is_deleted: 1
+    })),
+    format: "JSONEachRow"
+  });
+}
+
+/** deleteMovedTraceRows for observations, whose sort key holds the day of their start time. */
+export async function deleteMovedObservationRows(
+  client: ClickHouseClient,
+  rows: { projectId: string; id: string; traceId: string; startTime: string }[],
+  options: InsertOptions
+): Promise<void> {
+  if (rows.length === 0) return;
+  const eventTs = toClickHouseDateTime(options.eventTs);
+  await client.insert({
+    table: "observations",
+    values: rows.map((row) => ({
+      project_id: row.projectId,
+      id: row.id,
+      trace_id: row.traceId,
+      start_time: toClickHouseDateTime(row.startTime),
+      event_ts: options.rowEventTs?.get(row.id) ?? eventTs,
+      is_deleted: 1
+    })),
+    format: "JSONEachRow"
+  });
+}
+
 export async function insertTraces(
   client: ClickHouseClient,
   traces: Trace[],

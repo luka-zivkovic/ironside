@@ -10,10 +10,24 @@ export type LangfuseFieldSentAt = Record<string, string>;
 // the fence they take while holding these locks, for the caller's pool.
 const lockPools = new Map<Pool, Pool>();
 
+/** Names the lock sessions, so they can be found in pg_stat_activity and pg_locks. */
+export const LANGFUSE_MERGE_LOCK_APPLICATION_NAME = "ironside-langfuse-merge-locks";
+
+/**
+ * Lock buckets per project. A job holds at most this many advisory locks
+ * however large its batch: Postgres keeps every held lock in one shared
+ * table, and running out of it fails queries in every session on the server.
+ */
+export const LANGFUSE_MERGE_LOCK_BUCKETS = 64;
+
 function lockPoolFor(pool: Pool): Pool {
   const existing = lockPools.get(pool);
   if (existing) return existing;
-  const created = new Pool({ ...pool.options, allowExitOnIdle: true });
+  const created = new Pool({
+    ...pool.options,
+    application_name: LANGFUSE_MERGE_LOCK_APPLICATION_NAME,
+    allowExitOnIdle: true
+  });
   lockPools.set(pool, created);
   return created;
 }
@@ -28,8 +42,9 @@ export async function closeLangfuseMergeLocks(pool: Pool): Promise<void> {
 /**
  * Serializes merges of the same LangFuse traces/observations across worker
  * jobs and replicas: `operation` runs holding a session advisory lock per
- * entity, taken in a fixed order so overlapping batches cannot deadlock.
- * Hash collisions only add serialization.
+ * bucket its entities hash into (at most LANGFUSE_MERGE_LOCK_BUCKETS per
+ * project), taken in a fixed order so overlapping batches cannot deadlock.
+ * Unrelated entities sharing a bucket only add serialization.
  */
 export async function withLangfuseMergeLocks<T>(
   pool: Pool,
@@ -37,28 +52,33 @@ export async function withLangfuseMergeLocks<T>(
   entities: { kind: LangfuseEntityKind; id: string }[],
   operation: () => Promise<T>
 ): Promise<T> {
-  const keys = [...new Set(entities.map((entity) => JSON.stringify([projectId, entity.kind, entity.id])))];
+  const keys = [...new Set(entities.map((entity) => JSON.stringify([entity.kind, entity.id])))];
   if (keys.length === 0) return operation();
   const client = await lockPoolFor(pool).connect();
-  let locked = false;
   try {
     await client.query(
       `select pg_advisory_lock(lock_key)
          from (
-           select distinct hashtextextended(key, 20260924) as lock_key
+           select distinct hashtextextended(
+                    $2 || ':' || (abs(hashtextextended(key, 20260924)) % $3)::text,
+                    20260924
+                  ) as lock_key
              from unnest($1::text[]) as key
             order by lock_key
          ) ordered`,
-      [keys]
+      [keys, projectId, LANGFUSE_MERGE_LOCK_BUCKETS]
     );
-    locked = true;
     return await operation();
   } finally {
+    // Also after a failed lock statement, which can leave some locks held.
+    let unlockError: Error | undefined;
     try {
-      if (locked) await client.query("select pg_advisory_unlock_all()");
-    } finally {
-      client.release();
+      await client.query("select pg_advisory_unlock_all()");
+    } catch (error) {
+      unlockError = error instanceof Error ? error : new Error(String(error));
     }
+    // A session that may still hold locks is closed rather than pooled.
+    client.release(unlockError);
   }
 }
 
@@ -110,9 +130,26 @@ export async function recordLangfuseFieldSentAt(
  * merges as if every stored field was sent at the stored version.
  */
 export async function purgeLangfuseFieldSentAtOlderThan(pool: Pool, olderThan: Date): Promise<number> {
-  const result = await pool.query("delete from langfuse_field_provenance where updated_at < $1", [olderThan]);
-  return result.rowCount ?? 0;
+  // In bounded batches, so no single statement holds row locks that merges wait on.
+  let purged = 0;
+  for (;;) {
+    const result = await pool.query(
+      `delete from langfuse_field_provenance
+        where (project_id, entity_kind, entity_id) in (
+                select project_id, entity_kind, entity_id
+                  from langfuse_field_provenance
+                 where updated_at < $1
+                 limit $2
+              )
+          and updated_at < $1`,
+      [olderThan, PURGE_BATCH_SIZE]
+    );
+    purged += result.rowCount ?? 0;
+    if ((result.rowCount ?? 0) < PURGE_BATCH_SIZE) return purged;
+  }
 }
+
+const PURGE_BATCH_SIZE = 5_000;
 
 export function langfuseEntityKey(kind: LangfuseEntityKind, id: string): string {
   return `${kind}\u0000${id}`;

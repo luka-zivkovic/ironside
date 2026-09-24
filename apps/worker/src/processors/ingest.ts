@@ -1,5 +1,7 @@
 import type { ClickHouseClient } from "@ironside/clickhouse";
 import {
+  deleteMovedObservationRows,
+  deleteMovedTraceRows,
   hasPendingRawObjectRefs,
   insertObservations,
   insertRawEventRefs,
@@ -258,13 +260,16 @@ export function createIngestProcessor(deps: IngestProcessorDeps) {
         ]);
 
         const insertOptions = { eventTs: batch.receivedAt };
+        const traceOptions = { ...insertOptions, rowEventTs: merged.rowEventTs.traces };
+        const observationOptions = { ...insertOptions, rowEventTs: merged.rowEventTs.observations };
         await Promise.all([
-          insertTraces(deps.clickhouse, traces, { ...insertOptions, rowEventTs: merged.rowEventTs.traces }),
-          insertObservations(deps.clickhouse, observations, {
-            ...insertOptions,
-            rowEventTs: merged.rowEventTs.observations
-          }),
-          insertScores(deps.clickhouse, scores, insertOptions)
+          insertTraces(deps.clickhouse, traces, traceOptions),
+          insertObservations(deps.clickhouse, observations, observationOptions),
+          insertScores(deps.clickhouse, scores, insertOptions),
+          // A merge that moved a record to another day leaves its old row
+          // under the old sort key; delete it with the moved row's version.
+          deleteMovedTraceRows(deps.clickhouse, merged.moved.traces, traceOptions),
+          deleteMovedObservationRows(deps.clickhouse, merged.moved.observations, observationOptions)
         ]);
         // Evaluator score receipts suppress later HTTP retries only after the
         // durable ingest intent exists. Record the second commit point once its

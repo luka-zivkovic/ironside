@@ -4,6 +4,8 @@ export {
   insertTraces,
   insertObservations,
   insertScores,
+  deleteMovedTraceRows,
+  deleteMovedObservationRows,
   tombstoneImportedTraceSnapshot,
   tombstoneImportedScores,
   tombstoneExpiredImportedTraceSnapshot,
