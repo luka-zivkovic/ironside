@@ -49,8 +49,9 @@ First boot builds the images and initializes storage, which takes a few
 minutes; wait until every container reports healthy. If one stays unhealthy,
 read `docker compose logs api worker` and report what you found. Named
 volumes (`pgdata`, `chdata`, `miniodata`) hold data from earlier runs; leave
-them in place. On an incompatible database baseline, stop and point the user
-to `docs/pre-production-schema.md` instead of deleting anything.
+them in place. If `api` or `worker` refuses to start because of a database
+migration, stop and point the user to `docs/schema-migrations.md` instead of
+deleting anything.
 
 ## 4. Owner setup and first project
 
@@ -102,8 +103,10 @@ export OTEL_EXPORTER_OTLP_TRACES_HEADERS="authorization=Bearer%20${IRONSIDE_API_
 
 The route is `/v1/otel/traces`, not the base-endpoint-derived `/v1/traces`.
 These variables configure an exporter the app already has; they do not add
-one. If the app runs in another container or machine, replace `localhost`
-with an address it can reach.
+one. The local stack publishes its ports on `127.0.0.1` only. If the app runs
+in another container or on another machine, ask the user before exposing
+Ironside: setting `IRONSIDE_BIND_ADDRESS` publishes `api` and `web` on another
+interface, and the app then uses that address instead of `localhost`.
 
 ## 6. Verify one trace
 

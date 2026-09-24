@@ -60,3 +60,57 @@ LangFuse's real endpoint always returns **207** (not 4xx on per-event validation
 Same as native/OTLP: the whole batch is wrapped as one `langfuse-ingestion` event (`source: "langfuse"`), persisted to S3, queued, and exploded into rows by the worker's LangFuse mapper.
 
 **Deliberate deviation from LangFuse's own per-event error granularity**: LangFuse's real endpoint validates each batch item synchronously and reports per-item success/failure in the 207 body immediately. Ironside's ingest pipeline is fast-ACK-then-async everywhere (established since M1 — the edge never does mapping/validation work, only envelope checks) — event-level mapping errors (a malformed `generation-create` body, a missing `traceId`, etc.) surface only in worker logs, not this response. The route optimistically reports every event in the batch as accepted (once the outer `{batch: [...]}` envelope itself parses) rather than faking synchronous per-event validation it doesn't actually perform. This trades exact behavioral parity for staying consistent with the rest of the ingest architecture; a client relying on the SDK surfacing per-event validation errors from the response body won't see them here.
+
+## Partial updates across requests
+
+The SDK sends each record as a `*-create` followed by partial `*-update`
+events (and repeated partial `trace-create` events for trace updates), and it
+flushes on a timer. An update therefore routinely arrives in a later HTTP
+request than its create. Ironside rows are whole-row upserts
+(ReplacingMergeTree, highest `event_ts` wins), so the worker must not write
+an update's row as mapped: on its own it lacks name/model/input and its start
+time or timestamp defaults to the update's event time.
+
+- Within one request, events for the same `body.id` are merged before mapping:
+  creates first, then updates, and an explicit `null` never erases a value
+  another event in the group supplied (the SDK sends `null` for fields it is
+  not setting).
+- The mapper reports which domain fields each row actually received
+  (`MappedLangfuseRows.providedFields`). A defaulted trace `timestamp`,
+  `tags`, or `metadata`, an observation's `startTime`, `level`, or
+  `metadata`, and the `type` guessed for the untyped `observation-*` alias
+  do not count as received.
+- The worker merges each incoming row into the stored one field by field
+  (`apps/worker/src/processors/langfuse-merge.ts`), in any processing order:
+  - **Serialized per record.** Before reading the stored rows it takes
+    Postgres advisory locks, from a dedicated lock pool, and holds them until
+    the merged rows are written and their field times recorded. Each trace
+    and observation id hashes into one of 64 lock buckets per project, so two
+    batches for one record never merge concurrently, and a job holds at most
+    64 locks however large its batch: every held lock takes a slot in
+    Postgres's shared lock table, and exhausting it fails queries server-wide.
+  - **By recency.** `langfuse_field_provenance` (Postgres migration `0005`)
+    records, per record, the receive time of the batch that last sent each
+    field. A field both sides sent takes the later-received batch's value; a
+    field only one side sent takes that side's value; a field neither sent
+    keeps the stored placeholder. An update-only row's placeholder start time
+    therefore gives way to the create's real one even when the create is
+    processed later. A stored row with no recorded times (older data)
+    counts its non-empty fields as sent at its stored version, except a row
+    an earlier attempt of the same batch wrote before failing to record them:
+    only the fields that batch sent count, not its placeholders. Recorded
+    times older than 30 days are pruned after each retention pass.
+  - **Moved rows are deleted.** The day of a trace's timestamp and of an
+    observation's start time is part of its ClickHouse sort key. When a
+    merge moves one to another day (a late create replacing a placeholder
+    across midnight UTC), the stored row under the old key is written as a
+    deletion with the merged row's version, so one row remains.
+  - **Last write wins the tie.** A merged row whose stored version is newer
+    than its batch is written with the stored version (`event_ts`, exact to
+    the microsecond). ReplacingMergeTree keeps the most recently inserted row
+    among equal versions, so the merged row wins, and the trace's latest
+    activity, the settlement clock for evaluators and exports, does not move.
+  - **Derived cost stays consistent.** A stored cost Ironside derived is
+    dropped when the merge takes newer usage or a newer model, so it is
+    derived again from the merged values; a client-sent cost is kept, and
+    derived-cost labels carried over from stored metadata are removed from it.

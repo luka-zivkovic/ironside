@@ -1,4 +1,4 @@
-export { runMigrations } from "./migrate.js";
+export { runMigrations, type MigrationOptions } from "./migrate.js";
 export {
   closeEvaluatorLifecycleFence,
   withEvaluatorDataWriteFence,
@@ -60,7 +60,9 @@ export {
   createRawRetentionIntents,
   getRawRetentionIntent,
   getRawRetentionIntentsByIds,
+  getRawRetentionIntentsForObjects,
   listRawRetentionIntents,
+  listRawRetentionIntentsAfter,
   withRawRetentionExecutionLock,
   withRawRetentionObjectLock,
   tryWithRawRetentionObjectLock,
@@ -87,6 +89,7 @@ export {
   updateExportConfig,
   deleteExportConfig,
   recordExportRun,
+  type DestinationFeedCursor,
   type ExportConfig,
   type ExportFormat,
   type ExportFilter,
@@ -100,12 +103,28 @@ export {
   listOtlpForwardRules,
   listEnabledOtlpForwardRules,
   claimDueOtlpForwardRules,
+  recordOtlpForwardRun,
   updateOtlpForwardRule,
   deleteOtlpForwardRule,
   type OtlpForwardRule,
   type CreateOtlpForwardRuleInput,
   type UpdateOtlpForwardRuleInput
 } from "./otlp-forward-rules.js";
+export {
+  publishTraceScoreActivity,
+  listTraceScoreActivities,
+  pruneStaleTraceScoreFeed
+} from "./trace-score-feed.js";
+export {
+  withLangfuseMergeLocks,
+  closeLangfuseMergeLocks,
+  getLangfuseFieldSentAt,
+  recordLangfuseFieldSentAt,
+  purgeLangfuseFieldSentAtOlderThan,
+  langfuseEntityKey,
+  type LangfuseEntityKind,
+  type LangfuseFieldSentAt
+} from "./langfuse-field-provenance.js";
 export {
   createWebhookRule,
   getWebhookRule,

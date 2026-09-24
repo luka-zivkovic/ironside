@@ -621,6 +621,92 @@ export async function listObservationsForTrace(
   }));
 }
 
+/**
+ * ClickHouse ignores skip indexes under FINAL by default. Enabling them is
+ * safe for these lookups because they filter only on id and trace_id, which
+ * every version of a row shares, so no newer version can be skipped while an
+ * older one is kept.
+ */
+const SKIP_INDEXES_WITH_FINAL = { use_skip_indexes_if_final: 1 } as const;
+
+/** A stored row with its exact ReplacingMergeTree version, as ClickHouse renders DateTime64(6). */
+export type StoredTraceRow = TraceDetailRow & { event_ts: string };
+export type StoredObservationRow = ObservationRow & { event_ts: string };
+
+/**
+ * Stored traces for these ids, project-scoped: one row per id, the most
+ * recently written. A partial update is merged into this row before it is
+ * written (spec/langfuse-compat-v1.md); a trace whose timestamp moved to
+ * another day can still have an older row under its previous sort key.
+ */
+export async function listTracesByIds(
+  client: ClickHouseClient,
+  projectId: string,
+  traceIds: string[]
+): Promise<StoredTraceRow[]> {
+  if (traceIds.length === 0) return [];
+  const result = await client.query({
+    query: `
+      select id, timestamp, name, user_id, session_id, environment, release, version,
+             tags, metadata, input, output, toString(event_ts) as event_ts
+      from traces final
+      where project_id = {projectId:String} and id in {traceIds:Array(String)}
+      order by id, event_ts desc
+      limit 1 by id
+    `,
+    query_params: { projectId, traceIds: [...new Set(traceIds)] },
+    clickhouse_settings: SKIP_INDEXES_WITH_FINAL,
+    format: "JSONEachRow"
+  });
+  const rows = await result.json<StoredTraceRow>();
+  return rows.map((row) => ({ ...row, timestamp: fromClickHouseDateTime(row.timestamp) }));
+}
+
+/**
+ * Stored observations for these ids, project-scoped: one row per id, the
+ * most recently written. Filtering on trace_id as well lets its bloom-filter
+ * index skip granules. Same purpose as listTracesByIds.
+ */
+export async function listObservationsByIds(
+  client: ClickHouseClient,
+  projectId: string,
+  observations: { id: string; traceId: string }[]
+): Promise<StoredObservationRow[]> {
+  if (observations.length === 0) return [];
+  const result = await client.query({
+    // Same Map value casts as listObservationsForTrace.
+    query: `
+      select id, trace_id, parent_observation_id, type, name, start_time, end_time,
+             level, status_message, model, model_parameters, input, output,
+             mapApply((k, v) -> (k, toFloat64(v)), usage_details) as usage_details,
+             mapApply((k, v) -> (k, toFloat64(v)), cost_details) as cost_details,
+             completion_start_time, metadata, toString(event_ts) as event_ts
+      from observations final
+      where project_id = {projectId:String}
+        and trace_id in {traceIds:Array(String)}
+        and id in {observationIds:Array(String)}
+      order by id, event_ts desc
+      limit 1 by id
+    `,
+    query_params: {
+      projectId,
+      traceIds: [...new Set(observations.map((observation) => observation.traceId))],
+      observationIds: [...new Set(observations.map((observation) => observation.id))]
+    },
+    clickhouse_settings: SKIP_INDEXES_WITH_FINAL,
+    format: "JSONEachRow"
+  });
+  const rows = await result.json<StoredObservationRow>();
+  return rows.map((row) => ({
+    ...row,
+    start_time: fromClickHouseDateTime(row.start_time),
+    end_time: row.end_time ? fromClickHouseDateTime(row.end_time) : null,
+    completion_start_time: row.completion_start_time
+      ? fromClickHouseDateTime(row.completion_start_time)
+      : null
+  }));
+}
+
 export interface AggregatesRow {
   trace_count: number;
   token_totals: Record<string, number>;
@@ -730,4 +816,61 @@ export async function getAggregates(
     latency_p95: durationRow?.latency_p95 ?? null,
     latency_p99: durationRow?.latency_p99 ?? null
   };
+}
+
+/** Observations for a page of traces, project-scoped, oldest-first per trace. Batch form of listObservationsForTrace. */
+export async function listObservationsForTraces(
+  client: ClickHouseClient,
+  projectId: string,
+  traceIds: string[]
+): Promise<ObservationRow[]> {
+  const uniqueTraceIds = [...new Set(traceIds)].filter(Boolean);
+  if (uniqueTraceIds.length === 0) return [];
+  const result = await client.query({
+    // Same Map value casts as listObservationsForTrace.
+    query: `
+      select id, trace_id, parent_observation_id, type, name, start_time, end_time,
+             level, status_message, model, model_parameters, input, output,
+             mapApply((k, v) -> (k, toFloat64(v)), usage_details) as usage_details,
+             mapApply((k, v) -> (k, toFloat64(v)), cost_details) as cost_details,
+             completion_start_time, metadata
+      from observations final
+      where project_id = {projectId:String} and trace_id in {traceIds:Array(String)}
+      order by trace_id asc, start_time asc, id asc
+    `,
+    query_params: { projectId, traceIds: uniqueTraceIds },
+    format: "JSONEachRow"
+  });
+  const rows = await result.json<ObservationRow>();
+  return rows.map((row) => ({
+    ...row,
+    start_time: fromClickHouseDateTime(row.start_time),
+    end_time: row.end_time ? fromClickHouseDateTime(row.end_time) : null,
+    completion_start_time: row.completion_start_time
+      ? fromClickHouseDateTime(row.completion_start_time)
+      : null
+  }));
+}
+
+/** Scores for a page of traces, project-scoped, oldest-first per trace. Batch form of listScoresForTrace. */
+export async function listScoresForTraces(
+  client: ClickHouseClient,
+  projectId: string,
+  traceIds: string[]
+): Promise<ScoreRow[]> {
+  const uniqueTraceIds = [...new Set(traceIds)].filter(Boolean);
+  if (uniqueTraceIds.length === 0) return [];
+  const result = await client.query({
+    query: `
+      select id, trace_id, observation_id, name, data_type, value, string_value,
+             source, comment, timestamp, metadata
+      from scores final
+      where project_id = {projectId:String} and trace_id in {traceIds:Array(String)}
+      order by trace_id asc, timestamp asc, id asc
+    `,
+    query_params: { projectId, traceIds: uniqueTraceIds },
+    format: "JSONEachRow"
+  });
+  const rows = await result.json<ScoreRow>();
+  return rows.map((row) => ({ ...row, timestamp: fromClickHouseDateTime(row.timestamp) }));
 }

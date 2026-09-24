@@ -1,5 +1,7 @@
 import type { ClickHouseClient } from "@ironside/clickhouse";
 import {
+  deleteMovedObservationRows,
+  deleteMovedTraceRows,
   hasPendingRawObjectRefs,
   insertObservations,
   insertRawEventRefs,
@@ -12,12 +14,20 @@ import {
   listEvaluatorPublishedTraceIdsForActivity,
   markEvaluatorScoreReceiptMaterialized,
   publishEvaluatorTraceActivities,
+  publishTraceScoreActivity,
   recordIngestFailures,
+  recordLangfuseFieldSentAt,
+  withLangfuseMergeLocks,
   withEvaluatorDataWriteFence,
   withRawRetentionObjectLock,
   type RecordIngestFailureInput
 } from "@ironside/db";
-import { mapLangfuseIngestionRequest, mapNativeEvents, mapOtlpTraceRequest } from "@ironside/mappers";
+import {
+  mapLangfuseIngestionRequest,
+  mapNativeEvents,
+  mapOtlpTraceRequest,
+  type MappedLangfuseRows
+} from "@ironside/mappers";
 import type { IngestBatch, Observation, QueueMessage, Score, Trace } from "@ironside/shared";
 import {
   ingestBatchSchema,
@@ -31,6 +41,7 @@ import type { Pool } from "pg";
 import { ulid } from "ulid";
 import { observeTraceEnvironments } from "../environments/environment-registry.js";
 import { enrichObservationCosts } from "./cost-enrichment.js";
+import { foldLangfuseRows, langfuseEntities, mergeLangfuseRows } from "./langfuse-merge.js";
 
 export interface IngestProcessorDeps {
   storage: ObjectStorage;
@@ -152,9 +163,7 @@ export function createIngestProcessor(deps: IngestProcessorDeps) {
 
     const otlpTraces: Trace[] = [];
     const otlpObservations: Observation[] = [];
-    const langfuseTraces: Trace[] = [];
-    const langfuseObservations: Observation[] = [];
-    const langfuseScores: Score[] = [];
+    const langfuseMapped: MappedLangfuseRows[] = [];
 
     for (const event of batch.events) {
       if (event.source === "otlp" && event.type === "otlp-export") {
@@ -185,105 +194,130 @@ export function createIngestProcessor(deps: IngestProcessorDeps) {
             error.message ?? "event failed LangFuse mapping (no detail provided)"
           );
         }
-        langfuseTraces.push(...rows.traces);
-        langfuseObservations.push(...rows.observations);
-        langfuseScores.push(...rows.scores);
+        langfuseMapped.push(rows);
       }
     }
 
-    const traces = [...nativeRows.traces, ...otlpTraces, ...langfuseTraces];
-    const observations = [
-      ...nativeRows.observations,
-      ...otlpObservations,
-      ...langfuseObservations
-    ];
-    const scores = [...nativeRows.scores, ...langfuseScores];
+    // LangFuse rows merge into the stored rows field by field. The per-record
+    // locks are held until the merged rows are written and their field times
+    // recorded, so batches for one record never merge concurrently and their
+    // processing order does not matter (langfuse-merge.ts).
+    const langfuse = foldLangfuseRows(langfuseMapped);
+    await withLangfuseMergeLocks(deps.pool, projectId, langfuseEntities(langfuse), async () => {
+      // Merge into stored rows before cost enrichment, which needs the merged
+      // model and usage.
+      const merged = await mergeLangfuseRows(deps, {
+        projectId,
+        receivedAt: batch.receivedAt,
+        rows: langfuse
+      });
+      const traces = [...nativeRows.traces, ...otlpTraces, ...merged.traces];
+      const observations = [
+        ...nativeRows.observations,
+        ...otlpObservations,
+        ...merged.observations
+      ];
+      const scores = [...nativeRows.scores, ...langfuse.scores];
 
-    // Derive cost where the source reported usage and a model but no cost.
-    // Client-sent cost is never touched; a project override or the vendored
-    // price table fills the gap so direct SDK/OTLP/native ingest gets the
-    // same cost coverage imports already carry (spec/cost-pricing-v1.md).
-    await enrichObservationCosts(deps.pool, projectId, observations);
+      // Derive cost where the source reported usage and a model but no cost.
+      // Client-sent cost is never touched; a project override or the vendored
+      // price table fills the gap so direct SDK/OTLP/native ingest gets the
+      // same cost coverage imports already carry (spec/cost-pricing-v1.md).
+      await enrichObservationCosts(deps.pool, projectId, observations);
 
-    const traceIds = [
-      ...new Set([
+      const traceIds = [
+        ...new Set([
+          ...traces.map((trace) => trace.id),
+          ...observations.map((observation) => observation.traceId),
+          ...scores.map((score) => score.traceId)
+        ])
+      ];
+
+      const rawRefs = traceIds.map((traceId) => ({
+        projectId,
+        traceId,
+        objectKey,
+        receivedAt: batch.receivedAt
+      }));
+      const snapshotTraceIds = new Set([
         ...traces.map((trace) => trace.id),
-        ...observations.map((observation) => observation.traceId),
-        ...scores.map((score) => score.traceId)
-      ])
-    ];
-
-    const rawRefs = traceIds.map((traceId) => ({
-      projectId,
-      traceId,
-      objectKey,
-      receivedAt: batch.receivedAt
-    }));
-    const snapshotTraceIds = new Set([
-      ...traces.map((trace) => trace.id),
-      ...observations.map((observation) => observation.traceId)
-    ]);
-    const snapshotRawRefs = rawRefs.filter((ref) => snapshotTraceIds.has(ref.traceId));
-    const annotationOnlyRawRefs = rawRefs.filter((ref) => !snapshotTraceIds.has(ref.traceId));
-
-    await withEvaluatorDataWriteFence(deps.pool, async () => {
-      // Mark only snapshot-affecting refs pending before domain rows become
-      // visible. Existing complete traces therefore become conservatively
-      // incomplete during the short write window. Score-only refs start applied
-      // because annotations never alter evaluator snapshots.
-      await Promise.all([
-        insertRawEventRefs(deps.clickhouse, snapshotRawRefs, batch.receivedAt, false),
-        // Annotation-only rows never affect a trace snapshot, so their raw
-        // references can be retention-visible immediately without making
-        // evaluator reads wait for score materialization.
-        insertRawEventRefs(deps.clickhouse, annotationOnlyRawRefs, batch.receivedAt, true)
+        ...observations.map((observation) => observation.traceId)
       ]);
+      const snapshotRawRefs = rawRefs.filter((ref) => snapshotTraceIds.has(ref.traceId));
+      const annotationOnlyRawRefs = rawRefs.filter((ref) => !snapshotTraceIds.has(ref.traceId));
 
-      const insertOptions = { eventTs: batch.receivedAt };
-      await Promise.all([
-        insertTraces(deps.clickhouse, traces, insertOptions),
-        insertObservations(deps.clickhouse, observations, insertOptions),
-        insertScores(deps.clickhouse, scores, insertOptions)
-      ]);
-      // Evaluator score receipts suppress later HTTP retries only after the
-      // durable ingest intent exists. Record the second commit point once its
-      // ClickHouse score row is actually present; terminal recovery keeps an
-      // unmaterialized staged batch retryable.
-      await markEvaluatorScoreReceiptMaterialized(deps.pool, {
-        projectId,
-        batchId: batch.batchId
+      await withEvaluatorDataWriteFence(deps.pool, async () => {
+        // Mark only snapshot-affecting refs pending before domain rows become
+        // visible. Existing complete traces therefore become conservatively
+        // incomplete during the short write window. Score-only refs start applied
+        // because annotations never alter evaluator snapshots.
+        await Promise.all([
+          insertRawEventRefs(deps.clickhouse, snapshotRawRefs, batch.receivedAt, false),
+          // Annotation-only rows never affect a trace snapshot, so their raw
+          // references can be retention-visible immediately without making
+          // evaluator reads wait for score materialization.
+          insertRawEventRefs(deps.clickhouse, annotationOnlyRawRefs, batch.receivedAt, true)
+        ]);
+
+        const insertOptions = { eventTs: batch.receivedAt };
+        const traceOptions = { ...insertOptions, rowEventTs: merged.rowEventTs.traces };
+        const observationOptions = { ...insertOptions, rowEventTs: merged.rowEventTs.observations };
+        await Promise.all([
+          insertTraces(deps.clickhouse, traces, traceOptions),
+          insertObservations(deps.clickhouse, observations, observationOptions),
+          insertScores(deps.clickhouse, scores, insertOptions),
+          // A merge that moved a record to another day leaves its old row
+          // under the old sort key; delete it with the moved row's version.
+          deleteMovedTraceRows(deps.clickhouse, merged.moved.traces, traceOptions),
+          deleteMovedObservationRows(deps.clickhouse, merged.moved.observations, observationOptions)
+        ]);
+        // Evaluator score receipts suppress later HTTP retries only after the
+        // durable ingest intent exists. Record the second commit point once its
+        // ClickHouse score row is actually present; terminal recovery keeps an
+        // unmaterialized staged batch retryable.
+        await markEvaluatorScoreReceiptMaterialized(deps.pool, {
+          projectId,
+          batchId: batch.batchId
+        });
+        // Scores for traces this batch did not otherwise touch never move the
+        // trace feed, so scheduled exports learn about them from the score feed.
+        await publishTraceScoreActivity(deps.pool, {
+          projectId,
+          traceIds: annotationOnlyRawRefs.map((ref) => ref.traceId)
+        });
+
+        // Discovery is derived, but it is part of this job's durable materialize
+        // step: a failure retries the idempotent ClickHouse writes rather than
+        // silently leaving the picker stale until a future rebuild.
+        await observeTraceEnvironments(
+          deps.pool,
+          projectId,
+          traces,
+          deps.onEnvironmentRegistryOverflow
+        );
+
+        // Publish only trace/observation activity after every ClickHouse row and
+        // its pending raw reference is durable. Scores are downstream annotations
+        // and must never reopen or republish an evaluator snapshot. The batch id
+        // makes this publication idempotent if final cleanup later makes the job
+        // retry. Keep the raw reference pending until after publication so exact
+        // evaluator reads cannot observe changed ClickHouse rows under the prior
+        // snapshot version.
+        await publishEvaluatorTraceActivities(deps.pool, {
+          projectId,
+          traceIds: [
+            ...snapshotTraceIds
+          ],
+          sourceActivityAt: batch.receivedAt,
+          activityId: batch.batchId
+        });
+
+        // Applied refs are written last. Until this succeeds evaluator detail
+        // reads return 409 and the feed cursor remains retryable. A retry repeats
+        // ClickHouse writes but does not mint another feed version.
+        await insertRawEventRefs(deps.clickhouse, snapshotRawRefs, batch.receivedAt, true);
       });
-
-      // Discovery is derived, but it is part of this job's durable materialize
-      // step: a failure retries the idempotent ClickHouse writes rather than
-      // silently leaving the picker stale until a future rebuild.
-      await observeTraceEnvironments(
-        deps.pool,
-        projectId,
-        traces,
-        deps.onEnvironmentRegistryOverflow
-      );
-
-      // Publish only trace/observation activity after every ClickHouse row and
-      // its pending raw reference is durable. Scores are downstream annotations
-      // and must never reopen or republish an evaluator snapshot. The batch id
-      // makes this publication idempotent if final cleanup later makes the job
-      // retry. Keep the raw reference pending until after publication so exact
-      // evaluator reads cannot observe changed ClickHouse rows under the prior
-      // snapshot version.
-      await publishEvaluatorTraceActivities(deps.pool, {
-        projectId,
-        traceIds: [
-          ...snapshotTraceIds
-        ],
-        sourceActivityAt: batch.receivedAt,
-        activityId: batch.batchId
-      });
-
-      // Applied refs are written last. Until this succeeds evaluator detail
-      // reads return 409 and the feed cursor remains retryable. A retry repeats
-      // ClickHouse writes but does not mint another feed version.
-      await insertRawEventRefs(deps.clickhouse, snapshotRawRefs, batch.receivedAt, true);
+      await recordLangfuseFieldSentAt(deps.pool, projectId, merged.sentAt);
     });
 
     if (failures.length > 0) {

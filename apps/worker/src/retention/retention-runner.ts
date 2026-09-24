@@ -13,6 +13,8 @@ import {
   listAllProjects,
   listEvaluatorTraceFeedKeys,
   purgeIngestFailuresOlderThan,
+  purgeLangfuseFieldSentAtOlderThan,
+  pruneStaleTraceScoreFeed,
   recordEvaluatorImportRetentionCutoffs,
   withEvaluatorRetentionFence
 } from "@ironside/db";
@@ -104,10 +106,25 @@ function cutoffEntries(
  * precision via row-level markProjectDataDeletedOlderThan instead.
  */
 export async function runRetention(options: RunRetentionOptions): Promise<RetentionRunResult> {
-  return withEvaluatorRetentionFence(options.pool, () => runRetentionFenced(options));
+  const fenced = await withEvaluatorRetentionFence(options.pool, () => runRetentionFenced(options));
+  // Postgres-only bookkeeping touches no trace data, so it runs after the
+  // fence, which every ingest job waits on, rather than inside it.
+  const { pool } = options;
+  const now = options.now ?? new Date();
+  // Dead-letter rows are diagnostics, not trace data — a fixed 30-day
+  // window (not the per-project retention settings) keeps the table
+  // bounded without inventing a separate config knob for it.
+  const purgedIngestFailures = await purgeIngestFailuresOlderThan(pool, 30);
+  // LangFuse updates follow their create within minutes; after 30 days a
+  // record merges as if every stored field was sent at the stored version.
+  await purgeLangfuseFieldSentAtOlderThan(pool, daysAgo(30, now));
+  await pruneStaleTraceScoreFeed(pool, options.defaultRetentionDays);
+  return { ...fenced, purgedIngestFailures };
 }
 
-async function runRetentionFenced(options: RunRetentionOptions): Promise<RetentionRunResult> {
+async function runRetentionFenced(
+  options: RunRetentionOptions
+): Promise<Omit<RetentionRunResult, "purgedIngestFailures">> {
   const { pool, clickhouse } = options;
 
   const projects = await listAllProjects(pool);
@@ -176,16 +193,12 @@ async function runRetentionFenced(options: RunRetentionOptions): Promise<Retenti
     projects.map((project) => project.id)
   );
 
-  // Dead-letter rows are diagnostics, not trace data — a fixed 30-day
-  // window (not the per-project retention settings) keeps the table
-  // bounded without inventing a separate config knob for it.
-  const purgedIngestFailures = await purgeIngestFailuresOlderThan(pool, 30);
   // Reconcile on every pass. A prior run may have deleted ClickHouse traces
   // and then crashed before feed cleanup; conditioning this on deletions from
   // only the current run would strand those durable orphans indefinitely.
   const prunedEvaluatorTraceFeed = await pruneOrphanedEvaluatorTraceFeed(pool, clickhouse);
 
-  return { droppedPartitions, projectDeletes, purgedIngestFailures, prunedEvaluatorTraceFeed };
+  return { droppedPartitions, projectDeletes, prunedEvaluatorTraceFeed };
 }
 
 const EVALUATOR_FEED_PRUNE_BATCH_SIZE = 500;

@@ -1,4 +1,4 @@
-import { createClickHouseClient, insertTraces, runMigrations as runChMigrations } from "@ironside/clickhouse";
+import { createClickHouseClient, runMigrations as runChMigrations } from "@ironside/clickhouse";
 import {
   createExportConfig,
   createOtlpForwardRule,
@@ -15,6 +15,7 @@ import { ulid } from "ulid";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/config.js";
 import { startScheduler, type Scheduler } from "../src/scheduler.js";
+import { insertPublishedTrace } from "./support/published-traces.js";
 
 // These are real end-to-end integration tests (real ClickHouse/Postgres/
 // MinIO, real DuckDB writes for the export path) driven by a poll loop
@@ -32,8 +33,16 @@ vi.setConfig({ testTimeout: 15_000 });
 // and records the outcome, end-to-end against the real local stack.
 
 const config = loadConfig();
-const pool = new Pool({ connectionString: config.databaseUrl });
-const clickhouse = createClickHouseClient(config.clickhouse);
+// The scheduler claims due rows across every project, so in the shared test
+// database it also claimed and ran other files' exports, forwards, webhooks,
+// and imports, and a slow tick timed these tests out. Like
+// retention-runner.test.ts, this file gets its own Postgres schema and
+// ClickHouse database.
+const namespace = `scheduler_test_${ulid().toLowerCase()}`;
+const adminPool = new Pool({ connectionString: config.databaseUrl });
+const pool = new Pool({ connectionString: config.databaseUrl, options: `-c search_path=${namespace}` });
+const adminClickhouse = createClickHouseClient(config.clickhouse);
+const clickhouse = createClickHouseClient({ ...config.clickhouse, database: namespace });
 const destination = createObjectStorage({
   endpoint: config.storage.endpoint,
   region: config.storage.region,
@@ -46,6 +55,8 @@ let projectId: string;
 let scheduler: Scheduler | null = null;
 
 beforeAll(async () => {
+  await adminPool.query(`create schema ${namespace}`);
+  await adminClickhouse.command({ query: `create database ${namespace}` });
   await runPgMigrations(pool);
   await runChMigrations(clickhouse);
   await destination.ensureBucket();
@@ -78,10 +89,16 @@ afterEach(() => {
 });
 
 afterAll(async () => {
-  await pool.query("delete from organizations where name = 'scheduler-test-org'");
   await pool.end();
   await clickhouse.close();
   destination.close();
+  try {
+    await adminPool.query(`drop schema if exists ${namespace} cascade`);
+    await adminClickhouse.command({ query: `drop database if exists ${namespace} sync` });
+  } finally {
+    await adminPool.end();
+    await adminClickhouse.close();
+  }
 });
 
 async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 10_000): Promise<void> {
@@ -96,19 +113,9 @@ async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 10_000): P
 describe("startScheduler", () => {
   it("claims a due export config, decrypts its secret, runs the export, and records success", async () => {
     const marker = `sched_export_${ulid()}`;
-    await insertTraces(
-      clickhouse,
-      [
-        {
-          id: `trace_${marker}`,
-          projectId,
-          timestamp: new Date().toISOString(),
-          tags: [marker],
-          metadata: {}
-        }
-      ],
-      { eventTs: new Date().toISOString() }
-    );
+    await insertPublishedTrace({ pool, clickhouse }, {
+      trace: { id: `trace_${marker}`, projectId, timestamp: new Date().toISOString(), tags: [marker], metadata: {} }
+    });
 
     const exportConfig = await createExportConfig(pool, {
       id: `export_${ulid()}`,
@@ -147,6 +154,10 @@ describe("startScheduler", () => {
   });
 
   it("records a failure (not a crash) when a claimed export's destination is unreachable, and still advances next_run_at", async () => {
+    // A published trace, so the run has something to upload.
+    await insertPublishedTrace({ pool, clickhouse }, {
+      trace: { id: `trace_sched_fail_${ulid()}`, projectId, timestamp: new Date().toISOString(), tags: [], metadata: {} }
+    });
     const exportConfig = await createExportConfig(pool, {
       id: `export_${ulid()}`,
       projectId,
@@ -238,11 +249,9 @@ describe("startScheduler", () => {
     });
     // A second, healthy config proves the bad row doesn't block others.
     const marker = `sched_decrypt_${ulid()}`;
-    await insertTraces(
-      clickhouse,
-      [{ id: `trace_${marker}`, projectId, timestamp: new Date().toISOString(), tags: [marker], metadata: {} }],
-      { eventTs: new Date().toISOString() }
-    );
+    await insertPublishedTrace({ pool, clickhouse }, {
+      trace: { id: `trace_${marker}`, projectId, timestamp: new Date().toISOString(), tags: [marker], metadata: {} }
+    });
     const healthyConfig = await createExportConfig(pool, {
       id: `export_${ulid()}`,
       projectId,

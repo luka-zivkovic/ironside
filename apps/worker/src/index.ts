@@ -1,6 +1,7 @@
 import { createClickHouseClient, runMigrations as runChMigrations } from "@ironside/clickhouse";
 import {
   closeEvaluatorLifecycleFence,
+  closeLangfuseMergeLocks,
   runMigrations as runPgMigrations
 } from "@ironside/db";
 import { createIngestQueue, createIngestWorker } from "@ironside/queue";
@@ -14,6 +15,7 @@ import {
   settlePublishedEvaluatorTraceRefs
 } from "./processors/ingest.js";
 import { startPendingIngestRecovery } from "./recovery/recovery-loop.js";
+import { startRawRetentionSweep } from "./retention/raw-retention-sweep.js";
 import { verifyPendingIngestStorage } from "./recovery/storage-permissions.js";
 import { startScheduler } from "./scheduler.js";
 
@@ -40,7 +42,10 @@ const worker = createIngestWorker(
     storage,
     clickhouse,
     pool: pgPool,
-    retentionExecutionEnabled: config.rawRetentionExecutionEnabled,
+    // Always on, whatever RAW_RETENTION_EXECUTION_ENABLED says: an intent a
+    // worker already started executing must never have its batch
+    // re-materialized, even after deletion is switched off.
+    retentionExecutionEnabled: true,
     onDeadLetter: (count) => metrics.eventsDeadLettered.inc(count),
     onEnvironmentRegistryOverflow: (count) =>
       metrics.environmentRegistryOverflow.inc({ source: "live" }, count)
@@ -73,7 +78,8 @@ const recovery = startPendingIngestRecovery({
   storage,
   queue,
   pool: pgPool,
-  retentionExecutionEnabled: config.rawRetentionExecutionEnabled,
+  // Always on; see the ingest processor above.
+  retentionExecutionEnabled: true,
   intervalMs: config.ingestRecoveryIntervalMs,
   batchSize: config.ingestRecoveryBatchSize,
   beforeTerminalFailure: (message) =>
@@ -95,6 +101,46 @@ const recovery = startPendingIngestRecovery({
   }
 });
 console.log("ironside-worker: ingest recovery running");
+
+// Deletes raw event objects once they are past their project's retention;
+// see spec/raw-retention-intents-v1.md.
+const rawRetention = config.rawRetentionExecutionEnabled
+  ? startRawRetentionSweep({
+      pool: pgPool,
+      clickhouse,
+      storage,
+      queue,
+      defaultRetentionDays: config.defaultRetentionDays,
+      intervalMs: config.rawRetentionSweepIntervalMs,
+      onResult: (result) => {
+        if (result.deleted > 0 || result.prepared > 0) {
+          console.log(
+            `[raw-retention] deleted=${result.deleted} prepared=${result.prepared} ` +
+              `blocked=${result.blocked} skipped=${result.skipped} examined=${result.examined}`
+          );
+        }
+        for (const failure of result.errors) {
+          console.error(`[raw-retention] project=${failure.projectId}: ${failure.message}`);
+        }
+        if (result.errorCount > result.errors.length) {
+          console.error(`[raw-retention] ${result.errorCount - result.errors.length} more error(s) not shown`);
+        }
+        metrics.schedulerRuns.inc({
+          subsystem: "raw-retention",
+          outcome: result.errorCount > 0 ? "error" : "success"
+        });
+      },
+      onError: (error) => {
+        metrics.schedulerRuns.inc({ subsystem: "raw-retention", outcome: "error" });
+        console.error("[raw-retention] sweep failed:", error);
+      }
+    })
+  : null;
+console.log(
+  config.rawRetentionExecutionEnabled
+    ? "ironside-worker: raw retention sweep running"
+    : "ironside-worker: raw retention disabled (RAW_RETENTION_EXECUTION_ENABLED is not true); raw events are kept"
+);
 
 // Drives scheduled exports, OTLP forwards, webhooks, and retention — see
 // scheduler.ts for why a plain interval loop (not a second BullMQ queue)
@@ -118,10 +164,12 @@ console.log(`ironside-worker: metrics on :${config.metricsPort}/metrics`);
 async function shutdown(): Promise<void> {
   scheduler.stop();
   recovery.stop();
+  rawRetention?.stop();
   metricsServer.close();
   await worker.close();
   await queue.close();
   await closeEvaluatorLifecycleFence(pgPool);
+  await closeLangfuseMergeLocks(pgPool);
   await pgPool.end();
   await clickhouse.close();
   storage.close();

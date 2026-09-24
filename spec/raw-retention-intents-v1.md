@@ -1,13 +1,15 @@
 # Raw retention intents v1
 
-Status: implemented; preparation is non-destructive and execution is explicit,
-bounded, feature-disabled by default, and never scheduled.
+Status: implemented. Preparation is non-destructive; execution is bounded and
+runs automatically through the raw retention sweep, on by default (see
+"Automatic sweep"), or explicitly through the operator command.
 
 ## Product boundary
 
-Ironside is a storage layer and trace viewer. This slice adds the minimum
-control-plane contract needed to shorten raw history honestly; it does not add
-analytics, automatic discovery, a scheduler, or media garbage collection.
+Ironside is a storage layer and trace viewer. This contract shortens raw
+history honestly: raw event objects past their project's retention are
+deleted, with evidence, and only when nothing visible still depends on them.
+It does not add analytics or media garbage collection.
 
 `raw_event_trace_retention` is append-only evidence that at least one raw
 object for a project+trace identity was deliberately expired. Raw-event reads
@@ -72,30 +74,24 @@ slot. Project deletion does not cascade away this audit record.
 ## Executing reviewed intents
 
 Execution accepts no object scan, lifecycle manifest, or implicit prepared
-queue. The operator must name one exact project and 1–10 exact intent ids, set
-the normally-false feature flag, and pass the separate script's `--execute`
-argument:
+queue: every call names one exact project and 1–10 exact intent ids. The
+automatic sweep supplies them on a schedule; an operator can also run reviewed
+intents directly with the script's `--execute` argument:
 
 ```sh
-# First recreate every worker replica with the guard enabled.
-RAW_RETENTION_EXECUTION_ENABLED=true docker compose up -d --force-recreate worker
-
 docker compose exec \
-  -e RAW_RETENTION_EXECUTION_ENABLED=true \
   -e RAW_RETENTION_PROJECT_ID=proj_example \
   -e 'RAW_RETENTION_INTENT_IDS_JSON=["rti_example"]' \
   worker node apps/worker/dist/src/scripts/raw-retention-execute.js --execute
 ```
 
-All API and worker replicas must be upgraded before enabling execution. Every
-worker must receive `RAW_RETENTION_EXECUTION_ENABLED=true` so its ingest
-processor participates in the per-object advisory-lock/tombstone guard. Keep
-the flag false during ordinary operation; in that state ingestion performs no
-extra Postgres coordination. The coordination flag does not require ordinary
-worker replicas to receive raw-delete credentials.
+Execution requires `RAW_RETENTION_EXECUTION_ENABLED` to be `true` (the
+default). Every ingest batch takes the per-object advisory-lock/tombstone
+guard regardless of the flag. All API and worker replicas must run a build
+with this guard before any worker deletes raw objects.
 
-Run the explicit executor command with a short-lived execution role/window.
-That role needs the ordinary pending/failed sidecar contract plus
+The executing credentials — the worker's own for the sweep, or an operator's
+for the command — need the ordinary pending/failed sidecar contract plus
 `PutObject`/`HeadObject`/`DeleteObject` on each reviewed target day's
 `raw/{project}/{yyyy}/{mm}/{dd}/.retention-probes/*` prefix and `DeleteObject`
 on the exact reviewed canonical raw objects. For every raw-present intent, the
@@ -135,10 +131,54 @@ verifiably complete. Mutable policy, project, queue, and diagnostic state no
 longer veto that post-delete convergence. This distinguishes a crash after the
 last delete from unexplained external data loss.
 
+## Automatic sweep
+
+With `RAW_RETENTION_EXECUTION_ENABLED` at its default of `true`, each worker
+runs `runRawRetentionSweep` (`apps/worker/src/retention/raw-retention-sweep.ts`)
+every `RAW_RETENTION_SWEEP_INTERVAL_MS` (15 minutes). The sweep only discovers
+candidates; deletion still goes through the preparer and the executor above,
+with every check, lock, and irreversible ordering unchanged.
+
+- For each project it first resumes intents left `executing` by a crash,
+  whose raw object may already be gone, and then lists canonical
+  `raw/{project}/{yyyy}/{mm}/{dd}/{batch}.json` keys in day order for days
+  strictly before the project's cutoff. Non-canonical keys, such as
+  `.retention-probes/*`, are passed over.
+- Keys without an intent are prepared (at most 100 per call); keys with a
+  `prepared` or `executing` intent are executed again; intents are executed in
+  chunks of 10. Anything the preparer skips or the executor blocks — a visible
+  trace, a pending batch, an ambiguous ref-less object — stays and is revisited.
+- A per-project cursor, held in worker memory, lets the next sweep continue
+  where the budget stopped (1,000 objects per project, 5 minutes per sweep).
+  The cursor moves past a page only after the page is handled. Reaching the
+  cutoff clears it, so the next sweep starts again from the oldest day and
+  revisits skipped objects. A restart only restarts the cycle.
+- Each sweep starts with a different project, so the shared time budget
+  cannot starve later projects, and resumes `executing` intents in rotation,
+  so permanently blocked ones cannot hide later ones.
+- Failures stay local. A page the preparer or executor rejects as a whole
+  (for example, over the 10,000 aggregate trace-reference cap) is split until
+  single objects remain; a single object that still fails is recorded and
+  skipped until the next cycle. When every object on a page fails, the cause
+  is shared (a store outage, most likely): the project is recorded as failed
+  and its cursor stays put. Either way the sweep continues with the next
+  project, and the worker logs the errors.
+- If another replica holds the executor lock, the sweep stops and retries on
+  its next interval.
+
+Setting the flag to anything other than exactly `true` on every worker disables
+the sweep and the operator executor and keeps raw events indefinitely. Ingest
+and recovery always take the per-object lock and honor `executing`/`complete`
+intents, whatever the flag says, so switching deletion off never lets a
+delayed job resurrect rows an already-started deletion removed. Throughput is bounded by the per-object executor work; an
+installation ingesting many small batches can fall behind, and its backlog is
+visible in the lifecycle plan.
+
 ## Explicitly deferred
 
-- scheduled or all-project candidate discovery and automatic intent execution;
 - strict compliance TTL for raw batches that still support visible traces;
+- ref-less raw objects (for example, batches whose every event was
+  dead-lettered), which remain because their trace membership cannot be proven;
 - media cleanup, orphan/deleted-project cleanup, object versions, backups,
   WORM/Object Lock, and physical compaction of marker tables;
 - replay of executing/complete objects (enabled ingest workers terminally

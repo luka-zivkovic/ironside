@@ -11,7 +11,7 @@ M9 Phase 1: the codebase's usage-key vocabulary had silently forked — the SDK 
 - **Canonical vocabulary: `input_tokens` / `output_tokens` / `total_tokens`** — the existing majority convention (SDK, OTLP via gen_ai semconv, compat mapper) and the one `domain.ts`'s own doc comment already documented.
 - **One shared `canonicalizeUsageKeys`** (`@ironside/mappers`): maps every known alias (`input`/`output`/`total`, `promptTokens`/`completionTokens`/`totalTokens`, `prompt_tokens`/`completion_tokens`) to canonical names; **unknown keys pass through unchanged** (provider-specific series like `cache_read_input_tokens` are real data — the open record is the point of the schema). Collision rule: a canonical key present in the source wins over an alias targeting it, regardless of key order (two-pass, deterministic).
 - **`costDetails` untouched** — its `input`/`output`/`total` convention was already consistent across every writer; only usage keys had forked.
-- **No ClickHouse data rewrite** — local development data is disposable, so changing this contract requires a clean reset rather than mutation code.
+- **No ClickHouse data rewrite** — local development data was disposable when this shipped (before 0.3.0), so the change used a clean reset rather than mutation code. A change like this now needs a migration (docs/schema-migrations.md).
 
 ## A bonus bug fixed: the compat mapper silently dropped `total`
 

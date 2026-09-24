@@ -23,8 +23,14 @@ export interface Config {
   ingestRecoveryIntervalMs: number;
   /** Maximum pending intents examined per recovery pass. */
   ingestRecoveryBatchSize: number;
-  /** Destructive raw-retention commands require this literal opt-in. */
+  /**
+   * Raw event objects past their project's retention are deleted automatically
+   * (the sweep) and by the operator command. On unless set to anything other
+   * than exactly "true". Ingest coordinates with deletion regardless.
+   */
   rawRetentionExecutionEnabled: boolean;
+  /** How often the raw retention sweep runs, in ms. */
+  rawRetentionSweepIntervalMs: number;
   /** Port for the worker's own /metrics listener (the worker has no other HTTP surface). Not published in docker-compose by default. */
   metricsPort: number;
   /** Optional bearer token gating the worker's /metrics; null = unauthenticated (acceptable when the port isn't published/reachable). */
@@ -57,8 +63,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     retentionIntervalMs: Number(env.RETENTION_INTERVAL_MS ?? 6 * 60 * 60 * 1000),
     ingestRecoveryIntervalMs: Number(env.INGEST_RECOVERY_INTERVAL_MS ?? 30_000),
     ingestRecoveryBatchSize: Number(env.INGEST_RECOVERY_BATCH_SIZE ?? 1_000),
-    rawRetentionExecutionEnabled: env.RAW_RETENTION_EXECUTION_ENABLED === "true",
+    rawRetentionExecutionEnabled: (env.RAW_RETENTION_EXECUTION_ENABLED ?? "true") === "true",
+    rawRetentionSweepIntervalMs: timerIntervalMs(env.RAW_RETENTION_SWEEP_INTERVAL_MS, 15 * 60 * 1000),
     metricsPort: Number(env.METRICS_PORT ?? 9464),
     metricsToken: env.METRICS_TOKEN ?? null
   };
+}
+
+/**
+ * A positive interval within setTimeout's range (larger values fire after
+ * 1 ms); anything else, including an empty string, takes the default.
+ */
+function timerIntervalMs(value: string | undefined, fallback: number): number {
+  const parsed = value === undefined || value.trim() === "" ? Number.NaN : Number(value);
+  return Number.isFinite(parsed) && parsed >= 1 ? Math.min(parsed, 2 ** 31 - 1) : fallback;
 }

@@ -1,5 +1,10 @@
 import type { Pool } from "pg";
-import type { ExportFilter } from "./export-configs.js";
+import {
+  FEED_CURSOR_COLUMNS,
+  feedCursorFromRow,
+  type DestinationFeedCursor,
+  type ExportFilter
+} from "./export-configs.js";
 
 export interface OtlpForwardRule {
   id: string;
@@ -12,6 +17,13 @@ export interface OtlpForwardRule {
   enabled: boolean;
   pollIntervalSeconds: number;
   nextRunAt: Date;
+  /** Null until the first trace is forwarded; the next run starts at the beginning of the feed. */
+  feedCursor: DestinationFeedCursor | null;
+  lastRunAt: Date | null;
+  lastRunStatus: "success" | "error" | null;
+  /** Why the last run stopped, or which traces the destination rejected and were skipped. */
+  lastRunError: string | null;
+  lastRunForwardedCount: number | null;
 }
 
 interface OtlpForwardRuleRow {
@@ -24,6 +36,12 @@ interface OtlpForwardRuleRow {
   enabled: boolean;
   poll_interval_seconds: number;
   next_run_at: Date;
+  feed_cursor_trace_id: string | null;
+  feed_cursor_published_at_text?: string | null;
+  last_run_at: Date | null;
+  last_run_status: "success" | "error" | null;
+  last_run_error: string | null;
+  last_run_forwarded_count: string | null;
 }
 
 function fromRow(row: OtlpForwardRuleRow): OtlpForwardRule {
@@ -36,7 +54,13 @@ function fromRow(row: OtlpForwardRuleRow): OtlpForwardRule {
     filter: row.filter,
     enabled: row.enabled,
     pollIntervalSeconds: row.poll_interval_seconds,
-    nextRunAt: row.next_run_at
+    nextRunAt: row.next_run_at,
+    feedCursor: feedCursorFromRow(row),
+    lastRunAt: row.last_run_at,
+    lastRunStatus: row.last_run_status,
+    lastRunError: row.last_run_error,
+    lastRunForwardedCount:
+      row.last_run_forwarded_count === null ? null : Number(row.last_run_forwarded_count)
   };
 }
 
@@ -57,7 +81,7 @@ export async function createOtlpForwardRule(
   const result = await pool.query<OtlpForwardRuleRow>(
     `insert into otlp_forward_rules (id, project_id, name, destination_url, destination_auth_header_encrypted, filter)
      values ($1, $2, $3, $4, $5, $6)
-     returning *`,
+     returning *, ${FEED_CURSOR_COLUMNS}`,
     [
       input.id,
       input.projectId,
@@ -78,7 +102,7 @@ export async function getOtlpForwardRule(
   id: string
 ): Promise<OtlpForwardRule | null> {
   const result = await pool.query<OtlpForwardRuleRow>(
-    "select * from otlp_forward_rules where project_id = $1 and id = $2",
+    `select *, ${FEED_CURSOR_COLUMNS} from otlp_forward_rules where project_id = $1 and id = $2`,
     [projectId, id]
   );
   const row = result.rows[0];
@@ -87,7 +111,7 @@ export async function getOtlpForwardRule(
 
 export async function listOtlpForwardRules(pool: Pool, projectId: string): Promise<OtlpForwardRule[]> {
   const result = await pool.query<OtlpForwardRuleRow>(
-    "select * from otlp_forward_rules where project_id = $1 order by created_at asc",
+    `select *, ${FEED_CURSOR_COLUMNS} from otlp_forward_rules where project_id = $1 order by created_at asc`,
     [projectId]
   );
   return result.rows.map(fromRow);
@@ -95,7 +119,7 @@ export async function listOtlpForwardRules(pool: Pool, projectId: string): Promi
 
 export async function listEnabledOtlpForwardRules(pool: Pool): Promise<OtlpForwardRule[]> {
   const result = await pool.query<OtlpForwardRuleRow>(
-    "select * from otlp_forward_rules where enabled = true order by id asc"
+    `select *, ${FEED_CURSOR_COLUMNS} from otlp_forward_rules where enabled = true order by id asc`
   );
   return result.rows.map(fromRow);
 }
@@ -118,7 +142,7 @@ export async function updateOtlpForwardRule(
          poll_interval_seconds = coalesce($4, poll_interval_seconds),
          updated_at = now()
      where id = $1 and project_id = $2
-     returning *`,
+     returning *, ${FEED_CURSOR_COLUMNS}`,
     [id, projectId, input.enabled ?? null, input.pollIntervalSeconds ?? null]
   );
   const row = result.rows[0];
@@ -148,8 +172,52 @@ export async function claimDueOtlpForwardRules(
        limit $1
        for update skip locked
      )
-     returning *`,
+     returning *, ${FEED_CURSOR_COLUMNS}`,
     [limit]
   );
   return result.rows.map(fromRow);
 }
+
+/**
+ * Records a forwarding run: its outcome and how far it got through the trace
+ * feed. The position is stored only if it still holds the value the run
+ * started from, so a slow run claimed twice by different worker replicas
+ * cannot move it back. `runAgainSoon` makes the next scheduler tick continue
+ * a backlog the run stopped short of.
+ */
+export async function recordOtlpForwardRun(
+  pool: Pool,
+  id: string,
+  run: {
+    status: "success" | "error";
+    error?: string;
+    forwarded: number;
+    feedCursor: { from: DestinationFeedCursor | null; to: DestinationFeedCursor | null };
+    runAgainSoon?: boolean;
+  }
+): Promise<void> {
+  await pool.query(
+    `update otlp_forward_rules
+     set last_run_at = now(), last_run_status = $2, last_run_error = $3,
+         last_run_forwarded_count = $4,
+         feed_cursor_published_at = case when ${UNCHANGED} then $7::timestamptz else feed_cursor_published_at end,
+         feed_cursor_trace_id = case when ${UNCHANGED} then $8::text else feed_cursor_trace_id end,
+         next_run_at = case when $9 then now() else next_run_at end,
+         updated_at = now()
+     where id = $1`,
+    [
+      id,
+      run.status,
+      run.error ?? null,
+      run.forwarded,
+      run.feedCursor.from?.publishedAt ?? null,
+      run.feedCursor.from?.traceId ?? null,
+      run.feedCursor.to?.publishedAt ?? null,
+      run.feedCursor.to?.traceId ?? null,
+      run.runAgainSoon ?? false
+    ]
+  );
+}
+
+const UNCHANGED = `feed_cursor_published_at is not distinct from $5::timestamptz
+  and feed_cursor_trace_id is not distinct from $6::text`;

@@ -173,6 +173,7 @@ describe("Ironside SDK client", () => {
       apiKey: "k",
       host: "http://localhost:8788",
       fetchImpl: failingFetch(500),
+      maxRetries: 0,
       onError
     });
     clients.push(client);
@@ -191,6 +192,7 @@ describe("Ironside SDK client", () => {
       apiKey: "k",
       host: "http://localhost:8788",
       fetchImpl: throwingFetch,
+      maxRetries: 0,
       onError
     });
     clients.push(client);
@@ -420,5 +422,356 @@ describe("uploadMedia", () => {
     await expect(
       client.uploadMedia({ data: new Uint8Array([]), contentType: "image/png" })
     ).rejects.toThrow(/media upload failed: 400/);
+  });
+});
+
+describe("ingest delivery retries", () => {
+  const clients: { shutdown: () => Promise<void> }[] = [];
+  afterEach(async () => {
+    vi.useRealTimers();
+    await Promise.all(clients.splice(0).map((c) => c.shutdown()));
+  });
+
+  /** Answers each request with the next scripted status (or throws the scripted error); 202 once the script runs out. */
+  function scriptedFetch(script: (number | Error | Response)[]) {
+    const requests: { events: IngestRequestEvent[] }[] = [];
+    const fetchImpl: typeof fetch = vi.fn(async (_input, init) => {
+      requests.push(JSON.parse(String(init?.body)));
+      const next = script.shift() ?? 202;
+      if (next instanceof Error) throw next;
+      if (next instanceof Response) return next;
+      return new Response("{}", { status: next });
+    }) as unknown as typeof fetch;
+    return { fetchImpl, requests };
+  }
+
+  function traceNames(request: { events: IngestRequestEvent[] }): unknown[] {
+    return request.events.map((event) => (event.body as { name?: string }).name);
+  }
+
+  it("retries a transient 503 and delivers the same events on the next attempt", async () => {
+    const { fetchImpl, requests } = scriptedFetch([503]);
+    const onError = vi.fn();
+    const client = init({ apiKey: "k", host: "http://localhost:8788", fetchImpl, onError, retryDelayMs: 1 });
+    clients.push(client);
+
+    client.trace({ name: "retried" });
+    await client.flush();
+
+    expect(requests).toHaveLength(2);
+    expect(requests[1]).toEqual(requests[0]);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("retries network-level failures before reporting them", async () => {
+    const { fetchImpl, requests } = scriptedFetch([new Error("ECONNRESET"), new Error("ECONNRESET")]);
+    const onError = vi.fn();
+    const client = init({ apiKey: "k", host: "http://localhost:8788", fetchImpl, onError, retryDelayMs: 1 });
+    clients.push(client);
+
+    client.trace({ name: "flaky-network" });
+    await client.flush();
+
+    expect(requests).toHaveLength(3);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("does not retry a request the server rejected as invalid", async () => {
+    const { fetchImpl, requests } = scriptedFetch([400]);
+    const onError = vi.fn();
+    const client = init({ apiKey: "k", host: "http://localhost:8788", fetchImpl, onError, retryDelayMs: 1 });
+    clients.push(client);
+
+    client.trace({ name: "invalid" });
+    await client.flush();
+
+    expect(requests).toHaveLength(1);
+    expect(onError).toHaveBeenCalledOnce();
+    expect(String(onError.mock.calls[0]?.[0])).toMatch(/HTTP 400/);
+  });
+
+  it("reports the batch once after exhausting maxRetries", async () => {
+    const { fetchImpl, requests } = scriptedFetch([500, 500, 500, 500]);
+    const onError = vi.fn();
+    const client = init({
+      apiKey: "k",
+      host: "http://localhost:8788",
+      fetchImpl,
+      onError,
+      maxRetries: 2,
+      retryDelayMs: 1
+    });
+    clients.push(client);
+
+    client.trace({ name: "down" });
+    await client.flush();
+
+    expect(requests).toHaveLength(3);
+    expect(onError).toHaveBeenCalledOnce();
+    expect(onError.mock.calls[0]?.[1]).toHaveLength(1);
+  });
+
+  it("waits for the server's Retry-After before retrying a 429", async () => {
+    vi.useFakeTimers();
+    const rateLimited = new Response("rate limited", { status: 429, headers: { "Retry-After": "2" } });
+    const { fetchImpl, requests } = scriptedFetch([rateLimited]);
+    const client = init({ apiKey: "k", host: "http://localhost:8788", fetchImpl, retryDelayMs: 1 });
+    clients.push(client);
+
+    client.trace({ name: "throttled" });
+    const flushed = client.flush();
+
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(requests).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await flushed;
+    expect(requests).toHaveLength(2);
+  });
+
+  it("keeps batches in order while an earlier batch is retried", async () => {
+    const { fetchImpl, requests } = scriptedFetch([503]);
+    const client = init({
+      apiKey: "k",
+      host: "http://localhost:8788",
+      fetchImpl,
+      maxBatchSize: 1,
+      retryDelayMs: 5
+    });
+    clients.push(client);
+
+    client.trace({ name: "first" });
+    client.trace({ name: "second" });
+    await client.flush();
+    await client.shutdown();
+
+    expect(requests.map(traceNames)).toEqual([["first"], ["first"], ["second"]]);
+  });
+
+  it("drops events beyond maxQueuedEvents, counting batches still in flight, and reports them on the next flush", async () => {
+    let releaseSend!: () => void;
+    const sendGate = new Promise<void>((resolve) => {
+      releaseSend = resolve;
+    });
+    const requests: { events: IngestRequestEvent[] }[] = [];
+    const gatedFetch: typeof fetch = vi.fn(async (_input, init) => {
+      requests.push(JSON.parse(String(init?.body)));
+      await sendGate;
+      return new Response("{}", { status: 202 });
+    }) as unknown as typeof fetch;
+    const onError = vi.fn();
+    const client = init({
+      apiKey: "k",
+      host: "http://localhost:8788",
+      fetchImpl: gatedFetch,
+      onError,
+      maxBatchSize: 1,
+      maxQueuedEvents: 1,
+      flushIntervalMs: 60_000
+    });
+    clients.push(client);
+
+    client.trace({ name: "in-flight" });
+    await Promise.resolve();
+    client.trace({ name: "over-capacity" });
+
+    releaseSend();
+    await client.flush();
+
+    expect(requests.map(traceNames)).toEqual([["in-flight"]]);
+    expect(onError).toHaveBeenCalledOnce();
+    expect(String(onError.mock.calls[0]?.[0])).toMatch(/queue is full/);
+    expect(onError.mock.calls[0]?.[1].map((event: IngestRequestEvent) => (event.body as { name?: string }).name)).toEqual([
+      "over-capacity"
+    ]);
+  });
+
+  it("flush() returns after flushTimeoutMs while undelivered events keep retrying in the background", async () => {
+    const { fetchImpl, requests } = scriptedFetch([503]);
+    const onError = vi.fn();
+    const client = init({
+      apiKey: "k",
+      host: "http://localhost:8788",
+      fetchImpl,
+      onError,
+      retryDelayMs: 200,
+      flushTimeoutMs: 20
+    });
+    clients.push(client);
+
+    client.trace({ name: "slow-delivery" });
+    const started = Date.now();
+    await client.flush();
+    expect(Date.now() - started).toBeLessThan(150);
+    expect(requests).toHaveLength(1);
+
+    await client.shutdown();
+    expect(requests).toHaveLength(2);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("keeps sending after an onError handler throws", async () => {
+    const { fetchImpl, requests } = scriptedFetch([400]);
+    const client = init({
+      apiKey: "k",
+      host: "http://localhost:8788",
+      fetchImpl,
+      onError: () => {
+        throw new Error("handler bug");
+      }
+    });
+    clients.push(client);
+
+    client.trace({ name: "rejected" });
+    await client.flush();
+    client.trace({ name: "after-handler-threw" });
+    await client.flush();
+
+    expect(requests.map(traceNames)).toEqual([["rejected"], ["after-handler-threw"]]);
+  });
+
+  it("keeps sending after an async onError handler rejects", async () => {
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    try {
+      const { fetchImpl, requests } = scriptedFetch([400]);
+      const client = init({
+        apiKey: "k",
+        host: "http://localhost:8788",
+        fetchImpl,
+        onError: async () => {
+          throw new Error("async handler bug");
+        }
+      });
+      clients.push(client);
+
+      client.trace({ name: "rejected" });
+      await client.flush();
+      client.trace({ name: "after-handler-rejected" });
+      await client.flush();
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(requests.map(traceNames)).toEqual([["rejected"], ["after-handler-rejected"]]);
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off("unhandledRejection", unhandled);
+    }
+  });
+
+  it("flush() waits for a batch an automatic flush already sent", async () => {
+    let deliver!: () => void;
+    const delivered = new Promise<void>((resolve) => (deliver = resolve));
+    let settled = false;
+    const fetchImpl: typeof fetch = vi.fn(async () => {
+      await delivered;
+      settled = true;
+      return new Response("{}", { status: 202 });
+    }) as unknown as typeof fetch;
+    const client = init({ apiKey: "k", host: "http://localhost:8788", fetchImpl, maxBatchSize: 1 });
+    clients.push(client);
+
+    client.trace({ name: "sent-by-size" });
+    const flushed = client.flush();
+    setTimeout(deliver, 20);
+    await flushed;
+    expect(settled).toBe(true);
+  });
+
+  it("uses safe values for a batch size or flush interval out of range", async () => {
+    vi.useFakeTimers();
+    const { fetchImpl, requests } = scriptedFetch([]);
+    const client = init({
+      apiKey: "k",
+      host: "http://localhost:8788",
+      fetchImpl,
+      maxBatchSize: 10_000,
+      flushIntervalMs: 0
+    });
+    clients.push(client);
+
+    for (let index = 0; index < 501; index += 1) client.trace({ name: `trace_${index}` });
+    // 0 falls back to the default interval instead of flushing every millisecond.
+    await vi.advanceTimersByTimeAsync(100);
+    // The batch size is capped at the API's 500 events per request.
+    expect(requests.map((request) => request.events.length)).toEqual([500]);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(requests.map((request) => request.events.length)).toEqual([500, 1]);
+  });
+
+  it("treats non-finite option values safely instead of retrying forever or aborting at once", async () => {
+    const { fetchImpl, requests } = scriptedFetch([500, 500, 500, 500, 500, 500, 500, 500]);
+    const onError = vi.fn();
+    const client = init({
+      apiKey: "k",
+      host: "http://localhost:8788",
+      fetchImpl,
+      onError,
+      maxRetries: Number.NaN,
+      retryDelayMs: 1,
+      shutdownTimeoutMs: Infinity
+    });
+
+    client.trace({ name: "nan-retries" });
+    await client.shutdown();
+
+    // NaN falls back to the default of 5 retries; Infinity waits them all out.
+    expect(requests).toHaveLength(6);
+    expect(onError).toHaveBeenCalledOnce();
+    expect(String(onError.mock.calls[0]?.[0])).toMatch(/HTTP 500/);
+  });
+
+  it("clamps a shutdownTimeoutMs beyond the timer range instead of cancelling at once", async () => {
+    let releaseSend!: () => void;
+    const sendGate = new Promise<void>((resolve) => {
+      releaseSend = resolve;
+    });
+    const requests: unknown[] = [];
+    // Honors the abort signal like real fetch, so an early cancellation shows up.
+    const gatedFetch: typeof fetch = vi.fn(
+      (_input, init) =>
+        new Promise<Response>((resolve, reject) => {
+          requests.push(init?.body);
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+          void sendGate.then(() => resolve(new Response("{}", { status: 202 })));
+        })
+    ) as unknown as typeof fetch;
+    const onError = vi.fn();
+    const client = init({
+      apiKey: "k",
+      host: "http://localhost:8788",
+      fetchImpl: gatedFetch,
+      onError,
+      maxRetries: 0,
+      shutdownTimeoutMs: 2 ** 40
+    });
+
+    client.trace({ name: "long-shutdown" });
+    const shutdown = client.shutdown();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    releaseSend();
+    await shutdown;
+
+    expect(requests).toHaveLength(1);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("shutdown() stops retrying after shutdownTimeoutMs and reports the unsent batch", async () => {
+    const { fetchImpl } = scriptedFetch([503, 503, 503, 503, 503, 503]);
+    const onError = vi.fn();
+    const client = init({
+      apiKey: "k",
+      host: "http://localhost:8788",
+      fetchImpl,
+      onError,
+      retryDelayMs: 60_000,
+      shutdownTimeoutMs: 50
+    });
+
+    client.trace({ name: "outage-at-shutdown" });
+    const started = Date.now();
+    await client.shutdown();
+
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(onError).toHaveBeenCalledOnce();
+    expect(onError.mock.calls[0]?.[1]).toHaveLength(1);
   });
 });

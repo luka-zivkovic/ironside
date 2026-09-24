@@ -393,3 +393,69 @@ describe("mapLangfuseIngestionRequest", () => {
     expect(rows.traces[0]).toMatchObject({ name: "checkout", userId: "u1", output: { total: 42 } });
   });
 });
+
+describe("mapLangfuseIngestionRequest — fields each row actually received", () => {
+  it("reports only the fields an update-only request sent, so the worker can fill the rest from the stored row", () => {
+    const { rows } = mapLangfuseIngestionRequest(
+      "proj_x",
+      request([
+        batchEvent({
+          type: "generation-update",
+          body: {
+            id: "obs_1",
+            traceId: "trace_1",
+            endTime: "2026-07-12T00:00:03.000Z",
+            output: { text: "hello" },
+            usage: { promptTokens: 5, completionTokens: 2 }
+          }
+        })
+      ])
+    );
+    const provided = rows.providedFields.observations.get("obs_1");
+    expect(provided).toBeDefined();
+    expect([...(provided ?? [])].sort()).toEqual(
+      ["endTime", "id", "output", "projectId", "traceId", "type", "usageDetails"].sort()
+    );
+  });
+
+  it("does not count a defaulted trace timestamp, tags, or metadata as sent", () => {
+    const { rows } = mapLangfuseIngestionRequest(
+      "proj_x",
+      request([batchEvent({ body: { id: "trace_1", output: { answer: 42 } } })])
+    );
+    const provided = rows.providedFields.traces.get("trace_1");
+    expect(provided?.has("output")).toBe(true);
+    expect(provided?.has("timestamp")).toBe(false);
+    expect(provided?.has("tags")).toBe(false);
+    expect(provided?.has("metadata")).toBe(false);
+  });
+
+  it("does not let a later event's explicit null erase a value an earlier event in the same request sent — the SDK sends null for fields an update is not setting", () => {
+    const { rows } = mapLangfuseIngestionRequest(
+      "proj_x",
+      request([
+        batchEvent({
+          id: "evt_create",
+          type: "generation-create",
+          body: { id: "obs_1", traceId: "trace_1", name: "llm-call", input: "question" }
+        }),
+        batchEvent({
+          id: "evt_update",
+          type: "generation-update",
+          body: { id: "obs_1", traceId: "trace_1", name: null, input: null, output: "answer" }
+        })
+      ])
+    );
+    expect(rows.observations[0]).toMatchObject({ name: "llm-call", input: "question", output: "answer" });
+  });
+
+  it("does not claim a type for the untyped observation-* alias, which only guesses span", () => {
+    const { rows } = mapLangfuseIngestionRequest(
+      "proj_x",
+      request([
+        batchEvent({ type: "observation-update", body: { id: "obs_1", traceId: "trace_1", output: "x" } })
+      ])
+    );
+    expect(rows.providedFields.observations.get("obs_1")?.has("type")).toBe(false);
+  });
+});

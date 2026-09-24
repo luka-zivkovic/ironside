@@ -8,10 +8,25 @@ import { fileURLToPath } from "node:url";
 // by the build script (they are data, not TS, so tsc won't emit them).
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+export interface MigrationOptions {
+  /** Directory of NNNN_name.sql files. Defaults to the migrations shipped with this release; tests override it to simulate an older install. */
+  migrationsDir?: string;
+}
+
 /**
- * Applies the current clean-install ClickHouse baseline.
+ * Applies pending ClickHouse migrations in file order. Migrations are
+ * append-only: a released file is never edited (docs/schema-migrations.md).
+ *
+ * ClickHouse DDL is not transactional and api and worker both run this on
+ * boot, so every statement must be safe to run twice: a crash can leave a
+ * migration partly applied with no ledger row, and concurrent starts can
+ * apply the same one at once. `create`/`add` use `if not exists` and `drop`
+ * uses `if exists`; test/migration-files.test.ts enforces it.
  */
-export async function runMigrations(client: ClickHouseClient): Promise<void> {
+export async function runMigrations(
+  client: ClickHouseClient,
+  options: MigrationOptions = {}
+): Promise<void> {
   await client.command({
     query: `
       create table if not exists ironside_migrations
@@ -25,8 +40,7 @@ export async function runMigrations(client: ClickHouseClient): Promise<void> {
     `
   });
 
-  // Fail explicitly if a disposable test database does not match the current
-  // clean-install ledger shape.
+  // Databases created before the 0.3.0 baseline used a different ledger.
   const ledgerColumnsResult = await client.query({
     query: `
       select name
@@ -42,11 +56,12 @@ export async function runMigrations(client: ClickHouseClient): Promise<void> {
   const expectedLedgerColumns = ["id", "checksum", "applied_at"];
   if (expectedLedgerColumns.some((column) => !ledgerColumns.has(column))) {
     throw new Error(
-      "ClickHouse migration ledger is incompatible with this clean-install release; recreate the disposable database"
+      "ClickHouse migration ledger predates the 0.3.0 baseline and cannot be upgraded; " +
+      "install 0.3.0 or later into a new database (docs/schema-migrations.md)"
     );
   }
 
-  const migrationsDir = join(__dirname, "..", "migrations");
+  const migrationsDir = options.migrationsDir ?? join(__dirname, "..", "migrations");
   const files = (await readdir(migrationsDir))
     .filter((file) => file.endsWith(".sql"))
     .sort();
@@ -60,8 +75,9 @@ export async function runMigrations(client: ClickHouseClient): Promise<void> {
     .filter((id) => !migrationIds.has(id));
   if (obsolete.length > 0) {
     throw new Error(
-      `ClickHouse migration history is newer than or incompatible with this release ` +
-      `(${obsolete.join(", ")}); recreate the disposable database`
+      `ClickHouse schema was migrated by a newer Ironside release (${obsolete.join(", ")}); ` +
+      "run that release or a later one. Returning to an older release means restoring " +
+      "the backup taken before the upgrade (docs/schema-migrations.md)"
     );
   }
 
@@ -78,8 +94,9 @@ export async function runMigrations(client: ClickHouseClient): Promise<void> {
     if (rows.length > 0) {
       if (rows.some((row) => row.checksum !== checksum)) {
         throw new Error(
-          `applied ClickHouse migration ${id} checksum does not match this release; ` +
-          "recreate the disposable database"
+          `ClickHouse migration ${id} differs from the version this database applied. ` +
+          "Released migrations are never edited, so this database was created by an " +
+          "unreleased build (docs/schema-migrations.md)"
         );
       }
       continue;

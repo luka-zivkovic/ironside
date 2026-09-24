@@ -13,10 +13,15 @@ export interface IronsideClientOptions {
   apiKey: string;
   /** Ironside API host, e.g. "https://ironside.example.com" or "http://localhost:8788". */
   host: string;
-  maxBatchSize?: number;
-  flushIntervalMs?: number;
+  maxBatchSize?: BatcherOptions["maxBatchSize"];
+  flushIntervalMs?: BatcherOptions["flushIntervalMs"];
   fetchImpl?: BatcherOptions["fetchImpl"];
   onError?: BatcherOptions["onError"];
+  maxRetries?: BatcherOptions["maxRetries"];
+  retryDelayMs?: BatcherOptions["retryDelayMs"];
+  maxQueuedEvents?: BatcherOptions["maxQueuedEvents"];
+  flushTimeoutMs?: BatcherOptions["flushTimeoutMs"];
+  shutdownTimeoutMs?: BatcherOptions["shutdownTimeoutMs"];
 }
 
 export interface ObservationHandle {
@@ -67,9 +72,9 @@ export interface IronsideClient {
    * network (the ref doesn't exist until the server has the bytes).
    */
   uploadMedia(options: UploadMediaOptions): Promise<UploadedMedia>;
-  /** Sends buffered events immediately instead of waiting for the next automatic flush. */
+  /** Sends buffered events now and waits at most `flushTimeoutMs` for delivery; undelivered events keep retrying in the background. */
   flush(): Promise<void>;
-  /** Stops background flushing and sends any remaining buffered events. Call before process exit. */
+  /** Stops background flushing and sends any remaining buffered events, waiting at most `shutdownTimeoutMs` for sends and retries. Call before process exit. */
   shutdown(): Promise<void>;
 }
 
@@ -89,7 +94,12 @@ export function init(options: IronsideClientOptions): IronsideClient {
     ...(options.maxBatchSize !== undefined && { maxBatchSize: options.maxBatchSize }),
     ...(options.flushIntervalMs !== undefined && { flushIntervalMs: options.flushIntervalMs }),
     ...(options.fetchImpl !== undefined && { fetchImpl: options.fetchImpl }),
-    ...(options.onError !== undefined && { onError: options.onError })
+    ...(options.onError !== undefined && { onError: options.onError }),
+    ...(options.maxRetries !== undefined && { maxRetries: options.maxRetries }),
+    ...(options.retryDelayMs !== undefined && { retryDelayMs: options.retryDelayMs }),
+    ...(options.maxQueuedEvents !== undefined && { maxQueuedEvents: options.maxQueuedEvents }),
+    ...(options.flushTimeoutMs !== undefined && { flushTimeoutMs: options.flushTimeoutMs }),
+    ...(options.shutdownTimeoutMs !== undefined && { shutdownTimeoutMs: options.shutdownTimeoutMs })
   });
 
   function enqueueScore(

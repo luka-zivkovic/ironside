@@ -3,6 +3,8 @@ import {
   getRawObjectRefSnapshot,
   getTraceRawRetentionExpiredMap,
   insertRawEventRefs,
+  insertTraces,
+  markProjectDataDeletedOlderThan,
   runMigrations as runClickHouseMigrations
 } from "@ironside/clickhouse";
 import {
@@ -21,6 +23,12 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.js";
 import { prepareRawRetentionIntents } from "../src/retention/raw-retention-intent-preparer.js";
 import { executeRawRetentionIntents } from "../src/retention/raw-retention-intent-executor.js";
+import {
+  createRawRetentionSweepState,
+  runRawRetentionSweep,
+  type RawRetentionSweepResult,
+  type RawRetentionSweepState
+} from "../src/retention/raw-retention-sweep.js";
 
 const config = loadConfig();
 const pool = new Pool({ connectionString: config.databaseUrl });
@@ -279,7 +287,12 @@ describe("raw retention intent preparation (live stores)", () => {
       query_params: { projectId, objectKey: retryObjectKey },
       format: "JSONEachRow"
     });
-    expect(await physicalRefs.json()).toEqual([{ count: "2" }]);
+    // The original ref plus its tombstone: a retry must never add rows. A
+    // background merge may already have collapsed the two into one, so an
+    // exact count of 2 is timing-dependent.
+    const [physical] = await physicalRefs.json<{ count: string }>();
+    expect(Number(physical?.count)).toBeGreaterThanOrEqual(1);
+    expect(Number(physical?.count)).toBeLessThanOrEqual(2);
   });
 
   it("completes a proven post-delete crash despite a later policy change", async () => {
@@ -450,5 +463,193 @@ describe("raw retention intent preparation (live stores)", () => {
       state: "executing",
       lastError: "no_authoritative_trace_refs"
     });
+  });
+});
+
+const SWEEP_ORG_NAME = "raw-retention-sweep-test-org";
+const DAY_MS = 24 * 60 * 60 * 1000;
+let sweepOrgId: string;
+const createdKeys: string[] = [];
+
+/** A project keeping one day of data. */
+async function newProject(): Promise<string> {
+  const projectId = `proj_${ulid()}`;
+  await pool.query(
+    "insert into projects (id, organization_id, name, retention_days) values ($1, $2, $3, 1)",
+    [projectId, sweepOrgId, "raw-retention-sweep-test"]
+  );
+  return projectId;
+}
+
+/** A raw batch received `daysAgo` days ago, referenced by `traceIds`, as the ingest worker leaves it. */
+async function rawBatch(projectId: string, traceIds: string | string[], daysAgo: number): Promise<string> {
+  const referenced = typeof traceIds === "string" ? [traceIds] : traceIds;
+  const receivedAt = new Date(Date.now() - daysAgo * DAY_MS);
+  const batchId = ulid();
+  const key = rawObjectKey(projectId, receivedAt, batchId);
+  await storage.putJson(key, {
+    batchId,
+    projectId,
+    receivedAt: receivedAt.toISOString(),
+    events: [
+      {
+        id: `evt_${ulid()}`,
+        type: "trace-upsert",
+        source: "native",
+        schemaVersion: 1,
+        idempotencyKey: batchId,
+        body: { id: referenced[0], timestamp: receivedAt.toISOString() }
+      }
+    ]
+  });
+  await insertRawEventRefs(
+    clickhouse,
+    referenced.map((traceId) => ({ projectId, traceId, objectKey: key, receivedAt: receivedAt.toISOString() })),
+    receivedAt.toISOString()
+  );
+  createdKeys.push(key);
+  return key;
+}
+
+/** Retries while another test file holds the executor's cross-replica lock. */
+async function sweep(
+  projectId: string | string[],
+  state: RawRetentionSweepState = createRawRetentionSweepState(),
+  maxObjectsPerProject?: number
+): Promise<RawRetentionSweepResult> {
+  for (let attempt = 0; ; attempt += 1) {
+    const result = await runRawRetentionSweep(
+      {
+        pool,
+        clickhouse,
+        storage,
+        queue,
+        defaultRetentionDays: 90,
+        projectIds: typeof projectId === "string" ? [projectId] : projectId,
+        ...(maxObjectsPerProject !== undefined && { maxObjectsPerProject })
+      },
+      state
+    );
+    if (!result.lockBusy || attempt >= 20) return result;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+// These tests live in this file, not their own, because the executor takes a
+// cross-replica try-lock: vitest runs files in parallel, and a sweep in another
+// file would make this file's executor calls report lockAcquired: false.
+describe("runRawRetentionSweep (live stores)", () => {
+  beforeAll(async () => {
+    sweepOrgId = `org_${ulid()}`;
+    await pool.query("insert into organizations (id, name) values ($1, $2)", [sweepOrgId, SWEEP_ORG_NAME]);
+  });
+
+  afterAll(async () => {
+    for (const key of createdKeys) await storage.delete(key).catch(() => undefined);
+    await pool.query(
+      "delete from raw_retention_intents where project_id in (select id from projects where organization_id = $1)",
+      [sweepOrgId]
+    );
+    await pool.query("delete from organizations where id = $1", [sweepOrgId]);
+  });
+
+  it("deletes a raw object past its project's retention once no trace still shows it", async () => {
+    const projectId = await newProject();
+    const expired = await rawBatch(projectId, `trace_${ulid()}`, 10);
+    const recent = await rawBatch(projectId, `trace_${ulid()}`, 0);
+    // A non-canonical object in an expired day, like the executor's own probes.
+    const probe = `raw/${projectId}/${new Date(Date.now() - 10 * DAY_MS).toISOString().slice(0, 10).replaceAll("-", "/")}/.retention-probes/stray`;
+    await storage.putJson(probe, {});
+    createdKeys.push(probe);
+
+    const result = await sweep(projectId);
+
+    expect(result).toMatchObject({ examined: 1, prepared: 1, deleted: 1, blocked: 0 });
+    expect(await storage.exists(expired)).toBe(false);
+    expect(await getRawRetentionIntent(pool, projectId, expired)).toMatchObject({ state: "complete" });
+    expect(await storage.exists(recent)).toBe(true);
+    expect(await storage.exists(probe)).toBe(true);
+  });
+
+  it("keeps a raw object while its trace is still visible, then deletes it on a later cycle once the trace is gone", async () => {
+    const projectId = await newProject();
+    const traceId = `trace_${ulid()}`;
+    const key = await rawBatch(projectId, traceId, 10);
+    // The trace's own timestamp is recent, so ClickHouse retention keeps it.
+    await insertTraces(
+      clickhouse,
+      [{ id: traceId, projectId, timestamp: new Date().toISOString(), tags: [], metadata: {} }],
+      { eventTs: new Date().toISOString() }
+    );
+    const state = createRawRetentionSweepState();
+
+    const kept = await sweep(projectId, state);
+    expect(kept).toMatchObject({ examined: 1, deleted: 0, skipped: 1 });
+    expect(await storage.exists(key)).toBe(true);
+
+    await markProjectDataDeletedOlderThan(clickhouse, "traces", projectId, new Date(Date.now() + DAY_MS));
+    const deleted = await sweep(projectId, state);
+    expect(deleted).toMatchObject({ deleted: 1 });
+    expect(await storage.exists(key)).toBe(false);
+  });
+
+  it("continues where the previous sweep stopped when its per-project budget runs out", async () => {
+    const projectId = await newProject();
+    const first = await rawBatch(projectId, `trace_${ulid()}`, 12);
+    const second = await rawBatch(projectId, `trace_${ulid()}`, 11);
+    const state = createRawRetentionSweepState();
+
+    expect(await sweep(projectId, state, 1)).toMatchObject({ examined: 1, deleted: 1 });
+    expect(await storage.exists(first)).toBe(false);
+    expect(await storage.exists(second)).toBe(true);
+
+    expect(await sweep(projectId, state, 1)).toMatchObject({ examined: 1, deleted: 1 });
+    expect(await storage.exists(second)).toBe(false);
+  });
+
+  it("splits a page the preparer and executor reject as a whole, and deletes each object on its own", async () => {
+    const projectId = await newProject();
+    const traceIds = (count: number) => Array.from({ length: count }, () => `trace_${ulid()}`);
+    // 12,000 references together exceed the 10,000 aggregate cap of both calls.
+    const first = await rawBatch(projectId, traceIds(6_000), 12);
+    const second = await rawBatch(projectId, traceIds(6_000), 11);
+
+    const result = await sweep(projectId);
+
+    expect(result).toMatchObject({ deleted: 2, errorCount: 0 });
+    expect(await storage.exists(first)).toBe(false);
+    expect(await storage.exists(second)).toBe(false);
+  }, 60_000);
+
+  it("records a project whose objects all fail, keeps its position, and still sweeps the next project", async () => {
+    const failing = await newProject();
+    const healthy = await newProject();
+    // A single object past the cap fails even on its own.
+    const oversized = await rawBatch(
+      failing,
+      Array.from({ length: 10_001 }, () => `trace_${ulid()}`),
+      10
+    );
+    const expired = await rawBatch(healthy, `trace_${ulid()}`, 10);
+    const state = createRawRetentionSweepState();
+
+    const result = await sweep([failing, healthy], state);
+
+    expect(result.deleted).toBe(1);
+    expect(result.errors).toEqual([{ projectId: failing, message: expect.stringMatching(/budget|cap/) }]);
+    expect(await storage.exists(oversized)).toBe(true);
+    expect(await storage.exists(expired)).toBe(false);
+    expect(state.cursors.has(failing)).toBe(false);
+  }, 60_000);
+
+  it("starts each sweep with the next project, so a shared deadline cannot always favor the same one", async () => {
+    const first = await newProject();
+    const second = await newProject();
+    const state = createRawRetentionSweepState();
+
+    await sweep([first, second], state);
+    expect(state.projectOffset).toBe(1);
+    await sweep([first, second], state);
+    expect(state.projectOffset).toBe(0);
   });
 });

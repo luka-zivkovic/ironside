@@ -90,17 +90,15 @@ export function startScheduler(options: SchedulerOptions): Scheduler {
     for (const config of due) {
       try {
         const secret = decryptSecret(config.destinationSecretAccessKeyEncrypted);
-        // runExport already records its own outcome on every path it
-        // reaches (empty-result success with rowCount 0, non-empty
-        // success, and upload failure) — see export-runner.ts. A second
+        // runExport records its own outcome, including its feed position,
+        // on success and on failure — see export-runner.ts. A second
         // recordExportRun call here on success would not just be
         // redundant, it would actively corrupt the empty-result case:
         // runExport writes rowCount 0, then this call's
         // `outcome.rowCount ?? null` would overwrite it back to null.
-        // Only a failure that happens BEFORE runExport reaches any of
-        // its own recordExportRun calls (e.g. decryptSecret throwing, or
-        // exportTraces itself throwing) has no bookkeeping yet — that's
-        // the only case this catch block needs to cover.
+        // Only a failure before runExport starts (decryptSecret throwing)
+        // has no bookkeeping yet; recording a runExport failure again
+        // below is harmless because error outcomes never move the position.
         await runExport({
           pool: options.pool,
           clickhouse: options.clickhouse,
@@ -124,7 +122,8 @@ export function startScheduler(options: SchedulerOptions): Scheduler {
     const due = await claimDueOtlpForwardRules(options.pool, claimBatchSize);
     for (const rule of due) {
       try {
-        await forwardOtlpTraces({
+        const result = await forwardOtlpTraces({
+          pool: options.pool,
           clickhouse: options.clickhouse,
           rule,
           traceQuietPeriodSeconds: await traceQuietPeriodSeconds(rule.projectId),
@@ -132,7 +131,19 @@ export function startScheduler(options: SchedulerOptions): Scheduler {
             destinationAuthHeader: decryptSecret(rule.destinationAuthHeaderEncrypted)
           })
         });
-        onRunOutcome("otlp-forward", "success");
+        if (result.failed.length > 0) {
+          // The rule's last_run_error has the detail; surface it in logs and metrics too.
+          onError(
+            "otlp-forward",
+            new Error(
+              `rule ${rule.id}: destination did not accept ${result.failed.length} trace(s): ` +
+                result.failed.map((failure) => `${failure.traceId}: ${failure.error}`).join("; ")
+            )
+          );
+          onRunOutcome("otlp-forward", "error");
+        } else {
+          onRunOutcome("otlp-forward", "success");
+        }
       } catch (error) {
         onError("otlp-forward", error);
         onRunOutcome("otlp-forward", "error");

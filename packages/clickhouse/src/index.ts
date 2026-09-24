@@ -1,9 +1,11 @@
 export { createClickHouseClient, type ClickHouseConfig } from "./client.js";
-export { runMigrations } from "./migrate.js";
+export { runMigrations, type MigrationOptions } from "./migrate.js";
 export {
   insertTraces,
   insertObservations,
   insertScores,
+  deleteMovedTraceRows,
+  deleteMovedObservationRows,
   tombstoneImportedTraceSnapshot,
   tombstoneImportedScores,
   tombstoneExpiredImportedTraceSnapshot,
@@ -45,6 +47,10 @@ export {
   listExistingTraceIds,
   getTraceRawAnchor,
   listObservationsForTrace,
+  listTracesByIds,
+  listObservationsByIds,
+  listObservationsForTraces,
+  listScoresForTraces,
   listScoresForTrace,
   getAggregates,
   exportTraces,
@@ -55,6 +61,8 @@ export {
   type SettledTraceVersionRow,
   type SettledTraceVersionCursor,
   type TraceDetailRow,
+  type StoredTraceRow,
+  type StoredObservationRow,
   type VersionedTraceDetailRow,
   type VersionedTraceSummaryRow,
   type TraceRawAnchorRow,

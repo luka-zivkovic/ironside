@@ -11,8 +11,9 @@
   ClickHouse baselines changed, so it needs a clean instance; do not update a
   `v0.2.0` Service in place. The earlier `v0.1.0` predates the verified
   multi-architecture/public-image contract; do not use it.
-- **CURRENT:** founder-only deployments are disposable test instances. This
-  pre-launch release supports clean Postgres and ClickHouse installs only.
+- **CURRENT:** Services created with 0.3.0 or later upgrade in place; schema
+  changes ship as append-only migrations
+  ([database schema migrations](schema-migrations.md)).
 - **ASSUMPTION:** the default stack is single-server, the nginx web component
   is the only public ingress, and Coolify terminates TLS.
 
@@ -63,30 +64,28 @@ anonymous pulls of every exact tag before announcing the release. Every release
 note must list:
 
 - required Compose and environment changes;
-- whether the current Postgres or ClickHouse baseline changed;
+- new Postgres or ClickHouse migrations;
 - object-storage or queue compatibility changes;
 - backup prerequisites; and
-- whether the update is image-only or requires a clean test instance.
+- any step beyond changing `IRONSIDE_VERSION`.
 
 Infrastructure images are pinned independently in the template. Upgrade them
 only through a documented compatibility drill. In particular, changing a
 Postgres major version is a dump/restore or `pg_upgrade` project, not an image
 tag edit.
 
-## Update a test instance
+## Update an instance
 
-An image-only update is supported only when the release notes say both
-baselines are unchanged. Change the single `IRONSIDE_VERSION` so API, worker,
-and web move together, then verify health and the primary ingest/read paths.
-When either baseline changes, create a new clean Coolify Service and preserve
-the old disposable Service only as long as its test data is useful.
+Take Postgres, ClickHouse, and MinIO backups first. Then change the single
+`IRONSIDE_VERSION` so API, worker, and web move together; pending migrations
+apply when they start. Verify health and the primary ingest/read paths.
 
 Do not use **Pull Latest Images & Restart** for Ironside. Exact semantic-version
 tags are immutable, so a normal redeploy is enough. Pulling a mutable tag can
 silently combine a new app, a schema migration, and changed dependencies.
 
-There is no supported in-place schema upgrade or downgrade during the current
-founder-only testing period.
+Downgrades are not supported: an older release refuses to start on a schema a
+newer release migrated. To go back, restore the pre-update backups.
 
 ## Backup coverage
 

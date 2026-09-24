@@ -69,7 +69,8 @@ MinIO, and the API, worker, and web services.
 | API | `http://localhost:8788` | Native ingestion, OTLP, integrations, and health. |
 
 These are localhost development defaults. Compose also maps infrastructure
-ports and uses development credentials. Review
+ports and uses development credentials, so every port is published on
+`127.0.0.1` only. Review
 [production considerations](self-hosting.md#production-considerations) before
 exposing an installation on a network.
 
@@ -170,7 +171,7 @@ it does not expose Ironside's entire API or manage Ironside through MCP.
 | Rejected setup code | Generate a fresh code from this installation; it is single-use and expires. |
 | Unauthorized ingestion | Use the project's current Ingest credential, not an Integration credential. |
 | Missing trace | Check the caller's network address, flush the exporter, and inspect API/worker logs. |
-| Incompatible database baseline | Consult the [schema policy](pre-production-schema.md); do not automatically delete volumes. |
+| Migration refused (newer release or edited migration) | Consult [database schema migrations](schema-migrations.md); do not automatically delete volumes. |
 
 See [self-hosting](self-hosting.md) for recovery, credential rotation, backups,
 and persistent deployment options.
