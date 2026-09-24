@@ -4,6 +4,7 @@ import { createClickHouseClient, runMigrations as runChMigrations } from "@irons
 import {
   claimWebhookDelivery,
   createWebhookRule,
+  getWebhookDeliveryStatus,
   getWebhookRule,
   markWebhookDelivered,
   runMigrations as runPgMigrations,
@@ -157,15 +158,19 @@ describe("runWebhooks", () => {
     expect(stored.feedCursor).not.toBeNull();
   });
 
-  it("delivers each settled version once: a later run starts after it, and a run from a stale position skips it", async () => {
+  it("delivers each settled version once: a later run starts after it, and a run from a stale position skips it without moving the position", async () => {
     const projectId = await newProject();
-    await publish(trace(projectId));
+    const first = trace(projectId);
+    await publish(first);
     const hook = await rule(projectId);
 
     expect((await run(hook)).delivered).toBe(1);
     expect(await run(hook)).toEqual({ matched: 0, delivered: 0, skipped: 0, failed: [] });
+    const position = (await getWebhookRule(pool, projectId, hook.id))!.feedCursor;
 
     // A run claimed twice by different replicas starts from the old position.
+    const second = trace(projectId);
+    await publish(second);
     const stale = await runWebhooks({
       pool,
       clickhouse,
@@ -174,8 +179,13 @@ describe("runWebhooks", () => {
       traceQuietPeriodSeconds: 0,
       allowPrivateDestinations: true
     });
-    expect(stale).toEqual({ matched: 1, delivered: 0, skipped: 1, failed: [] });
-    expect(receivedRequests).toHaveLength(1);
+    expect(stale).toEqual({ matched: 2, delivered: 1, skipped: 1, failed: [] });
+    expect(payloads().map((payload) => payload.traceId)).toEqual([first.id, second.id]);
+    expect((await getWebhookRule(pool, projectId, hook.id))!.feedCursor).toEqual(position);
+
+    // The current position then skips what the stale run sent.
+    expect(await run(hook)).toEqual({ matched: 1, delivered: 0, skipped: 1, failed: [] });
+    expect(receivedRequests).toHaveLength(2);
   });
 
   it("delivers again when the trace is published again, even by a late batch that does not move its activity time", async () => {
@@ -227,37 +237,110 @@ describe("runWebhooks", () => {
     expect(payloads().map((payload) => payload.traceId)).toEqual([first.id, second.id]);
   });
 
-  it("stops without sending at a version another run is still delivering", async () => {
+  it("stops without sending at a version another run is still delivering, and says so on the rule", async () => {
     const projectId = await newProject();
     const inFlight = trace(projectId);
     await publish(inFlight);
     const hook = await rule(projectId);
     await claimWebhookDelivery(pool, `d_${ulid()}`, hook.id, inFlight.id, await feedVersion(projectId, inFlight.id));
 
-    expect(await run(hook)).toEqual({ matched: 1, delivered: 0, skipped: 0, failed: [] });
+    expect(await run(hook)).toEqual({ matched: 1, delivered: 0, skipped: 0, failed: [], waitingFor: inFlight.id });
     expect(receivedRequests).toHaveLength(0);
-    expect((await getWebhookRule(pool, projectId, hook.id))!.feedCursor).toBeNull();
+    expect((await getWebhookRule(pool, projectId, hook.id))!).toMatchObject({
+      feedCursor: null,
+      lastRunStatus: "success",
+      lastRunError: `stopped at ${inFlight.id}: another run is still delivering it`
+    });
   });
 
-  it("does not resend what the pre-feed scanner delivered under the trace's activity time", async () => {
-    const projectId = await newProject();
-    const alreadySent = trace(projectId);
-    const neverSent = trace(projectId);
-    const sentActivity = await publish(alreadySent);
-    await publish(neverSent);
-    const hook = await rule(projectId);
-    // What migration 0006 leaves for a rule the scanner was serving.
-    await pool.query("update webhook_rules set legacy_delivery_cutoff = clock_timestamp() where id = $1", [hook.id]);
-    const legacyId = (await claimWebhookDelivery(pool, `d_${ulid()}`, hook.id, alreadySent.id, sentActivity))!;
-    await markWebhookDelivered(pool, legacyId);
+  describe("handing off from a previous-release worker, which keys deliveries by activity time", () => {
+    /** What a worker from before migration 0006 records for a trace it sends. */
+    async function scannerDelivery(hook: WebhookRule, traceId: string, activity: string, finished = true) {
+      const id = (await claimWebhookDelivery(pool, `d_${ulid()}`, hook.id, traceId, activity))!;
+      if (finished) await markWebhookDelivered(pool, id);
+    }
 
-    expect(await run(hook)).toEqual({ matched: 2, delivered: 1, skipped: 1, failed: [] });
-    expect(payloads().map((payload) => payload.traceId)).toEqual([neverSent.id]);
+    async function moveHandoff(hook: WebhookRule, sql: string) {
+      await pool.query(`update webhook_rules set scanner_handoff_at = ${sql} where id = $1`, [hook.id]);
+    }
 
-    // Published after the cutoff, the same activity time is a new version.
-    await publish(alreadySent, sentActivity);
-    expect((await run(hook)).delivered).toBe(1);
-    expect(payloads().map((payload) => payload.traceId)).toEqual([neverSent.id, alreadySent.id]);
+    it("does not resend what the previous release delivered, and waits for what it is still sending", async () => {
+      const projectId = await newProject();
+      const sent = trace(projectId);
+      const sending = trace(projectId);
+      const sentActivity = await publish(sent);
+      const sendingActivity = await publish(sending);
+      const hook = await rule(projectId);
+      await scannerDelivery(hook, sent.id, sentActivity);
+      await scannerDelivery(hook, sending.id, sendingActivity, false);
+
+      expect(await run(hook)).toEqual({ matched: 2, delivered: 0, skipped: 1, failed: [], waitingFor: sending.id });
+      expect(receivedRequests).toHaveLength(0);
+    });
+
+    it("while the previous release may still run, skips what it sent after the handoff too", async () => {
+      const projectId = await newProject();
+      const hook = await rule(projectId);
+      const hooked = trace(projectId);
+      const activity = await publish(hooked);
+      await scannerDelivery(hook, hooked.id, activity);
+
+      expect(await run(hook)).toEqual({ matched: 1, delivered: 0, skipped: 1, failed: [] });
+      expect(receivedRequests).toHaveLength(0);
+    });
+
+    it("marks what it delivers under the old key while the previous release may still run, so that release skips it", async () => {
+      const projectId = await newProject();
+      const hooked = trace(projectId);
+      const activity = await publish(hooked);
+      const hook = await rule(projectId);
+
+      expect((await run(hook)).delivered).toBe(1);
+      expect(await getWebhookDeliveryStatus(pool, hook.id, hooked.id, activity)).toBe("covered");
+      // The previous release's claim for the same trace finds the key taken.
+      expect(await claimWebhookDelivery(pool, `d_${ulid()}`, hook.id, hooked.id, activity)).toBeNull();
+    });
+
+    it("after the handoff window, honors old deliveries only for traces published before the handoff", async () => {
+      const projectId = await newProject();
+      const early = trace(projectId);
+      const late = trace(projectId);
+      const earlyActivity = await publish(early);
+      const lateActivity = await publish(late);
+      const hook = await rule(projectId);
+      await scannerDelivery(hook, early.id, earlyActivity);
+      await scannerDelivery(hook, late.id, lateActivity);
+      // Handed off two days ago; only the early trace was published before it.
+      await moveHandoff(hook, "now() - interval '2 days'");
+      await pool.query(
+        "update evaluator_trace_feed set published_at = now() - interval '3 days' where project_id = $1 and trace_id = $2",
+        [projectId, early.id]
+      );
+
+      expect(await run(hook)).toEqual({ matched: 2, delivered: 1, skipped: 1, failed: [] });
+      expect(payloads().map((payload) => payload.traceId)).toEqual([late.id]);
+      // Outside the window nothing is marked under the old key.
+      expect(await getWebhookDeliveryStatus(pool, hook.id, late.id, lateActivity)).toBe("delivered");
+    });
+
+    it("sends a republished trace again even when its activity time matches an old delivery, once the window has passed", async () => {
+      const projectId = await newProject();
+      const hooked = trace(projectId);
+      const activity = await publish(hooked);
+      const hook = await rule(projectId);
+      await scannerDelivery(hook, hooked.id, activity);
+      await moveHandoff(hook, "now() - interval '2 days'");
+      await pool.query(
+        "update evaluator_trace_feed set published_at = now() - interval '3 days' where project_id = $1 and trace_id = $2",
+        [projectId, hooked.id]
+      );
+      expect((await run(hook)).skipped).toBe(1);
+
+      // A batch received earlier but written now publishes the trace again with the same activity time.
+      await publish(hooked, activity);
+      expect((await run(hook)).delivered).toBe(1);
+      expect(payloads().map((payload) => payload.traceId)).toEqual([hooked.id]);
+    });
   });
 
   it("a filter matching zero traces delivers nothing and still moves past them", async () => {

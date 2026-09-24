@@ -9,12 +9,11 @@ alter table webhook_rules
   add column last_run_error text,
   add column last_run_delivered_count bigint;
 
--- Before this migration a delivery was keyed by the trace's ingest activity
--- time; now it is keyed by the trace's feed version. For feed entries
--- published up to this instant, a run first checks for a delivery under the
--- activity time, so upgrading does not send those traces again. Rules created
--- later keep it null and never need the check.
+-- Before this migration a run keyed each delivery by the trace's ingest
+-- activity time; now it keys it by the trace's feed version. A rule honors
+-- deliveries keyed by activity time for feed entries published up to this
+-- instant, and for a day after it, while a worker from the previous release
+-- may still be delivering. Existing rules get the migration time; a new rule,
+-- whichever release's API creates it, gets its creation time.
 alter table webhook_rules
-  add column legacy_delivery_cutoff timestamptz;
-
-update webhook_rules set legacy_delivery_cutoff = now();
+  add column scanner_handoff_at timestamptz not null default now();

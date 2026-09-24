@@ -4,9 +4,14 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { runMigrations } from "../src/migrate.js";
 import {
   claimWebhookDelivery,
+  coverScannerDelivery,
   createWebhookRule,
+  getWebhookDeliveryStatus,
+  getWebhookRule,
+  listScannerDeliveries,
   markWebhookDelivered,
-  markWebhookFailed
+  markWebhookFailed,
+  recordWebhookRun
 } from "../src/webhooks.js";
 
 const pool = new Pool({
@@ -177,5 +182,131 @@ describe("claimWebhookDelivery — exactly-once per settled version", () => {
     expect(first).toBeTruthy();
     expect(second).toBeTruthy();
     expect(first).not.toBe(second);
+  });
+});
+
+describe("scanner deliveries — keyed by activity time before migration 0006", () => {
+  async function scannerDelivery(traceId: string, status: "delivered" | "failed" | "pending" | "stale") {
+    const id = (await claimWebhookDelivery(pool, `d_${ulid()}`, ruleId, traceId, TRACE_VERSION))!;
+    if (status === "delivered") await markWebhookDelivered(pool, id);
+    if (status === "failed") await markWebhookFailed(pool, id, "HTTP 500");
+    if (status === "stale") {
+      await pool.query("update webhook_deliveries set attempted_at = now() - interval '11 minutes' where id = $1", [id]);
+    }
+  }
+
+  it("reports a delivered or freshly pending scanner delivery, and nothing for failed, stale or covered keys", async () => {
+    const traces = {
+      delivered: `trace_${ulid()}`,
+      pending: `trace_${ulid()}`,
+      stale: `trace_${ulid()}`,
+      failed: `trace_${ulid()}`,
+      covered: `trace_${ulid()}`,
+      none: `trace_${ulid()}`
+    };
+    await scannerDelivery(traces.delivered, "delivered");
+    await scannerDelivery(traces.pending, "pending");
+    await scannerDelivery(traces.stale, "stale");
+    await scannerDelivery(traces.failed, "failed");
+    await coverScannerDelivery(pool, `d_${ulid()}`, ruleId, traces.covered, TRACE_VERSION);
+
+    const found = await listScannerDeliveries(
+      pool,
+      ruleId,
+      Object.values(traces).map((traceId) => ({ traceId, activityVersion: TRACE_VERSION }))
+    );
+    expect(Object.fromEntries(found)).toEqual({
+      [traces.delivered]: "delivered",
+      [traces.pending]: "in-flight"
+    });
+    expect(await listScannerDeliveries(pool, ruleId, [])).toEqual(new Map());
+  });
+
+  it("covering a key stops a previous-release claim, takes over a failed or stale attempt, and never touches a delivered one", async () => {
+    const fresh = `trace_${ulid()}`;
+    await coverScannerDelivery(pool, `d_${ulid()}`, ruleId, fresh, TRACE_VERSION);
+    expect(await getWebhookDeliveryStatus(pool, ruleId, fresh, TRACE_VERSION)).toBe("covered");
+    expect(await claimWebhookDelivery(pool, `d_${ulid()}`, ruleId, fresh, TRACE_VERSION)).toBeNull();
+
+    for (const status of ["failed", "stale"] as const) {
+      const traceId = `trace_${ulid()}`;
+      await scannerDelivery(traceId, status);
+      await coverScannerDelivery(pool, `d_${ulid()}`, ruleId, traceId, TRACE_VERSION);
+      expect(await getWebhookDeliveryStatus(pool, ruleId, traceId, TRACE_VERSION)).toBe("covered");
+      expect(await claimWebhookDelivery(pool, `d_${ulid()}`, ruleId, traceId, TRACE_VERSION)).toBeNull();
+    }
+
+    const delivered = `trace_${ulid()}`;
+    await scannerDelivery(delivered, "delivered");
+    await coverScannerDelivery(pool, `d_${ulid()}`, ruleId, delivered, TRACE_VERSION);
+    expect(await getWebhookDeliveryStatus(pool, ruleId, delivered, TRACE_VERSION)).toBe("delivered");
+    expect(await getWebhookDeliveryStatus(pool, ruleId, `trace_${ulid()}`, TRACE_VERSION)).toBeNull();
+  });
+});
+
+describe("recordWebhookRun", () => {
+  it("stores the run and moves the feed position only from the value the run started at", async () => {
+    const rule = await createWebhookRule(pool, {
+      id: `webhook_${ulid()}`,
+      projectId,
+      name: "cursor rule",
+      destinationUrl: "http://localhost:9999/hook",
+      signingSecretEncrypted: "unused-in-this-test",
+      filter: {}
+    });
+    expect(rule.feedCursor).toBeNull();
+    expect(rule.lastRunAt).toBeNull();
+    const first = { publishedAt: "2026-09-24T10:00:00.000001Z", traceId: "trace_a" };
+    const second = { publishedAt: "2026-09-24T10:00:00.000002Z", traceId: "trace_b" };
+
+    await recordWebhookRun(pool, rule.id, {
+      status: "success",
+      delivered: 2,
+      feedCursor: { from: null, to: first },
+      runAgainSoon: true
+    });
+    const afterFirst = (await getWebhookRule(pool, projectId, rule.id))!;
+    expect(afterFirst).toMatchObject({
+      feedCursor: first,
+      lastRunStatus: "success",
+      lastRunError: null,
+      lastRunDeliveredCount: 2
+    });
+    expect(afterFirst.nextRunAt.getTime()).toBeLessThanOrEqual(Date.now());
+
+    // A run that started from the old position (claimed twice) records its outcome but not its position.
+    await recordWebhookRun(pool, rule.id, {
+      status: "error",
+      error: "trace_b: destination responded HTTP 500",
+      delivered: 0,
+      feedCursor: { from: null, to: second }
+    });
+    expect((await getWebhookRule(pool, projectId, rule.id))!).toMatchObject({
+      feedCursor: first,
+      lastRunStatus: "error",
+      lastRunError: "trace_b: destination responded HTTP 500",
+      lastRunDeliveredCount: 0
+    });
+
+    await recordWebhookRun(pool, rule.id, {
+      status: "success",
+      delivered: 1,
+      feedCursor: { from: first, to: second }
+    });
+    expect((await getWebhookRule(pool, projectId, rule.id))!.feedCursor).toEqual(second);
+  });
+
+  it("gives a new rule its creation time as its scanner handoff", async () => {
+    const before = Date.now();
+    const rule = await createWebhookRule(pool, {
+      id: `webhook_${ulid()}`,
+      projectId,
+      name: "handoff rule",
+      destinationUrl: "http://localhost:9999/hook",
+      signingSecretEncrypted: "unused-in-this-test",
+      filter: {}
+    });
+    expect(rule.scannerHandoffAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/);
+    expect(Date.parse(rule.scannerHandoffAt)).toBeGreaterThanOrEqual(before - 5_000);
   });
 });

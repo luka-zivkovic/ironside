@@ -68,7 +68,7 @@ describe("runMigrations (postgres)", () => {
       },
       {
         id: "0006_webhook_feed_cursors",
-        checksum: "feaec475385c6c79b0ef91b5a0e5c7c9cf6754532cb3d7cdacd059728f3b5b29"
+        checksum: "3be4a408cf2aa74fc17932d9ac549942f18433228f59e1f1b3635a3ccb9b6861"
       }
     ]);
     expect((await pool.query("select to_regclass('api_keys') as table_name")).rows).toEqual([

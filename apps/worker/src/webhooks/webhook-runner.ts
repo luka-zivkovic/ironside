@@ -2,8 +2,9 @@ import { createHmac } from "node:crypto";
 import type { ClickHouseClient, VersionedTraceSummaryRow } from "@ironside/clickhouse";
 import {
   claimWebhookDelivery,
+  coverScannerDelivery,
   getWebhookDeliveryStatus,
-  listDeliveredWebhookTraceIds,
+  listScannerDeliveries,
   markWebhookDelivered,
   markWebhookFailed,
   recordWebhookRun,
@@ -23,6 +24,11 @@ const MAX_DELIVERIES_PER_RUN = 1_000;
 const MAX_FEED_ENTRIES_PER_RUN = 100_000;
 /** One unresponsive destination must not hold the scheduler tick, which runs every subsystem in turn. */
 const REQUEST_TIMEOUT_MS = 30_000;
+/**
+ * How long after a rule's scanner handoff a worker from the previous release
+ * may still be delivering it during a rolling upgrade.
+ */
+export const SCANNER_HANDOFF_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 export interface RunWebhooksOptions {
   pool: Pool;
@@ -52,6 +58,8 @@ export interface WebhookRunResult {
   skipped: number;
   /** The delivery the run stopped at. It is retried from the same feed position on the next run. */
   failed: { traceId: string; error: string }[];
+  /** Set when the run stopped at a trace another run is still delivering. */
+  waitingFor?: string;
 }
 
 interface WebhookPayload {
@@ -78,6 +86,13 @@ type DeliveryOutcome = "delivered" | "already-delivered" | "in-flight" | { error
  * delivery instead of skipping traces; so does a version another run is
  * still sending. Every run records its status on the rule.
  *
+ * Workers before migration 0006 keyed a delivery by the trace's activity
+ * time instead of its feed version. A run honors those deliveries for feed
+ * entries published before the rule's scanner handoff, and for a day after
+ * it, when such a worker may still be running beside this one; in that window
+ * it also marks each trace it delivers under the old key, so the older worker
+ * does not send it again.
+ *
  * Body is signed with HMAC-SHA256 over the raw JSON string (not a
  * re-serialized object, which could differ byte-for-byte from what was
  * signed) in an X-Ironside-Signature header, so the receiver can verify
@@ -92,6 +107,7 @@ type DeliveryOutcome = "delivered" | "already-delivered" | "in-flight" | { error
 export async function runWebhooks(options: RunWebhooksOptions): Promise<WebhookRunResult> {
   const { pool, clickhouse, rule } = options;
   const settledBefore = traceSettledBefore(options.traceQuietPeriodSeconds);
+  const handoffOpen = Date.now() < Date.parse(rule.scannerHandoffAt) + SCANNER_HANDOFF_WINDOW_MS;
 
   let cursor = rule.feedCursor;
   let backlog = false;
@@ -113,20 +129,28 @@ export async function runWebhooks(options: RunWebhooksOptions): Promise<WebhookR
           limit: Math.min(FEED_PAGE_SIZE, MAX_DELIVERIES_PER_RUN - result.delivered)
         }
       );
-      const deliveredBeforeFeed = await listDeliveredBeforeFeed(pool, rule, page.entries);
+      const scannerDeliveries = await listScannerDeliveriesOnPage(pool, rule, page.entries, handoffOpen);
 
       for (const entry of page.entries) {
         const { trace, version } = entry;
         if (trace && version !== undefined && matchesExportFilter(trace, rule.filter)) {
           result.matched += 1;
-          const outcome = deliveredBeforeFeed.has(trace.id)
-            ? "already-delivered"
-            : await deliver(options, trace, version);
+          const scanner = scannerDeliveries.get(trace.id);
+          const outcome =
+            scanner === "delivered"
+              ? "already-delivered"
+              : scanner === "in-flight"
+                ? "in-flight"
+                : await deliver(options, trace, version);
           if (outcome === "delivered") {
             result.delivered += 1;
+            if (handoffOpen) {
+              await coverScannerDelivery(pool, ulid(), rule.id, trace.id, trace.trace_version);
+            }
           } else if (outcome === "already-delivered") {
             result.skipped += 1;
           } else if (outcome === "in-flight") {
+            result.waitingFor = trace.id;
             break read;
           } else {
             result.failed.push({ traceId: trace.id, error: outcome.error });
@@ -153,9 +177,16 @@ export async function runWebhooks(options: RunWebhooksOptions): Promise<WebhookR
       ...result.failed.map((failure) => `${failure.traceId}: ${failure.error}`),
       ...(runError === undefined ? [] : [runError instanceof Error ? runError.message : String(runError)])
     ];
+    // Waiting behind an in-flight delivery is not a failure, but it explains a run that stopped.
+    const note =
+      errors.length > 0
+        ? errors.join("; ")
+        : result.waitingFor !== undefined
+          ? `stopped at ${result.waitingFor}: another run is still delivering it`
+          : undefined;
     await recordWebhookRun(pool, rule.id, {
       status: errors.length > 0 ? "error" : "success",
-      ...(errors.length > 0 && { error: errors.join("; ").slice(0, 2_000) }),
+      ...(note !== undefined && { error: note.slice(0, 2_000) }),
       delivered: result.delivered,
       feedCursor: { from: rule.feedCursor, to: cursor },
       runAgainSoon: backlog
@@ -164,24 +195,23 @@ export async function runWebhooks(options: RunWebhooksOptions): Promise<WebhookR
 }
 
 /**
- * Traces on this page that the scanner webhooks used before migration 0006
- * already delivered. It keyed a delivery by the trace's latest activity time,
- * which a feed entry carries as `trace.trace_version`. Only entries published
- * before the rule's cutoff can have such a delivery.
+ * What a pre-0006 worker delivered, or is delivering, for this page's traces
+ * under their activity time, which a feed entry carries as
+ * `trace.trace_version`. Only entries published before the rule's handoff can
+ * have such a delivery, unless a previous-release worker may still be running.
  */
-async function listDeliveredBeforeFeed(
+async function listScannerDeliveriesOnPage(
   pool: Pool,
   rule: WebhookRule,
-  entries: SettledFeedEntry[]
-): Promise<Set<string>> {
-  const cutoff = rule.legacyDeliveryCutoff;
-  if (cutoff === null) return new Set();
+  entries: SettledFeedEntry[],
+  handoffOpen: boolean
+): Promise<Map<string, "delivered" | "in-flight">> {
   const versions = entries.flatMap((entry) =>
-    entry.trace && entry.cursor.publishedAt <= cutoff
-      ? [{ traceId: entry.trace.id, traceVersion: entry.trace.trace_version }]
+    entry.trace && (handoffOpen || entry.cursor.publishedAt <= rule.scannerHandoffAt)
+      ? [{ traceId: entry.trace.id, activityVersion: entry.trace.trace_version }]
       : []
   );
-  return listDeliveredWebhookTraceIds(pool, rule.id, versions);
+  return listScannerDeliveries(pool, rule.id, versions);
 }
 
 async function deliver(
@@ -193,7 +223,7 @@ async function deliver(
   const deliveryId = await claimWebhookDelivery(pool, ulid(), rule.id, trace.id, version);
   if (!deliveryId) {
     const status = await getWebhookDeliveryStatus(pool, rule.id, trace.id, version);
-    return status === "delivered" ? "already-delivered" : "in-flight";
+    return status === "delivered" || status === "covered" ? "already-delivered" : "in-flight";
   }
 
   const body = JSON.stringify({

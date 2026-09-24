@@ -42,7 +42,7 @@ A delivered tuple cannot be claimed again, so a run that starts from an old posi
 
 A request that fails (a network error, a timeout, or any non-2xx response) marks its delivery failed and stops the run before that trace. The next run retries it first, so an unreachable or misconfigured destination delays webhooks instead of skipping traces, and delivery stays in feed order. A run also stops, without an error, at a version another run is still sending.
 
-The position advances past every delivered, already-delivered, or non-matching entry, and is stored only if it still holds the value the run started from. Every run records `last_run_status`, `last_run_error` (the delivery it stopped at) and `last_run_delivered_count` on the rule, returned by the webhook rule API as `lastRunStatus`, `lastRunError` and `lastRunDeliveredCount`.
+The position advances past every delivered, already-delivered, or non-matching entry, and is stored only if it still holds the value the run started from. Every run records `last_run_status`, `last_run_error` and `last_run_delivered_count` on the rule, returned by the webhook rule API as `lastRunStatus`, `lastRunError` and `lastRunDeliveredCount`. `last_run_error` names the delivery a run stopped at: the failed one, or, with a `success` status, the one another run is still sending.
 
 ## Payload and signing
 
@@ -58,16 +58,22 @@ The position advances past every delivered, already-delivered, or non-matching e
 
 ## Upgrading from 0.3.0
 
-Before migration `0006`, a run scanned every matching settled trace on every run and keyed deliveries by the trace's latest activity time. Migration `0006` sets `legacy_delivery_cutoff` on every existing rule. For feed entries published at or before that instant, a run first looks for a delivery under the trace's activity time and skips the trace if it was delivered, so upgrading does not resend earlier webhooks. Rules created afterwards have no cutoff. Old and new workers must not run side by side: during such an overlap a trace can be delivered once by each.
+Before migration `0006`, a run scanned every matching settled trace on every run and keyed each delivery by the trace's latest activity time (the "scanner" key). Each rule has a `scanner_handoff_at`: the migration time for a rule that existed before it, otherwise the rule's creation time, whichever release's API created it.
+
+- For a feed entry published at or before the handoff, a run first looks up the scanner key. A delivered one means the trace was already sent, and the run skips it; a pending one younger than 10 minutes means a previous-release worker is sending it, and the run stops before it. Upgrading therefore does not resend earlier webhooks.
+- For 24 hours after the handoff, while a worker from the previous release may still run beside this one during a rolling upgrade (`docs/schema-migrations.md`), a run checks the scanner key for every entry, and after delivering a trace it marks the scanner key `covered`. The older worker's claim cannot take a covered key, so it does not send the trace again.
+- After that window, a trace published again with an unchanged activity time (a late batch) gets a new webhook, even if the scanner delivered that activity time.
+
+A previous-release worker that claims a trace between a new run's check and its delivery can still send it twice. The window for that is one request, and only during a rolling upgrade.
 
 Receivers see `traceVersion` change meaning from the activity time to the feed version. Both are timestamps; a receiver that stores the latest `traceVersion` per trace and compares them keeps working, because feed versions only increase.
 
 ## Verified
 
-`apps/worker/test/webhook-runner.test.ts` publishes traces to the feed and runs `runWebhooks` against real Postgres, ClickHouse and a local HTTP server. It covers the signed payload and the recorded run, no resend from a later run or from a stale position, a new webhook for each republication (including a late batch), a failed delivery stopping the run and being retried first in feed order, stopping at an in-flight delivery, skipping deliveries made before the upgrade, a filter matching nothing, a bookkeeping failure after a confirmed delivery, and the SSRF guard. `packages/db/test/webhooks.test.ts` covers the claim itself, including 10 parallel claims producing one winner. `packages/db/test/migrate-upgrade.test.ts` checks the cutoff is set only on rules that existed before the upgrade.
+`apps/worker/test/webhook-runner.test.ts` publishes traces to the feed and runs `runWebhooks` against real Postgres, ClickHouse and a local HTTP server. It covers the signed payload and the recorded run, no resend from a later run and no position change from a stale one, a new webhook for each republication (including a late batch), a failed delivery stopping the run and being retried first in feed order, stopping at an in-flight delivery, the handoff from a previous-release worker (before the handoff, inside and after the 24-hour window, and covering the old key), a filter matching nothing, a bookkeeping failure after a confirmed delivery, and the SSRF guard. `packages/db/test/webhooks.test.ts` covers the claim itself (including 10 parallel claims producing one winner), scanner-key lookups and covering, and the guarded position update. `packages/db/test/migrate-upgrade.test.ts` checks that existing rules are handed off at the migration.
 
 ## History
 
 - M6-03 added webhooks, scanning matching traces with `exportTraces` on every run. Issue #44 made delivery exactly once per settled version, keyed by activity time.
-- Migration `0006` moved webhooks onto the trace feed: runs read only new publications instead of every matching trace, deliveries are keyed by feed version, a failed delivery stops the run instead of being retried out of order, and each run's outcome is recorded on the rule. `exportTraces` was removed.
+- Migration `0006` moved webhooks onto the trace feed: runs read only new publications instead of every matching trace, deliveries are keyed by feed version with a handoff from the old activity-time key, a failed delivery stops the run instead of being retried out of order, and each run's outcome is recorded on the rule. `exportTraces` was removed.
 - Still open: webhooks fire on the scheduler's poll cadence, not the instant a trace settles (the same trade-off as `spec/otlp-forwarding-v1.md`).

@@ -72,7 +72,7 @@ describe("Postgres upgrades", () => {
     );
   });
 
-  it("marks webhook rules from before the trace feed so their earlier deliveries are not resent", async () => {
+  it("hands existing webhook rules off to feed-version deliveries at the migration", async () => {
     const pool = await scratchDatabase();
     await runMigrations(pool, { migrationsDir: v030MigrationsDir() });
     await pool.query("insert into organizations (id, name) values ('org_1', 'upgrade-org')");
@@ -90,14 +90,14 @@ describe("Postgres upgrades", () => {
     await runMigrations(pool);
     await insertRule("webhook_after");
 
-    const rules = await pool.query<{ id: string; marked: boolean; feed_cursor_trace_id: string | null }>(
-      `select id, legacy_delivery_cutoff is not null as marked, feed_cursor_trace_id
-       from webhook_rules order by id`
+    const rules = await pool.query<{ handed_off_first: boolean; cursors_unset: boolean }>(
+      `select before.scanner_handoff_at < after.scanner_handoff_at as handed_off_first,
+              before.feed_cursor_trace_id is null and after.feed_cursor_trace_id is null as cursors_unset
+       from webhook_rules as before, webhook_rules as after
+       where before.id = 'webhook_before' and after.id = 'webhook_after'`
     );
-    expect(rules.rows).toEqual([
-      { id: "webhook_after", marked: false, feed_cursor_trace_id: null },
-      { id: "webhook_before", marked: true, feed_cursor_trace_id: null }
-    ]);
+    // The existing rule is handed off at the migration; the new one when it is created.
+    expect(rules.rows).toEqual([{ handed_off_first: true, cursors_unset: true }]);
   });
 
   it("applies an upgrade exactly once when api and worker start at the same time", async () => {
