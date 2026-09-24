@@ -117,7 +117,7 @@ export async function getRetentionVisibleTraceIds(
 
 /** Large trace id sets are queried in chunks under the HTTP parameter limit (params.ts). */
 function traceIdChunks(traceIds: string[]): string[][] {
-  return chunkByParamBytes(traceIds, [(traceId) => traceId]);
+  return chunkByParamBytes([...new Set(traceIds)], [(traceId) => traceId]);
 }
 
 async function getRetentionVisibleTraceIdChunk(

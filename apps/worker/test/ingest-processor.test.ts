@@ -1134,6 +1134,90 @@ describe("a record written again with a timestamp on another day", () => {
     expect(await liveRows("scores", scoreId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
   });
 
+  it("never deletes a record whose timestamp is outside the range ClickHouse's Date keys by calendar day", async () => {
+    const traceId = `trace_${ulid()}`;
+    const batch = nativeBatch(noon(1), [{ type: "trace-upsert", body: { id: traceId, timestamp: "9999-12-31T12:00:00.000Z", name: "far" } }]);
+    await run(batch);
+    await run(batch);
+    expect(await liveRows("traces", traceId, "timestamp")).toHaveLength(1);
+    expect((await getTrace(clickhouse, projectId, traceId))?.name).toBe("far");
+  });
+
+  /** A processor whose ClickHouse client fails the first insert `failWhen` matches. */
+  function processorFailingOnce(failWhen: (insert: { table: string; values: unknown }) => boolean) {
+    let failed = false;
+    const flaky = new Proxy(clickhouse, {
+      get(target, property) {
+        if (property === "insert") {
+          return async (insert: Parameters<typeof clickhouse.insert>[0]) => {
+            if (!failed && failWhen(insert as { table: string; values: unknown })) {
+              failed = true;
+              throw new Error("simulated ClickHouse failure");
+            }
+            return target.insert(insert);
+          };
+        }
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+    });
+    return createIngestProcessor({ storage, clickhouse: flaky, pool });
+  }
+
+  function langfuseTraceBatch(day: number, body: Record<string, unknown>): IngestBatch {
+    return {
+      ...nativeBatch(noon(day), []),
+      events: [
+        {
+          id: ulid(),
+          type: "langfuse-ingestion",
+          source: "langfuse",
+          schemaVersion: INGEST_SCHEMA_VERSION,
+          idempotencyKey: ulid(),
+          body: { batch: [{ id: ulid(), timestamp: noon(day), type: "trace-create", body }] }
+        }
+      ]
+    };
+  }
+
+  it("keeps every stored LangFuse field when writing a moved record fails and the batch is retried", async () => {
+    const traceId = `trace_${ulid()}`;
+    await run(langfuseTraceBatch(2, { id: traceId, timestamp: noon(2), name: "checkout", userId: "u1" }));
+    const move = langfuseTraceBatch(1, { id: traceId, timestamp: noon(1), output: { answer: "done" } });
+
+    const job = await storeAndEnqueue(move);
+    const isTraceRow = (insert: { table: string; values: unknown }) =>
+      insert.table === "traces" &&
+      Array.isArray(insert.values) &&
+      insert.values.every((value) => (value as { is_deleted?: number }).is_deleted === undefined);
+    await expect(processorFailingOnce(isTraceRow)(job)).rejects.toThrow("simulated");
+    // Nothing was deleted before the rows were written.
+    expect(await liveRows("traces", traceId, "timestamp")).toEqual([noon(2).slice(0, 10)]);
+    await processBatch(job);
+    await job.remove();
+
+    expect(await liveRows("traces", traceId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
+    expect(await getTrace(clickhouse, projectId, traceId)).toMatchObject({ name: "checkout", user_id: "u1" });
+    expect(JSON.parse((await getTrace(clickhouse, projectId, traceId))?.output ?? "null")).toEqual({ answer: "done" });
+  });
+
+  it("leaves a duplicate, not a missing record, when the deletions fail, and the retry removes it", async () => {
+    const traceId = `trace_${ulid()}`;
+    await run(nativeBatch(noon(2), [{ type: "trace-upsert", body: { id: traceId, timestamp: noon(2), name: "old" } }]));
+    const move = nativeBatch(noon(1), [{ type: "trace-upsert", body: { id: traceId, timestamp: noon(1), name: "new" } }]);
+    const isDeletion = (insert: { values: unknown }) =>
+      Array.isArray(insert.values) && insert.values.some((value) => (value as { is_deleted?: number }).is_deleted === 1);
+
+    const job = await storeAndEnqueue(move);
+    await expect(processorFailingOnce(isDeletion)(job)).rejects.toThrow("simulated");
+    expect((await liveRows("traces", traceId, "timestamp")).sort()).toEqual([noon(2), noon(1)].map((at) => at.slice(0, 10)).sort());
+    await processBatch(job);
+    await job.remove();
+
+    expect(await liveRows("traces", traceId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
+    expect((await getTrace(clickhouse, projectId, traceId))?.name).toBe("new");
+  });
+
   it("removes duplicates written before this fix when the record is written again", async () => {
     const traceId = `trace_${ulid()}`;
     const trace = (day: number) => ({ id: traceId, projectId, timestamp: noon(day), tags: [], metadata: {} });

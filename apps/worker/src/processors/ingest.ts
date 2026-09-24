@@ -225,7 +225,8 @@ export function createIngestProcessor(deps: IngestProcessorDeps) {
         receivedAt: batch.receivedAt,
         traces: [...nativeRows.traces, ...otlpTraces],
         observations: [...nativeRows.observations, ...otlpObservations],
-        scores: incomingScores
+        scores: incomingScores,
+        merged: { traces: merged.traces, observations: merged.observations, rowEventTs: merged.rowEventTs }
       });
       const traces = [...resolved.traces, ...merged.traces];
       const observations = [...resolved.observations, ...merged.observations];
@@ -278,20 +279,20 @@ export function createIngestProcessor(deps: IngestProcessorDeps) {
         const insertOptions = { eventTs: batch.receivedAt };
         const traceOptions = { ...insertOptions, rowEventTs: merged.rowEventTs.traces };
         const observationOptions = { ...insertOptions, rowEventTs: merged.rowEventTs.observations };
-        // Rows a record left under another day are deleted first, with the
-        // version of the row that replaces them (moved-rows.ts,
-        // langfuse-merge.ts). They never share a key with a row written below.
-        await Promise.all([
-          deleteMovedTraceRows(deps.clickhouse, merged.moved.traces, traceOptions),
-          deleteMovedObservationRows(deps.clickhouse, merged.moved.observations, observationOptions),
-          deleteMovedTraceRows(deps.clickhouse, resolved.deletions.traces, insertOptions),
-          deleteMovedObservationRows(deps.clickhouse, resolved.deletions.observations, insertOptions),
-          deleteMovedScoreRows(deps.clickhouse, resolved.deletions.scores, insertOptions)
-        ]);
         await Promise.all([
           insertTraces(deps.clickhouse, traces, traceOptions),
           insertObservations(deps.clickhouse, observations, observationOptions),
           insertScores(deps.clickhouse, scores, insertOptions)
+        ]);
+        // Then the rows these records left under another day, with the
+        // version of the row that replaces them (moved-rows.ts). A failure in
+        // between leaves a duplicate until the retry, never a missing record.
+        await Promise.all([
+          deleteMovedTraceRows(deps.clickhouse, resolved.deletions.traces, insertOptions),
+          deleteMovedObservationRows(deps.clickhouse, resolved.deletions.observations, insertOptions),
+          deleteMovedScoreRows(deps.clickhouse, resolved.deletions.scores, insertOptions),
+          deleteMovedTraceRows(deps.clickhouse, resolved.mergedDeletions.traces, traceOptions),
+          deleteMovedObservationRows(deps.clickhouse, resolved.mergedDeletions.observations, observationOptions)
         ]);
         // Evaluator score receipts suppress later HTTP retries only after the
         // durable ingest intent exists. Record the second commit point once its

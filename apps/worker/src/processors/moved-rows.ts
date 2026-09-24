@@ -1,6 +1,6 @@
 import { listStoredRowKeys, type ClickHouseClient, type StoredRowKey } from "@ironside/clickhouse";
 import type { Observation, Score, Trace } from "@ironside/shared";
-import { instant, utcDay } from "./langfuse-merge.js";
+import { instant } from "./langfuse-merge.js";
 
 // A trace's, observation's or score's ClickHouse sort key includes the day of
 // its timestamp (start time for observations). ReplacingMergeTree replaces a
@@ -15,10 +15,15 @@ import { instant, utcDay } from "./langfuse-merge.js";
 // - When a stored row is newer, the batch's row is stale and is not written;
 //   stored rows older than the batch are still deleted, since a newer row
 //   replaces them either way.
+// - LangFuse-compatible rows arrive already merged with the stored row
+//   (langfuse-merge.ts) and are always written; their stored rows under
+//   other days are deleted with the merged row's version.
 //
-// Deletions carry the batch's version and never share a key with a row the
-// batch writes. LangFuse-compatible rows are merged field by field instead
-// and handle a move in langfuse-merge.ts.
+// Deletions are written after the rows they make way for, so a failure in
+// between leaves a duplicate, never a missing record; the retry, which finds
+// the same stored rows, removes it. Deletions never share a key with a row the
+// batch writes: days are compared only within the range of ClickHouse's Date
+// type, which the sort key uses (see sortKeyDay).
 //
 // Two batches writing the same record on different days at the same moment
 // can both find nothing stored and both be written; the next write of that
@@ -31,27 +36,42 @@ export interface MovedRowDeletions {
 }
 
 export interface ResolvedRows {
-  /** The rows to write: one per record, leaving out stale rows. */
+  /** The whole-row upserts to write: one per record, leaving out stale rows. */
   traces: Trace[];
   observations: Observation[];
   scores: Score[];
-  /** Stored rows these writes replace, to write as deletions with this batch's version before the rows. */
+  /** Stored rows the upserts replace, to write as deletions with this batch's version after the rows. */
   deletions: MovedRowDeletions;
+  /** Stored rows the merged LangFuse rows replace, to write with each merged row's version (rowEventTs). */
+  mergedDeletions: Omit<MovedRowDeletions, "scores">;
 }
 
 export async function resolveMovedRows(
   clickhouse: ClickHouseClient,
-  input: { projectId: string; receivedAt: string; traces: Trace[]; observations: Observation[]; scores: Score[] }
+  input: {
+    projectId: string;
+    receivedAt: string;
+    /** Whole-row upserts: native and OTLP traces and observations, and every score. */
+    traces: Trace[];
+    observations: Observation[];
+    scores: Score[];
+    /** LangFuse-compatible rows merged with their stored rows, and the versions they are written with. */
+    merged: {
+      traces: Trace[];
+      observations: Observation[];
+      rowEventTs: { traces: ReadonlyMap<string, string>; observations: ReadonlyMap<string, string> };
+    };
+  }
 ): Promise<ResolvedRows> {
-  const { projectId } = input;
+  const { projectId, merged } = input;
   const version = instant(input.receivedAt);
   const traces = lastPerRecord(input.traces, (trace) => recordKey("trace", "", trace.id));
   const observations = lastPerRecord(input.observations, (row) => recordKey("observation", row.traceId, row.id));
   const scores = lastPerRecord(input.scores, (score) => recordKey("score", score.traceId, score.id));
 
   const stored = await listStoredRowKeys(clickhouse, projectId, {
-    traceIds: traces.map((trace) => trace.id),
-    observations: observations.map((observation) => ({ traceId: observation.traceId, id: observation.id })),
+    traceIds: [...traces, ...merged.traces].map((trace) => trace.id),
+    observations: [...observations, ...merged.observations].map((row) => ({ traceId: row.traceId, id: row.id })),
     scores: scores.map((score) => ({ traceId: score.traceId, id: score.id }))
   });
   const byRecord = new Map<string, StoredRowKey[]>();
@@ -60,20 +80,28 @@ export async function resolveMovedRows(
     byRecord.set(key, [...(byRecord.get(key) ?? []), row]);
   }
 
-  /** Whether the batch's row is written, and which stored rows it replaces. */
+  /** Stored rows under another day than `sortTime`, at or below `rowVersion`. */
+  const otherDays = (rows: StoredRowKey[], sortTime: string, rowVersion: string): StoredRowKey[] => {
+    const day = sortKeyDay(sortTime);
+    if (day === undefined) return [];
+    return rows.filter((row) => {
+      const storedDay = sortKeyDay(row.sort_time);
+      return storedDay !== undefined && storedDay !== day && instant(row.event_ts) <= rowVersion;
+    });
+  };
+  /** Whether a whole-row upsert is written, and which stored rows it replaces. */
   const resolve = (key: string, sortTime: string): { write: boolean; replaced: StoredRowKey[] } => {
     const rows = byRecord.get(key) ?? [];
     if (rows.some((row) => instant(row.event_ts) > version)) {
       return { write: false, replaced: rows.filter((row) => instant(row.event_ts) < version) };
     }
-    const day = utcDay(sortTime);
-    return { write: true, replaced: rows.filter((row) => utcDay(row.sort_time) !== day) };
+    return { write: true, replaced: otherDays(rows, sortTime, version) };
   };
 
   const deletions: MovedRowDeletions = { traces: [], observations: [], scores: [] };
   const writtenTraces = traces.filter((trace) => {
     const { write, replaced } = resolve(recordKey("trace", "", trace.id), trace.timestamp);
-    for (const row of replaced) deletions.traces.push({ projectId, id: row.id, timestamp: row.sort_time });
+    deletions.traces.push(...replaced.map((row) => traceDeletion(projectId, row)));
     return write;
   });
   const writtenObservations = observations.filter((observation) => {
@@ -81,9 +109,7 @@ export async function resolveMovedRows(
       recordKey("observation", observation.traceId, observation.id),
       observation.startTime
     );
-    for (const row of replaced) {
-      deletions.observations.push({ projectId, id: row.id, traceId: row.trace_id, startTime: row.sort_time });
-    }
+    deletions.observations.push(...replaced.map((row) => observationDeletion(projectId, row)));
     return write;
   });
   const writtenScores = scores.filter((score) => {
@@ -91,12 +117,50 @@ export async function resolveMovedRows(
       recordKey("score", score.traceId, score.id),
       score.timestamp ?? input.receivedAt
     );
-    for (const row of replaced) {
-      deletions.scores.push({ projectId, id: row.id, traceId: row.trace_id, timestamp: row.sort_time });
-    }
+    deletions.scores.push(
+      ...replaced.map((row) => ({ projectId, id: row.id, traceId: row.trace_id, timestamp: row.sort_time }))
+    );
     return write;
   });
-  return { traces: writtenTraces, observations: writtenObservations, scores: writtenScores, deletions };
+
+  const mergedDeletions: ResolvedRows["mergedDeletions"] = { traces: [], observations: [] };
+  for (const trace of merged.traces) {
+    const rowVersion = instant(merged.rowEventTs.traces.get(trace.id) ?? input.receivedAt);
+    const rows = byRecord.get(recordKey("trace", "", trace.id)) ?? [];
+    mergedDeletions.traces.push(...otherDays(rows, trace.timestamp, rowVersion).map((row) => traceDeletion(projectId, row)));
+  }
+  for (const observation of merged.observations) {
+    const rowVersion = instant(merged.rowEventTs.observations.get(observation.id) ?? input.receivedAt);
+    const rows = byRecord.get(recordKey("observation", observation.traceId, observation.id)) ?? [];
+    mergedDeletions.observations.push(
+      ...otherDays(rows, observation.startTime, rowVersion).map((row) => observationDeletion(projectId, row))
+    );
+  }
+
+  return { traces: writtenTraces, observations: writtenObservations, scores: writtenScores, deletions, mergedDeletions };
+}
+
+const DATE_MIN = Date.parse("1970-01-01T00:00:00.000Z");
+const DATE_END = Date.parse("2149-06-07T00:00:00.000Z");
+
+/**
+ * The day a timestamp's row is keyed under, as ClickHouse's toDate computes
+ * it, or undefined outside the Date type's range (1970-01-01 to 2149-06-06),
+ * where toDate does not return the calendar day. Rows there are never
+ * compared, so they are never deleted as moved.
+ */
+function sortKeyDay(timestamp: string): string | undefined {
+  const time = Date.parse(timestamp);
+  if (Number.isNaN(time) || time < DATE_MIN || time >= DATE_END) return undefined;
+  return new Date(time).toISOString().slice(0, 10);
+}
+
+function traceDeletion(projectId: string, row: StoredRowKey): MovedRowDeletions["traces"][number] {
+  return { projectId, id: row.id, timestamp: row.sort_time };
+}
+
+function observationDeletion(projectId: string, row: StoredRowKey): MovedRowDeletions["observations"][number] {
+  return { projectId, id: row.id, traceId: row.trace_id, startTime: row.sort_time };
 }
 
 /** Each record's last row, in the order of those last rows. */

@@ -50,15 +50,6 @@ export interface LangfuseMergeResult {
   rowEventTs: { traces: Map<string, string>; observations: Map<string, string> };
   /** Field times to record once the rows are written (recordLangfuseFieldSentAt). */
   sentAt: { kind: LangfuseEntityKind; id: string; sentAt: LangfuseFieldSentAt }[];
-  /**
-   * Stored rows the merge moved to another day. The day is part of the
-   * ClickHouse sort key, so the merged row does not replace the stored one;
-   * these are written as deletions of the old key (deleteMovedTraceRows).
-   */
-  moved: {
-    traces: { projectId: string; id: string; timestamp: string }[];
-    observations: { projectId: string; id: string; traceId: string; startTime: string }[];
-  };
 }
 
 /** Combines a batch's LangFuse requests; a record in more than one takes later requests' sent fields. */
@@ -133,8 +124,7 @@ export async function mergeLangfuseRows(
     traces: [],
     observations: [],
     rowEventTs: { traces: new Map(), observations: new Map() },
-    sentAt: [],
-    moved: { traces: [], observations: [] }
+    sentAt: []
   };
   for (const trace of rows.traces) {
     const stored = tracesById.get(trace.id);
@@ -150,9 +140,6 @@ export async function mergeLangfuseRows(
     );
     result.traces.push(merged.row);
     result.sentAt.push({ kind: "trace", id: trace.id, sentAt: merged.sentAt });
-    if (stored && utcDay(stored.timestamp) !== utcDay(merged.row.timestamp)) {
-      result.moved.traces.push({ projectId, id: trace.id, timestamp: stored.timestamp });
-    }
     const override = versionOverride(stored, receivedAt);
     if (override) result.rowEventTs.traces.set(trace.id, override);
   }
@@ -172,24 +159,10 @@ export async function mergeLangfuseRows(
     );
     result.observations.push(merged.row);
     result.sentAt.push({ kind: "observation", id: observation.id, sentAt: merged.sentAt });
-    if (stored && utcDay(stored.start_time) !== utcDay(merged.row.startTime)) {
-      result.moved.observations.push({
-        projectId,
-        id: observation.id,
-        traceId: stored.trace_id,
-        startTime: stored.start_time
-      });
-    }
     const override = versionOverride(stored, receivedAt);
     if (override) result.rowEventTs.observations.set(observation.id, override);
   }
   return result;
-}
-
-/** The UTC day of an ISO timestamp: the day ClickHouse's sort key (toDate) puts a row under. */
-export function utcDay(timestamp: string): string {
-  const time = Date.parse(timestamp);
-  return Number.isNaN(time) ? timestamp : new Date(time).toISOString().slice(0, 10);
 }
 
 /** The stored version when it is newer than this batch, in ClickHouse's own rendering. */
