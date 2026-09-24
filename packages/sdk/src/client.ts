@@ -104,9 +104,11 @@ export function init(options: IronsideClientOptions): IronsideClient {
 
   function enqueueScore(
     traceId: string,
-    observationId: string | undefined,
+    handleObservationId: string | undefined,
     scoreOptions: ScoreOptions
   ): void {
+    // An explicit observationId wins, so trace.score() can target an observation too.
+    const observationId = scoreOptions.observationId ?? handleObservationId;
     batcher.enqueue({
       type: "score-upsert",
       body: {

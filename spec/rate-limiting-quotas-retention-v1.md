@@ -21,7 +21,7 @@ These machine write routes share one project budget:
 | `POST /api/v1/evaluator/scores` | `scores:write` |
 | `POST /api/v1/media` | `media:write` |
 
-- **Limit:** `projects.rate_limit_per_minute`, or `DEFAULT_RATE_LIMIT_PER_MINUTE` (default 300) when the project has no override. The window is 60 seconds.
+- **Limit:** `projects.rate_limit_per_minute`, or `DEFAULT_RATE_LIMIT_PER_MINUTE` (default 300) when the project has no override. The API refuses to start when `DEFAULT_RATE_LIMIT_PER_MINUTE` is not a positive integer. The window is 60 seconds.
 - **Counting:** Redis key `ratelimit:{projectId}:{window}`, where `window` is the Unix time in seconds divided by 60, rounded down. Each request `INCR`s the key; the request that creates it sets `EXPIRE 60`, so later requests cannot push the expiry out. Every authenticated request on these routes counts, including ones that are then rejected.
 - **Rejection:** past the limit the API returns `429` with `{"error": "rate limit exceeded: <limit> requests per 60s per project"}` and `Retry-After` set to the seconds left in the current window.
 - **Boundary:** a fixed window allows up to twice the limit across a window boundary. That is acceptable because the limiter exists to stop a runaway client, not to meter usage.

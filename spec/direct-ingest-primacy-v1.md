@@ -28,7 +28,7 @@ Cost derivation is described in `spec/cost-pricing-v1.md` and usage keys in `spe
 
 ### Scores
 
-`trace.score(options)` and `observation.score(options)` enqueue a `score-upsert` for that trace or that observation (`packages/sdk/src/client.ts`).
+`trace.score(options)` and `observation.score(options)` enqueue a `score-upsert` for that trace or that observation (`packages/sdk/src/client.ts`). An `observationId` in the options attaches the score to that observation instead, including from `trace.score()`.
 
 - `ScoreOptions` (`packages/sdk/src/types.ts`) is a discriminated union that requires exactly one of `value` (a number) and `stringValue` (a string), so a score with neither or both fails to type-check. The type is the only place to catch it: the worker rejects a score with neither as a dead letter (`spec/dead-letters-v1.md`), and the SDK's background delivery never reports per-event rejections to the caller.
 - `dataType` is `numeric` when `value` is set and `categorical` otherwise. A `value` of 0 is sent as data.

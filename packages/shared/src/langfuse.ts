@@ -106,6 +106,8 @@ export const langfuseObservationBodySchema = z.object({
   name: opt(z.string()),
   startTime: opt(z.string()),
   endTime: opt(z.string()),
+  /** First-token time of a streamed generation. */
+  completionStartTime: opt(z.string()),
   metadata: z.unknown().optional(),
   input: z.unknown().optional(),
   output: z.unknown().optional(),

@@ -314,6 +314,19 @@ describe("Ironside SDK client", () => {
     expect(body.timestamp).toBeTruthy();
   });
 
+  it("trace.score() attaches the score to the observation its options name", async () => {
+    const { fetchImpl, requests } = mockFetch();
+    const client = init({ apiKey: "k", host: "http://localhost:8788", fetchImpl });
+    clients.push(client);
+
+    const trace = client.trace({ name: "checkout" });
+    trace.score({ name: "grounded", value: 1, observationId: "obs_retrieval" });
+    await client.flush();
+
+    const scoreEvent = requests.flatMap((r) => r.body.events).find((e) => e.type === "score-upsert");
+    expect(scoreEvent?.body).toMatchObject({ traceId: trace.id, observationId: "obs_retrieval" });
+  });
+
   it("observation.score() sends a score-upsert scoped to that observation, defaulting dataType to categorical when stringValue is used", async () => {
     const { fetchImpl, requests } = mockFetch();
     const client = init({ apiKey: "k", host: "http://localhost:8788", fetchImpl });
