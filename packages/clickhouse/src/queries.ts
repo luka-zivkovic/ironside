@@ -1,5 +1,6 @@
 import type { ClickHouseClient } from "@clickhouse/client";
 import { fromClickHouseDateTime, toClickHouseDateTime } from "./datetime.js";
+import { chunkByParamBytes } from "./params.js";
 
 export interface TraceFilter {
   projectId: string;
@@ -715,7 +716,18 @@ export async function listTracesByIds(
   projectId: string,
   traceIds: string[]
 ): Promise<StoredTraceRow[]> {
-  if (traceIds.length === 0) return [];
+  const rows: StoredTraceRow[] = [];
+  for (const chunk of chunkByParamBytes([...new Set(traceIds)], [(traceId) => traceId])) {
+    rows.push(...(await listTracesByIdChunk(client, projectId, chunk)));
+  }
+  return rows;
+}
+
+async function listTracesByIdChunk(
+  client: ClickHouseClient,
+  projectId: string,
+  traceIds: string[]
+): Promise<StoredTraceRow[]> {
   const result = await client.query({
     query: `
       select id, timestamp, name, user_id, session_id, environment, release, version,
@@ -725,7 +737,7 @@ export async function listTracesByIds(
       order by id, event_ts desc
       limit 1 by id
     `,
-    query_params: { projectId, traceIds: [...new Set(traceIds)] },
+    query_params: { projectId, traceIds },
     clickhouse_settings: SKIP_INDEXES_WITH_FINAL,
     format: "JSONEachRow"
   });
@@ -743,7 +755,17 @@ export async function listObservationsByIds(
   projectId: string,
   observations: { id: string; traceId: string }[]
 ): Promise<StoredObservationRow[]> {
-  if (observations.length === 0) return [];
+  const rows: StoredObservationRow[] = [];
+  const chunks = chunkByParamBytes(observations, [(row) => row.traceId, (row) => row.id]);
+  for (const chunk of chunks) rows.push(...(await listObservationsByIdChunk(client, projectId, chunk)));
+  return rows;
+}
+
+async function listObservationsByIdChunk(
+  client: ClickHouseClient,
+  projectId: string,
+  observations: { id: string; traceId: string }[]
+): Promise<StoredObservationRow[]> {
   const result = await client.query({
     // Same Map value casts as listObservationsForTrace.
     query: `
@@ -807,8 +829,45 @@ export async function listStoredRowKeys(
     scores: { traceId: string; id: string }[];
   }
 ): Promise<StoredRowKey[]> {
+  type Entry = { kind: StoredRowKey["kind"]; traceId: string; id: string };
+  const entries: Entry[] = [
+    ...records.traceIds.map((id) => ({ kind: "trace" as const, traceId: "", id })),
+    ...records.observations.map((row) => ({ kind: "observation" as const, ...row })),
+    ...records.scores.map((row) => ({ kind: "score" as const, ...row }))
+  ];
+  const of = (kind: Entry["kind"], field: "traceId" | "id") => (entry: Entry) =>
+    entry.kind === kind ? entry[field] : "";
+  const chunks = chunkByParamBytes(entries, [
+    of("trace", "id"),
+    of("observation", "traceId"),
+    of("observation", "id"),
+    of("score", "traceId"),
+    of("score", "id")
+  ]);
+  const rows: StoredRowKey[] = [];
+  for (const chunk of chunks) {
+    const byKind = (kind: Entry["kind"]) => chunk.filter((entry) => entry.kind === kind);
+    rows.push(
+      ...(await listStoredRowKeyChunk(client, projectId, {
+        traceIds: byKind("trace").map((entry) => entry.id),
+        observations: byKind("observation"),
+        scores: byKind("score")
+      }))
+    );
+  }
+  return rows;
+}
+
+async function listStoredRowKeyChunk(
+  client: ClickHouseClient,
+  projectId: string,
+  records: {
+    traceIds: string[];
+    observations: { traceId: string; id: string }[];
+    scores: { traceId: string; id: string }[];
+  }
+): Promise<StoredRowKey[]> {
   const { traceIds, observations, scores } = records;
-  if (traceIds.length === 0 && observations.length === 0 && scores.length === 0) return [];
   const unique = (values: string[]) => [...new Set(values)];
   const result = await client.query({
     query: `

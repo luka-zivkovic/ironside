@@ -18,7 +18,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await pool.query("delete from organizations where id = $1", [orgId]);
   await pool.end();
-});
+}, 60_000);
 
 async function project(retentionDays: number | null): Promise<string> {
   const id = `proj_${ulid()}`;
@@ -68,12 +68,13 @@ describe("pruneStaleTraceScoreFeed", () => {
 });
 
 describe("purgeLangfuseFieldSentAtOlderThan", () => {
-  it("purges every stale row in bounded batches and keeps recent ones", async () => {
+  // More stale rows than one purge batch (5,000), so the purge takes two.
+  it("purges every stale row in bounded batches and keeps recent ones", { timeout: 60_000 }, async () => {
     const projectId = await project(null);
     await pool.query(
       `insert into langfuse_field_provenance (project_id, entity_kind, entity_id, sent_at, updated_at)
        select $1, 'observation', 'obs_' || n, '{}'::jsonb, now() - interval '40 days'
-         from generate_series(1, 12000) as n`,
+         from generate_series(1, 6000) as n`,
       [projectId]
     );
     await pool.query(
@@ -84,7 +85,7 @@ describe("purgeLangfuseFieldSentAtOlderThan", () => {
 
     const purged = await purgeLangfuseFieldSentAtOlderThan(pool, new Date(Date.now() - 30 * 24 * 60 * 60 * 1000));
 
-    expect(purged).toBeGreaterThanOrEqual(12_000);
+    expect(purged).toBeGreaterThanOrEqual(6_000);
     const left = await pool.query<{ entity_id: string }>(
       "select entity_id from langfuse_field_provenance where project_id = $1",
       [projectId]

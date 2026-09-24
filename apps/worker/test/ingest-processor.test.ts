@@ -4,11 +4,14 @@ import {
   getTraceRawIndex,
   getVersionedTrace,
   hasPendingTraceRawRefs,
+  insertObservations,
   insertRawEventRefs,
+  insertScores,
   insertTraces,
   listObservationsForTrace,
   runMigrations as runChMigrations
 } from "@ironside/clickhouse";
+import { mapNativeEvents } from "@ironside/mappers";
 import {
   claimEvaluatorScoreReceipt,
   claimRawRetentionIntentExecution,
@@ -959,6 +962,16 @@ describe("a record written again with a timestamp on another day", () => {
     await job.remove();
   }
 
+  /** Writes observations and scores directly, as a race between batches could have left them. */
+  async function observationsAndScores(
+    events: { type: "observation-upsert" | "score-upsert"; body: Record<string, unknown> }[],
+    eventTs: string
+  ): Promise<void> {
+    const { rows } = mapNativeEvents(projectId, nativeBatch(eventTs, events).events);
+    await insertObservations(clickhouse, rows.observations, { eventTs });
+    await insertScores(clickhouse, rows.scores, { eventTs });
+  }
+
   async function liveRows(table: "traces" | "observations" | "scores", id: string, column: string): Promise<string[]> {
     const result = await clickhouse.query({
       query: `select toString(${column}) as at from ${table} final where project_id = {projectId:String} and id = {id:String}`,
@@ -1003,6 +1016,121 @@ describe("a record written again with a timestamp on another day", () => {
     expect(await liveRows("scores", scoreId, "timestamp")).toEqual([noon(2).slice(0, 10)]);
 
     await run(nativeBatch(noon(1), [{ type: "score-upsert", body: { ...score, value: 0 } }]));
+    expect(await liveRows("scores", scoreId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
+  });
+
+  it("keeps a record's last row when one batch writes it on two days, also when the batch is retried", async () => {
+    const traceId = `trace_${ulid()}`;
+    const scoreId = `score_${ulid()}`;
+    const score = { id: scoreId, traceId, name: "helpful", dataType: "numeric", source: "api", metadata: {} };
+    const batch = nativeBatch(noon(1), [
+      { type: "trace-upsert", body: { id: traceId, timestamp: noon(2), name: "first" } },
+      { type: "trace-upsert", body: { id: traceId, timestamp: noon(1), name: "last" } },
+      { type: "score-upsert", body: { ...score, value: 0, timestamp: noon(2) } },
+      { type: "score-upsert", body: { ...score, value: 1, timestamp: noon(1) } }
+    ]);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await run(batch);
+      expect(await liveRows("traces", traceId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
+      expect((await getTrace(clickhouse, projectId, traceId))?.name).toBe("last");
+      expect(await liveRows("scores", scoreId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
+    }
+  });
+
+  it("keeps the batch's last row when it moves a stored record away and back", async () => {
+    const traceId = `trace_${ulid()}`;
+    await run(nativeBatch(noon(3), [{ type: "trace-upsert", body: { id: traceId, timestamp: noon(3), name: "stored" } }]));
+    await run(
+      nativeBatch(noon(1), [
+        { type: "trace-upsert", body: { id: traceId, timestamp: noon(2), name: "moved" } },
+        { type: "trace-upsert", body: { id: traceId, timestamp: noon(3), name: "moved back" } }
+      ])
+    );
+    expect(await liveRows("traces", traceId, "timestamp")).toEqual([noon(3).slice(0, 10)]);
+    expect((await getTrace(clickhouse, projectId, traceId))?.name).toBe("moved back");
+  });
+
+  it("leaves out stale observations and scores too, and still removes stored rows older than the batch", async () => {
+    const traceId = `trace_${ulid()}`;
+    const observationId = `obs_${ulid()}`;
+    const scoreId = `score_${ulid()}`;
+    const events = (day: number, name: string) => [
+      { type: "observation-upsert" as const, body: { id: observationId, traceId, type: "span", name, startTime: noon(day) } },
+      { type: "score-upsert" as const, body: { id: scoreId, traceId, name, dataType: "numeric", value: 1, source: "api", metadata: {}, timestamp: noon(day) } }
+    ];
+    // An older duplicate on day 3 and the newest row on day 1, as a race could leave them.
+    await observationsAndScores(events(3, "old"), noon(3));
+    await observationsAndScores(events(1, "newest"), noon(1));
+    // Received on day 2 with rows on day 3: stale, but newer than the old duplicate.
+    await run(nativeBatch(noon(2), events(3, "stale")));
+
+    expect(await liveRows("observations", observationId, "start_time")).toEqual([noon(1).slice(0, 10)]);
+    expect(await liveRows("scores", scoreId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
+  });
+
+  it("lets the later-processed batch win when two batches with the same receive time write different days", async () => {
+    const traceId = `trace_${ulid()}`;
+    await run(nativeBatch(noon(1), [{ type: "trace-upsert", body: { id: traceId, timestamp: noon(2), name: "first" } }]));
+    await run(nativeBatch(noon(1), [{ type: "trace-upsert", body: { id: traceId, timestamp: noon(1), name: "second" } }]));
+    expect(await liveRows("traces", traceId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
+    expect((await getTrace(clickhouse, projectId, traceId))?.name).toBe("second");
+  });
+
+  it("applies to OTLP spans and LangFuse-compatible scores", async () => {
+    const traceHex = ulid().toLowerCase().padEnd(32, "0").slice(0, 32).replace(/[^0-9a-f]/g, "a");
+    const spanHex = traceHex.slice(0, 16);
+    const nanos = (iso: string) => `${BigInt(Date.parse(iso)) * 1_000_000n}`;
+    const otlp = (day: number): IngestBatch => ({
+      ...nativeBatch(noon(day), []),
+      events: [
+        {
+          id: ulid(),
+          type: "otlp-export",
+          source: "otlp",
+          schemaVersion: INGEST_SCHEMA_VERSION,
+          idempotencyKey: ulid(),
+          body: {
+            resourceSpans: [
+              {
+                resource: { attributes: [] },
+                scopeSpans: [
+                  {
+                    spans: [
+                      { traceId: traceHex, spanId: spanHex, name: "root", startTimeUnixNano: nanos(noon(day)), endTimeUnixNano: nanos(noon(day)) }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    });
+    await run(otlp(2));
+    await run(otlp(1));
+    expect(await liveRows("traces", traceHex, "timestamp")).toEqual([noon(1).slice(0, 10)]);
+    expect(await liveRows("observations", spanHex, "start_time")).toEqual([noon(1).slice(0, 10)]);
+
+    const scoreId = `score_${ulid()}`;
+    const langfuseScore = (day: number): IngestBatch => ({
+      ...nativeBatch(noon(day), []),
+      events: [
+        {
+          id: ulid(),
+          type: "langfuse-ingestion",
+          source: "langfuse",
+          schemaVersion: INGEST_SCHEMA_VERSION,
+          idempotencyKey: ulid(),
+          body: {
+            batch: [
+              { id: ulid(), timestamp: noon(day), type: "score-create", body: { id: scoreId, traceId: traceHex, name: "verdict", value: 1 } }
+            ]
+          }
+        }
+      ]
+    });
+    await run(langfuseScore(2));
+    await run(langfuseScore(1));
     expect(await liveRows("scores", scoreId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
   });
 

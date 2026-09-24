@@ -278,17 +278,20 @@ export function createIngestProcessor(deps: IngestProcessorDeps) {
         const insertOptions = { eventTs: batch.receivedAt };
         const traceOptions = { ...insertOptions, rowEventTs: merged.rowEventTs.traces };
         const observationOptions = { ...insertOptions, rowEventTs: merged.rowEventTs.observations };
+        // Rows a record left under another day are deleted first, with the
+        // version of the row that replaces them (moved-rows.ts,
+        // langfuse-merge.ts). They never share a key with a row written below.
         await Promise.all([
-          insertTraces(deps.clickhouse, traces, traceOptions),
-          insertObservations(deps.clickhouse, observations, observationOptions),
-          insertScores(deps.clickhouse, scores, insertOptions),
-          // A merge that moved a record to another day leaves its old row
-          // under the old sort key; delete it with the moved row's version.
           deleteMovedTraceRows(deps.clickhouse, merged.moved.traces, traceOptions),
           deleteMovedObservationRows(deps.clickhouse, merged.moved.observations, observationOptions),
           deleteMovedTraceRows(deps.clickhouse, resolved.deletions.traces, insertOptions),
           deleteMovedObservationRows(deps.clickhouse, resolved.deletions.observations, insertOptions),
           deleteMovedScoreRows(deps.clickhouse, resolved.deletions.scores, insertOptions)
+        ]);
+        await Promise.all([
+          insertTraces(deps.clickhouse, traces, traceOptions),
+          insertObservations(deps.clickhouse, observations, observationOptions),
+          insertScores(deps.clickhouse, scores, insertOptions)
         ]);
         // Evaluator score receipts suppress later HTTP retries only after the
         // durable ingest intent exists. Record the second commit point once its

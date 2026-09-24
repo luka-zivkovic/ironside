@@ -10,7 +10,8 @@ import {
   markWebhookCovered,
   markWebhookDelivered,
   markWebhookFailed,
-  recordWebhookRun
+  recordWebhookRun,
+  updateWebhookRule
 } from "../src/webhooks.js";
 
 const pool = new Pool({
@@ -214,6 +215,10 @@ describe("recordWebhookRun", () => {
     });
     expect(rule.feedCursor).toBeNull();
     expect(rule.lastRunAt).toBeNull();
+    // Disabled, so scheduler tests claiming due rules across the shared
+    // database cannot move next_run_at under this test; due in a day.
+    await updateWebhookRule(pool, projectId, rule.id, { enabled: false });
+    await pool.query("update webhook_rules set next_run_at = now() + interval '1 day' where id = $1", [rule.id]);
     const first = { publishedAt: "2026-09-24T10:00:00.000001Z", traceId: "trace_a" };
     const second = { publishedAt: "2026-09-24T10:00:00.000002Z", traceId: "trace_b" };
 
@@ -230,7 +235,8 @@ describe("recordWebhookRun", () => {
       lastRunError: null,
       lastRunDeliveredCount: 2
     });
-    expect(afterFirst.nextRunAt.getTime()).toBeLessThanOrEqual(Date.now());
+    // runAgainSoon makes it due now; the margin allows for clock skew between Postgres and this host.
+    expect(afterFirst.nextRunAt.getTime()).toBeLessThan(Date.now() + 60_000);
 
     // A run that started from the old position (claimed twice) records its outcome but not its position.
     await recordWebhookRun(pool, rule.id, {
