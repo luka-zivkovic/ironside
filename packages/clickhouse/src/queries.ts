@@ -12,6 +12,20 @@ export interface TraceFilter {
   metadataKey?: string;
   metadataValue?: string;
   /**
+   * Case-insensitive substring of the trace's name, input or output, or of
+   * any of its observations' names, inputs or outputs; or an exact trace id.
+   * Inputs and outputs are matched as their stored JSON text.
+   */
+  search?: string;
+  /** Traces with at least one observation at this level. */
+  level?: string;
+  /** Traces with at least one observation of this model. */
+  model?: string;
+  /** Traces whose duration (see TRACE_DURATION_MS) is at least this long. */
+  minDurationMs?: number;
+  /** Traces whose total cost (see OBSERVATION_COST) is at least this, in USD. */
+  minCost?: number;
+  /**
    * Only include traces whose latest ingest activity is at or before this
    * instant. Activity includes trace and observation writes. Scores are
    * downstream annotations and deliberately do not reopen a trace. This is
@@ -53,6 +67,52 @@ function traceActivityQuery(traceIdParam?: string, traceIdsParam?: string): stri
   `;
 }
 
+/**
+ * One observation's cost in USD: its `total` component when it reports one
+ * (derived and LangFuse costs always do), otherwise the sum of its components.
+ */
+const OBSERVATION_COST = `if(mapContains(cost_details, 'total'),
+  toFloat64(cost_details['total']),
+  toFloat64(arraySum(mapValues(cost_details))))`;
+
+/**
+ * One observation's token count in the canonical usage vocabulary
+ * (spec/usage-keys-v1.md): `total_tokens` when reported, otherwise input plus
+ * output. Other keys, such as cache reads, can overlap those two and are left
+ * out rather than double counted.
+ */
+const OBSERVATION_TOKENS = `if(mapContains(usage_details, 'total_tokens'),
+  usage_details['total_tokens'],
+  usage_details['input_tokens'] + usage_details['output_tokens'])`;
+const OBSERVATION_HAS_TOKENS = `(mapContains(usage_details, 'total_tokens')
+  or mapContains(usage_details, 'input_tokens')
+  or mapContains(usage_details, 'output_tokens'))`;
+
+/**
+ * A trace's duration in milliseconds, aggregated over its observations: first
+ * start to last end. Null when no observation has ended, the same rule as
+ * getAggregates' latency percentiles.
+ */
+const TRACE_DURATION_MS = "dateDiff('millisecond', min(start_time), max(end_time))";
+
+/** Trace ids with an observation matching `condition` in the filtered project. */
+function tracesWithObservations(condition: string): string {
+  return `id in (
+    select trace_id from observations final
+    where project_id = {projectId:String} and ${condition}
+  )`;
+}
+
+/** Trace ids whose observations, grouped per trace, satisfy `having`. */
+function tracesWhereObservations(having: string): string {
+  return `id in (
+    select trace_id from observations final
+    where project_id = {projectId:String}
+    group by trace_id
+    having ${having}
+  )`;
+}
+
 /** Shared by listTraces and getAggregates — same filter surface, different projection. */
 function buildTraceConditions(
   filter: TraceFilter,
@@ -92,6 +152,33 @@ function buildTraceConditions(
     conditions.push("metadata[{metadataKey:String}] = {metadataValue:String}");
     params.metadataKey = filter.metadataKey;
     params.metadataValue = filter.metadataValue;
+  }
+  // The observation filters below scan the project's observations, which are
+  // partitioned by their own start time rather than the trace's timestamp.
+  if (filter.search) {
+    const matches = (column: string) => `positionCaseInsensitiveUTF8(${column}, {search:String}) > 0`;
+    conditions.push(`(
+      id = {search:String}
+      or ${matches("name")} or ${matches("input")} or ${matches("output")}
+      or ${tracesWithObservations(`(${matches("name")} or ${matches("input")} or ${matches("output")})`)}
+    )`);
+    params.search = filter.search;
+  }
+  if (filter.level) {
+    conditions.push(tracesWithObservations("level = {level:String}"));
+    params.level = filter.level;
+  }
+  if (filter.model) {
+    conditions.push(tracesWithObservations("model = {model:String}"));
+    params.model = filter.model;
+  }
+  if (filter.minDurationMs !== undefined) {
+    conditions.push(tracesWhereObservations(`${TRACE_DURATION_MS} >= {minDurationMs:Int64}`));
+    params.minDurationMs = filter.minDurationMs;
+  }
+  if (filter.minCost !== undefined) {
+    conditions.push(tracesWhereObservations(`sum(${OBSERVATION_COST}) >= {minCost:Float64}`));
+    params.minCost = filter.minCost;
   }
 
   if (filter.settledBefore && options.includeSettledCondition !== false) {
@@ -226,6 +313,60 @@ export async function listTraces(
   // boundary — see fromClickHouseDateTime's docstring for why this matters
   // beyond just API response shape (cursor correctness depends on it too).
   return rows.map((row) => ({ ...row, timestamp: fromClickHouseDateTime(row.timestamp) }));
+}
+
+/**
+ * ClickHouse ignores skip indexes under FINAL by default. Enabling them is
+ * safe for these lookups because they filter only on id and trace_id, which
+ * every version of a row shares, so no newer version can be skipped while an
+ * older one is kept.
+ */
+const SKIP_INDEXES_WITH_FINAL = { use_skip_indexes_if_final: 1 } as const;
+
+export interface TraceMetricsRow {
+  trace_id: string;
+  /** Null when no observation has ended. */
+  duration_ms: number | null;
+  /** Null when no observation reports a cost. */
+  total_cost: number | null;
+  /** Null when no observation reports input, output or total tokens. */
+  total_tokens: number | null;
+  error_count: number;
+  models: string[];
+}
+
+/**
+ * Per-trace figures for one page of the trace list, computed from each
+ * trace's observations with the same rules the list filters use. A trace
+ * with no observations has no row.
+ */
+export async function listTraceMetrics(
+  client: ClickHouseClient,
+  projectId: string,
+  traceIds: string[]
+): Promise<Map<string, TraceMetricsRow>> {
+  if (traceIds.length === 0) return new Map();
+  const result = await client.query({
+    // 64-bit integers serialize as JSON strings; the display figures are cast
+    // to Float64 so they arrive as numbers, like getAggregates' sums.
+    query: `
+      select
+        trace_id,
+        toFloat64(${TRACE_DURATION_MS}) as duration_ms,
+        if(countIf(notEmpty(cost_details)) = 0, null, sum(${OBSERVATION_COST})) as total_cost,
+        if(countIf(${OBSERVATION_HAS_TOKENS}) = 0, null, toFloat64(sum(${OBSERVATION_TOKENS}))) as total_tokens,
+        toUInt32(countIf(level = 'error')) as error_count,
+        arraySort(groupUniqArrayIf(assumeNotNull(model), model is not null)) as models
+      from observations final
+      where project_id = {projectId:String} and trace_id in {traceIds:Array(String)}
+      group by trace_id
+    `,
+    query_params: { projectId, traceIds: [...new Set(traceIds)] },
+    clickhouse_settings: SKIP_INDEXES_WITH_FINAL,
+    format: "JSONEachRow"
+  });
+  const rows = await result.json<TraceMetricsRow>();
+  return new Map(rows.map((row) => [row.trace_id, row]));
 }
 
 export interface ExportTraceRow {
@@ -620,14 +761,6 @@ export async function listObservationsForTrace(
       : null
   }));
 }
-
-/**
- * ClickHouse ignores skip indexes under FINAL by default. Enabling them is
- * safe for these lookups because they filter only on id and trace_id, which
- * every version of a row shares, so no newer version can be skipped while an
- * older one is kept.
- */
-const SKIP_INDEXES_WITH_FINAL = { use_skip_indexes_if_final: 1 } as const;
 
 /** A stored row with its exact ReplacingMergeTree version, as ClickHouse renders DateTime64(6). */
 export type StoredTraceRow = TraceDetailRow & { event_ts: string };

@@ -1,8 +1,17 @@
 import { z } from "zod";
+import { observationLevelSchema } from "./domain.js";
 import { ingestEventSchema } from "./envelope.js";
 import { environmentNameSchema } from "./environment.js";
 
 // Contract for the project-explicit native trace list/filter and related query endpoints.
+
+/** A numeric query parameter; an empty value means the filter is not set rather than 0. */
+function optionalQueryNumber(schema: z.ZodNumber) {
+  return z.preprocess(
+    (value) => (value === "" ? undefined : typeof value === "string" ? Number(value) : value),
+    schema.optional()
+  );
+}
 
 export const listTracesQuerySchema = z.object({
   from: z.iso.datetime({ offset: true }).optional(),
@@ -14,6 +23,19 @@ export const listTracesQuerySchema = z.object({
   /** Matches traces whose metadata has this exact key/value pair. */
   metadataKey: z.string().optional(),
   metadataValue: z.string().optional(),
+  /**
+   * Case-insensitive text in the trace's or any observation's name, input or
+   * output (inputs and outputs as their stored JSON text), or an exact trace id.
+   */
+  search: z.string().trim().max(200).optional(),
+  /** Traces with at least one observation at this level, e.g. `error`. */
+  level: observationLevelSchema.optional(),
+  /** Traces with at least one observation of this exact model. */
+  model: z.string().max(200).optional(),
+  /** Traces lasting at least this long: first observation start to last observation end. */
+  minDurationMs: optionalQueryNumber(z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)),
+  /** Traces costing at least this much in USD, summed over their observations' costs. */
+  minCost: optionalQueryNumber(z.number().nonnegative().max(1e12)),
   limit: z.coerce.number().int().min(1).max(100).default(20),
   /** Opaque keyset cursor from the previous page's `nextCursor`. */
   cursor: z.string().optional()
@@ -28,7 +50,17 @@ export const traceSummarySchema = z.object({
   sessionId: z.string().nullable(),
   environment: z.string().nullable(),
   tags: z.array(z.string()),
-  metadata: z.record(z.string(), z.string())
+  metadata: z.record(z.string(), z.string()),
+  /** First observation start to last observation end; null until an observation has ended. */
+  durationMs: z.number().nullable(),
+  /** USD: each observation's `total` cost, or the sum of its cost components; null when none reports a cost. */
+  totalCost: z.number().nullable(),
+  /** Each observation's `total_tokens`, or input plus output tokens; null when none reports them. */
+  totalTokens: z.number().nullable(),
+  /** Observations at level `error`. */
+  errorCount: z.number().int().nonnegative(),
+  /** Distinct models of the trace's observations, sorted. */
+  models: z.array(z.string())
 });
 export type TraceSummary = z.infer<typeof traceSummarySchema>;
 

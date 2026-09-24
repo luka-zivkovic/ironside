@@ -2,16 +2,29 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { ArrowRight, RefreshCcw, Search } from "lucide-react";
 import type { AggregatesResponse, TraceSummary } from "@ironside/shared/browser";
-import { ApiError, fetchAggregates, fetchTraces, getApiBaseUrl, type ListTracesParams } from "@/lib/api";
+import { ApiError, fetchAggregates, fetchTraces, getApiBaseUrl } from "@/lib/api";
 import { buildNativeIngestCurl } from "@/lib/connection-snippets";
 import {
   TIME_RANGE_OPTIONS,
+  formatCompactNumber,
+  formatLatency,
+  formatTraceCost,
   parseTimeRange,
-  rangeFrom,
   summaryTiles,
   type SummaryTile,
   type TimeRange
 } from "@/lib/trace-analytics";
+import {
+  LEVEL_OPTIONS,
+  clearLocalFilters,
+  filtersFromSearchParams,
+  hasFilters,
+  parseFloor,
+  searchParamsFromFilters,
+  toParams,
+  type Filters,
+  type LevelFilter
+} from "@/lib/trace-filters";
 import { useActiveProject } from "@/lib/projects";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -20,15 +33,6 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { PageHeader } from "@/components/page-header";
 import { cn, formatTimestamp } from "@/lib/utils";
 
-interface Filters {
-  userId: string;
-  sessionId: string;
-  tags: string;
-  environment: string;
-  range: TimeRange;
-}
-
-const EMPTY_FILTERS: Filters = { userId: "", sessionId: "", tags: "", environment: "", range: "" };
 const EMPTY_STATE_REFRESH_INTERVAL_MS = 3_000;
 const EMPTY_STATE_MAX_AUTO_REFRESHES = 40;
 
@@ -48,31 +52,8 @@ function firstTraceCurl(): string {
   return buildNativeIngestCurl(getApiBaseUrl(), payload);
 }
 
-function hasFilters(filters: Filters): boolean {
-  return Boolean(
-    filters.userId.trim() ||
-      filters.sessionId.trim() ||
-      filters.tags.trim() ||
-      filters.environment.trim()
-  );
-}
-
-function toParams(filters: Filters, cursor: string | null): ListTracesParams {
-  const tags = filters.tags
-    .split(",")
-    .map((t) => t.trim())
-    .filter(Boolean);
-  const from = rangeFrom(filters.range);
-  return {
-    limit: 30,
-    ...(from !== undefined && { from }),
-    ...(filters.userId.trim() && { userId: filters.userId.trim() }),
-    ...(filters.sessionId.trim() && { sessionId: filters.sessionId.trim() }),
-    ...(filters.environment.trim() && { environment: filters.environment.trim() }),
-    ...(tags.length > 0 && { tags }),
-    ...(cursor && { cursor })
-  };
-}
+const SELECT_CLASS =
+  "h-8 w-full rounded-sm border border-rule bg-card px-2 text-[12.5px] text-ink outline-none focus-visible:border-signal sm:w-[150px]";
 
 export function TracesScreen() {
   const { project } = useActiveProject();
@@ -95,6 +76,11 @@ export function TracesScreen() {
 
   const showFirstTraceOnboarding =
     traces?.length === 0 && !hasFilters(filters) && currentCursor === null;
+  const localFiltersActive = hasFilters({ ...filters, environment: "" });
+  const pageModels = useMemo(
+    () => [...new Set((traces ?? []).flatMap((trace) => trace.models))].sort(),
+    [traces]
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -155,8 +141,14 @@ export function TracesScreen() {
     return () => window.clearTimeout(timeout);
   }, [loading, showFirstTraceOnboarding, autoRefreshCount]);
 
-  function applyFilters() {
-    setSearchParams(searchParamsFromFilters(pendingFilters));
+  function applyFilters(changes: Partial<Filters> = {}) {
+    setSearchParams(searchParamsFromFilters({ ...pendingFilters, ...changes }));
+  }
+
+  function clearFilters() {
+    const cleared = clearLocalFilters(filters);
+    setPendingFilters(cleared);
+    setSearchParams(searchParamsFromFilters(cleared));
   }
 
   function goNext() {
@@ -197,75 +189,126 @@ export function TracesScreen() {
       <Card>
         <CardHeader className="flex-col items-start gap-1 border-b border-rule-soft pb-3">
           <CardTitle>Narrow the record</CardTitle>
-          <CardDescription>Filter by the identifiers attached at ingest.</CardDescription>
+          <CardDescription>
+            Search what traces and their steps said, or filter by what was attached and measured at ingest.
+          </CardDescription>
         </CardHeader>
-        <CardContent className="flex flex-wrap items-end gap-3 pt-4">
-          <Field label="Time range">
-            <select
-              value={filters.range}
-              onChange={(e) =>
-                setSearchParams(searchParamsFromFilters({ ...filters, range: parseTimeRange(e.target.value) }))
-              }
-              className="h-8 w-full rounded-sm border border-rule bg-card px-2 text-[12.5px] text-ink outline-none focus-visible:border-signal sm:w-[150px]"
-              aria-label="Time range"
-            >
-              {TIME_RANGE_OPTIONS.map((option) => (
-                <option key={option.value || "all"} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </Field>
-          <Field label="User ID">
-            <Input
-              value={pendingFilters.userId}
-              onChange={(e) => setPendingFilters((f) => ({ ...f, userId: e.target.value }))}
-              placeholder="user_123"
-              className="w-full sm:w-[180px]"
-            />
-          </Field>
-          <Field label="Session ID">
-            <Input
-              value={pendingFilters.sessionId}
-              onChange={(e) => setPendingFilters((f) => ({ ...f, sessionId: e.target.value }))}
-              placeholder="session_abc"
-              className="w-full sm:w-[180px]"
-            />
-          </Field>
-          <Field label="Tags (comma-separated)">
-            <Input
-              value={pendingFilters.tags}
-              onChange={(e) => setPendingFilters((f) => ({ ...f, tags: e.target.value }))}
-              placeholder="prod, checkout"
-              className="w-full sm:w-[220px]"
-            />
-          </Field>
-          <Button variant="primary" size="sm" onClick={applyFilters}>
-            <Search />
-            Apply filters
-          </Button>
-          {filters.userId || filters.sessionId || filters.tags ? (
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => {
-                setPendingFilters({
-                  ...EMPTY_FILTERS,
-                  environment: filters.environment,
-                  range: filters.range
-                });
-                setSearchParams(
-                  searchParamsFromFilters({
-                    ...EMPTY_FILTERS,
-                    environment: filters.environment,
-                    range: filters.range
-                  })
-                );
-              }}
-            >
-              Clear
-            </Button>
-          ) : null}
+        <CardContent className="pt-4">
+          <form
+            className="flex flex-col gap-3"
+            onSubmit={(event) => {
+              event.preventDefault();
+              applyFilters();
+            }}
+          >
+            <Field label="Search">
+              <div className="relative">
+                <Search
+                  className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-ink-4"
+                  aria-hidden
+                />
+                <Input
+                  type="search"
+                  value={pendingFilters.search}
+                  onChange={(e) => setPendingFilters((f) => ({ ...f, search: e.target.value }))}
+                  placeholder="Text in a name, input or output, or an exact trace ID"
+                  maxLength={200}
+                  className="pl-8"
+                />
+              </div>
+            </Field>
+            <div className="flex flex-wrap items-end gap-3">
+              <Field label="Time range">
+                <select
+                  value={filters.range}
+                  onChange={(e) => applyFilters({ range: parseTimeRange(e.target.value) })}
+                  className={SELECT_CLASS}
+                  aria-label="Time range"
+                >
+                  {TIME_RANGE_OPTIONS.map((option) => (
+                    <option key={option.value || "all"} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="Level">
+                <select
+                  value={filters.level}
+                  onChange={(e) => applyFilters({ level: e.target.value as LevelFilter })}
+                  className={SELECT_CLASS}
+                  aria-label="Level"
+                >
+                  {LEVEL_OPTIONS.map((option) => (
+                    <option key={option.value || "any"} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="Model">
+                <Input
+                  value={pendingFilters.model}
+                  onChange={(e) => setPendingFilters((f) => ({ ...f, model: e.target.value }))}
+                  placeholder="gpt-4o"
+                  list="trace-models"
+                  className="w-full sm:w-[160px]"
+                />
+                <datalist id="trace-models">
+                  {pageModels.map((model) => (
+                    <option key={model} value={model} />
+                  ))}
+                </datalist>
+              </Field>
+              <Field label="Min latency (s)">
+                <FloorInput
+                  value={pendingFilters.minLatencySeconds}
+                  onChange={(value) => setPendingFilters((f) => ({ ...f, minLatencySeconds: value }))}
+                  placeholder="2"
+                />
+              </Field>
+              <Field label="Min cost ($)">
+                <FloorInput
+                  value={pendingFilters.minCost}
+                  onChange={(value) => setPendingFilters((f) => ({ ...f, minCost: value }))}
+                  placeholder="0.05"
+                />
+              </Field>
+              <Field label="User ID">
+                <Input
+                  value={pendingFilters.userId}
+                  onChange={(e) => setPendingFilters((f) => ({ ...f, userId: e.target.value }))}
+                  placeholder="user_123"
+                  className="w-full sm:w-[160px]"
+                />
+              </Field>
+              <Field label="Session ID">
+                <Input
+                  value={pendingFilters.sessionId}
+                  onChange={(e) => setPendingFilters((f) => ({ ...f, sessionId: e.target.value }))}
+                  placeholder="session_abc"
+                  className="w-full sm:w-[160px]"
+                />
+              </Field>
+              <Field label="Tags (comma-separated)">
+                <Input
+                  value={pendingFilters.tags}
+                  onChange={(e) => setPendingFilters((f) => ({ ...f, tags: e.target.value }))}
+                  placeholder="prod, checkout"
+                  className="w-full sm:w-[200px]"
+                />
+              </Field>
+              <Button type="submit" variant="primary" size="sm">
+                <Search />
+                Apply filters
+              </Button>
+              {localFiltersActive ? (
+                <Button type="button" variant="ghost" size="sm" onClick={clearFilters}>
+                  Clear
+                </Button>
+              ) : null}
+            </div>
+          </form>
         </CardContent>
       </Card>
 
@@ -294,13 +337,16 @@ export function TracesScreen() {
             </div>
           </div>
           <div className="overflow-x-auto">
-            <table className="ledger min-w-[820px]">
+            <table className="ledger min-w-[1040px]">
               <thead>
                 <tr>
                   <th>Name</th>
                   <th>Timestamp</th>
-                  <th>User</th>
-                  <th>Session</th>
+                  <th className="text-right">Latency</th>
+                  <th className="text-right">Cost</th>
+                  <th className="text-right">Tokens</th>
+                  <th>Models</th>
+                  <th>User · Session</th>
                   <th>Environment</th>
                   <th>Tags</th>
                 </tr>
@@ -322,10 +368,27 @@ export function TracesScreen() {
                         {trace.name ?? <span className="text-ink-4 italic">unnamed</span>}
                         <ArrowRight className="h-3 w-3 shrink-0 text-ink-4 transition-transform group-hover:translate-x-0.5 group-hover:text-signal" aria-hidden />
                       </Link>
+                      {trace.errorCount > 0 ? (
+                        <Badge variant="error" className="ml-2">
+                          {trace.errorCount === 1 ? "1 error" : `${formatCompactNumber(trace.errorCount)} errors`}
+                        </Badge>
+                      ) : null}
                     </td>
                     <td className="font-mono text-[11.5px] text-ink-3">{formatTimestamp(trace.timestamp)}</td>
-                    <td className="text-ink-2">{trace.userId ?? "—"}</td>
-                    <td className="text-ink-2">{trace.sessionId ?? "—"}</td>
+                    <td className="text-right font-mono text-[11.5px] text-ink-2">{formatLatency(trace.durationMs)}</td>
+                    <td className="text-right font-mono text-[11.5px] text-ink-2">
+                      {trace.totalCost === null ? "—" : formatTraceCost(trace.totalCost)}
+                    </td>
+                    <td className="text-right font-mono text-[11.5px] text-ink-2">
+                      {trace.totalTokens === null ? "—" : formatCompactNumber(trace.totalTokens)}
+                    </td>
+                    <td className="text-ink-2">{trace.models.length > 0 ? trace.models.join(", ") : "—"}</td>
+                    <td>
+                      <div className="text-ink-2">{trace.userId ?? "—"}</div>
+                      {trace.sessionId ? (
+                        <div className="mt-0.5 font-mono text-[10.5px] text-ink-4">{trace.sessionId}</div>
+                      ) : null}
+                    </td>
                     <td className="text-ink-2">{trace.environment ?? "—"}</td>
                     <td>
                       <div className="flex flex-wrap gap-1">
@@ -439,28 +502,6 @@ function FirstTraceOnboarding({ loading, onRefresh }: { loading: boolean; onRefr
   );
 }
 
-export function filtersFromSearchParams(search: URLSearchParams): Filters {
-  return {
-    userId: search.get("userId") ?? "",
-    sessionId: search.get("sessionId") ?? "",
-    tags: search.getAll("tags").join(", "),
-    environment: search.get("environment") ?? "",
-    range: parseTimeRange(search.get("range"))
-  };
-}
-
-export function searchParamsFromFilters(filters: Filters): URLSearchParams {
-  const search = new URLSearchParams();
-  if (filters.userId.trim()) search.set("userId", filters.userId.trim());
-  if (filters.sessionId.trim()) search.set("sessionId", filters.sessionId.trim());
-  if (filters.environment.trim()) search.set("environment", filters.environment.trim());
-  if (filters.range) search.set("range", filters.range);
-  for (const tag of filters.tags.split(",").map((value) => value.trim()).filter(Boolean)) {
-    search.append("tags", tag);
-  }
-  return search;
-}
-
 function SummaryStrip({
   aggregates,
   error,
@@ -504,6 +545,32 @@ const PLACEHOLDER_TILES: SummaryTile[] = [
   { label: "Cost", value: "—" },
   { label: "Latency p50", value: "—" }
 ];
+
+/** A non-negative number field; an invalid value is marked and left out of the request. */
+function FloorInput({
+  value,
+  onChange,
+  placeholder
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  placeholder: string;
+}) {
+  const invalid = value.trim() !== "" && parseFloor(value) === undefined;
+  return (
+    <Input
+      type="number"
+      inputMode="decimal"
+      min={0}
+      step="any"
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      placeholder={placeholder}
+      aria-invalid={invalid}
+      className={cn("w-full sm:w-[110px]", invalid && "border-error")}
+    />
+  );
+}
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (

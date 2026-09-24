@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Project } from "@ironside/shared/browser";
 import { selectInitialProject } from "../src/lib/project-storage.js";
-import { filtersFromSearchParams, searchParamsFromFilters } from "../src/screens/traces.js";
+import { EMPTY_FILTERS, filtersFromSearchParams, searchParamsFromFilters } from "../src/lib/trace-filters.js";
 import {
   environmentOptions,
   pathWithEnvironment,
@@ -30,6 +30,7 @@ describe("project URL context", () => {
 
   it("round-trips shareable trace filters and repeated tags", () => {
     const search = searchParamsFromFilters({
+      ...EMPTY_FILTERS,
       userId: " user_1 ",
       sessionId: "session_2",
       tags: "prod, checkout",
@@ -40,6 +41,7 @@ describe("project URL context", () => {
       "userId=user_1&sessionId=session_2&environment=production&range=7d&tags=prod&tags=checkout"
     );
     expect(filtersFromSearchParams(search)).toEqual({
+      ...EMPTY_FILTERS,
       userId: "user_1",
       sessionId: "session_2",
       tags: "prod, checkout",

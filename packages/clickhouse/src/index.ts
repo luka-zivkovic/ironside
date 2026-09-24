@@ -38,6 +38,7 @@ export {
 } from "./environments.js";
 export {
   listTraces,
+  listTraceMetrics,
   listSettledTraceVersions,
   listTracePage,
   getTrace,
@@ -58,6 +59,7 @@ export {
   type ListTracesFilter,
   type ListTracePageFilter,
   type TraceRow,
+  type TraceMetricsRow,
   type SettledTraceVersionRow,
   type SettledTraceVersionCursor,
   type TraceDetailRow,

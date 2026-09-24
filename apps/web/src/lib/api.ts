@@ -81,6 +81,11 @@ export interface ListTracesParams {
   tags?: string[];
   metadataKey?: string;
   metadataValue?: string;
+  search?: string;
+  level?: string;
+  model?: string;
+  minDurationMs?: number;
+  minCost?: number;
   limit?: number;
   cursor?: string;
 }
@@ -94,6 +99,11 @@ function buildQuery(params: ListTracesParams): string {
   if (params.environment) search.set("environment", params.environment);
   if (params.metadataKey) search.set("metadataKey", params.metadataKey);
   if (params.metadataValue) search.set("metadataValue", params.metadataValue);
+  if (params.search) search.set("search", params.search);
+  if (params.level) search.set("level", params.level);
+  if (params.model) search.set("model", params.model);
+  if (params.minDurationMs !== undefined) search.set("minDurationMs", String(params.minDurationMs));
+  if (params.minCost !== undefined) search.set("minCost", String(params.minCost));
   if (params.limit) search.set("limit", String(params.limit));
   if (params.cursor) search.set("cursor", params.cursor);
   for (const tag of params.tags ?? []) search.append("tags", tag);

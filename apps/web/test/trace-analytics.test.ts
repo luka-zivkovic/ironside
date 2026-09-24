@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   formatCompactNumber,
   formatLatency,
+  formatTraceCost,
   formatUsd,
   parseTimeRange,
   rangeFrom,
@@ -44,6 +45,14 @@ describe("trace analytics helpers", () => {
     expect(formatUsd(12.5)).toBe("$12.50");
     expect(formatUsd(4200)).toBe("$4,200");
     expect(formatUsd(42_000)).toBe("$42K");
+  });
+
+  it("formats one trace's cost to four decimals below a dollar", () => {
+    expect(formatTraceCost(0)).toBe("$0.00");
+    expect(formatTraceCost(0.00004)).toBe("<$0.0001");
+    expect(formatTraceCost(0.0061)).toBe("$0.0061");
+    expect(formatTraceCost(0.1875)).toBe("$0.1875");
+    expect(formatTraceCost(12.5)).toBe("$12.50");
   });
 
   it("formats latency across ms, seconds and minutes", () => {
