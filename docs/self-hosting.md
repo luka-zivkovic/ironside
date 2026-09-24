@@ -78,11 +78,11 @@ its matching exact `image:` reference.
 ```yaml
 services:
   api:
-    image: ghcr.io/luka-zivkovic/ironside-api:0.3.0
+    image: ghcr.io/luka-zivkovic/ironside-api:0.3.1
   worker:
-    image: ghcr.io/luka-zivkovic/ironside-worker:0.3.0
+    image: ghcr.io/luka-zivkovic/ironside-worker:0.3.1
   web:
-    image: ghcr.io/luka-zivkovic/ironside-web:0.3.0
+    image: ghcr.io/luka-zivkovic/ironside-web:0.3.1
 ```
 
 After every image publishes, the workflow pulls those exact tags into the
@@ -236,11 +236,14 @@ Redis jobs.
 **MinIO's image moved in 0.3.1.** MinIO no longer publishes public images:
 `quay.io/minio/minio` refuses anonymous pulls, so an installation on the 0.3.0
 Compose file keeps running from its cached image but cannot pull it again. From
-0.3.1 the Compose files use Chainguard's build of the same server, pinned by
-digest, and run it as root like the official image did, so it opens the
-existing data volume unchanged. The change is in the Compose file, not in the
-application images: take the new `compose.yaml` (or `docker-compose.yml`)
-along with the new version. Back up MinIO first as usual.
+0.3.1 the Compose files use Chainguard's build of MinIO, pinned by digest, and
+run it as root like the official image did, so it opens the existing data
+volume. The build is MinIO `RELEASE.2026-09-22T19-25-18Z`, a year newer than
+the `RELEASE.2025-09-07T16-13-09Z` it replaces; the old image cannot be pulled
+any more, so there is no going back to it. Back up MinIO first. The change is
+in the Compose file, not in the application images: when updating to 0.3.1,
+take `compose.yaml` (or `docker-compose.yml`) from the `v0.3.1` tag along with
+the version; later releases' files include it.
 
 **Upgrading from 0.3.x to 0.4.0 starts deleting raw event objects.** Raw
 retention is on by default from 0.4.0: within 15 minutes of the first boot, the
