@@ -33,8 +33,16 @@ vi.setConfig({ testTimeout: 15_000 });
 // and records the outcome, end-to-end against the real local stack.
 
 const config = loadConfig();
-const pool = new Pool({ connectionString: config.databaseUrl });
-const clickhouse = createClickHouseClient(config.clickhouse);
+// The scheduler claims due rows across every project, so in the shared test
+// database it also claimed and ran other files' exports, forwards, webhooks,
+// and imports, and a slow tick timed these tests out. Like
+// retention-runner.test.ts, this file gets its own Postgres schema and
+// ClickHouse database.
+const namespace = `scheduler_test_${ulid().toLowerCase()}`;
+const adminPool = new Pool({ connectionString: config.databaseUrl });
+const pool = new Pool({ connectionString: config.databaseUrl, options: `-c search_path=${namespace}` });
+const adminClickhouse = createClickHouseClient(config.clickhouse);
+const clickhouse = createClickHouseClient({ ...config.clickhouse, database: namespace });
 const destination = createObjectStorage({
   endpoint: config.storage.endpoint,
   region: config.storage.region,
@@ -47,6 +55,8 @@ let projectId: string;
 let scheduler: Scheduler | null = null;
 
 beforeAll(async () => {
+  await adminPool.query(`create schema ${namespace}`);
+  await adminClickhouse.command({ query: `create database ${namespace}` });
   await runPgMigrations(pool);
   await runChMigrations(clickhouse);
   await destination.ensureBucket();
@@ -79,10 +89,16 @@ afterEach(() => {
 });
 
 afterAll(async () => {
-  await pool.query("delete from organizations where name = 'scheduler-test-org'");
   await pool.end();
   await clickhouse.close();
   destination.close();
+  try {
+    await adminPool.query(`drop schema if exists ${namespace} cascade`);
+    await adminClickhouse.command({ query: `drop database if exists ${namespace} sync` });
+  } finally {
+    await adminPool.end();
+    await adminClickhouse.close();
+  }
 });
 
 async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 10_000): Promise<void> {
