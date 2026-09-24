@@ -200,7 +200,13 @@ describe("POST /v1/otel/traces (protobuf)", () => {
 
     const [protoEvent, jsonEvent] = [storedBatches[0]!.events[0]!, storedBatches[1]!.events[0]!];
     expect(protoEvent.body).toEqual(jsonEvent.body);
-    expect({ ...protoEvent, id: undefined }).toEqual({ ...jsonEvent, id: undefined });
+    // Only the per-request event id (and the key that defaults to it) differ.
+    expect({ ...protoEvent, id: undefined, idempotencyKey: undefined }).toEqual({
+      ...jsonEvent,
+      id: undefined,
+      idempotencyKey: undefined
+    });
+    expect(protoEvent.idempotencyKey).toBe(protoEvent.id);
   });
 
   it("accepts gzip content-encoding for both encodings", async () => {

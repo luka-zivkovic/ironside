@@ -107,11 +107,13 @@ export function otlpRoutes(deps: OtlpDeps): Hono<AuthEnv> {
     const batchId = ulid();
     const receivedAt = new Date();
 
+    const eventId = ulid();
     const event: IngestEvent = {
-      id: ulid(),
+      id: eventId,
       type: "otlp-export",
       source: "otlp",
       schemaVersion: INGEST_SCHEMA_VERSION,
+      idempotencyKey: eventId,
       body: parsed.data
     };
 

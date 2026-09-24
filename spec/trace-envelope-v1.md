@@ -15,7 +15,7 @@ Every ingest path — native JSON, OTLP, LangFuse-compat, importers — converge
       | "otlp-export" | "langfuse-ingestion",
   source: "native" | "otlp" | "langfuse" | "import-langfuse" | "import-langsmith",
   schemaVersion: 1,
-  idempotencyKey?: string,  // sent by the client, stored verbatim; absent otherwise (one exception below)
+  idempotencyKey: string,   // the client's key, or the event id when it sent none (one exception below)
   body: unknown             // source-shaped payload; worker mapper owns interpretation
 }
 ```
@@ -26,9 +26,10 @@ LangFuse mappers explode each into many domain rows.
 
 `idempotencyKey` is a correlation value, not a deduplication key: nothing reads
 it after storage. Resending an event is safe because rows upsert by their own
-ids (see "Upsert semantics" below). The one event the API fills in itself is
-the score event of `POST /api/v1/evaluator/scores`, which carries the SHA-256
-fingerprint of the canonical request.
+ids (see "Upsert semantics" below). It is always present, because releases up
+to 0.3.0 reject a stored batch without it. The score event of
+`POST /api/v1/evaluator/scores` carries the SHA-256 fingerprint of the
+canonical request instead.
 
 ## IngestBatch (unit of storage + queueing)
 
@@ -76,5 +77,5 @@ This contract applies uniformly to native SDK/JSON, OTLP, LangFuse compatibility
 ## History
 
 - Drafted in M0 as the single ingest envelope. The draft planned to offload large input/output payloads above a threshold to be set in M1; instead, media is uploaded separately (`spec/media-v1.md`).
-- Through 0.3.0 the API filled an absent `idempotencyKey` with a SHA-256 hash of the body; it no longer spends that work on every event.
+- Through 0.3.0 the API filled an absent `idempotencyKey` with a SHA-256 hash of the body; it now uses the event id, which costs nothing.
 - Settled versions were first identified by the trace's latest activity timestamp; they are now the trace's feed version (`spec/webhooks-v1.md`).

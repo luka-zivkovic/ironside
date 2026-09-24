@@ -125,8 +125,8 @@ describe("POST /api/v1/ingest", () => {
     expect(raw.batchId).toBe(batchId);
     expect(raw.events).toHaveLength(1);
     expect(raw.events[0]?.source).toBe("native");
-    // No key is invented for an event the client sent without one.
-    expect(raw.events[0]).not.toHaveProperty("idempotencyKey");
+    // Without a client key, the event id stands in for it (no body hashing).
+    expect(raw.events[0]?.idempotencyKey).toBe(raw.events[0]?.id);
     // Server assigns ids to events that lack one.
     expect(raw.events[0]?.id).toBeTruthy();
 
@@ -141,7 +141,7 @@ describe("POST /api/v1/ingest", () => {
     await job?.remove();
   });
 
-  it("stores a client-sent idempotencyKey verbatim", async () => {
+  it("stores a client-sent idempotencyKey as sent", async () => {
     const payload = tracePayload();
     const res = await app.request("/api/v1/ingest", {
       method: "POST",

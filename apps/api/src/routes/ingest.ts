@@ -36,14 +36,19 @@ export function ingestRoutes(deps: IngestDeps): Hono<AuthEnv> {
     const batchId = ulid();
     const receivedAt = new Date();
 
-    const events: IngestEvent[] = parsed.data.events.map((event) => ({
-      id: event.id ?? ulid(),
-      type: event.type,
-      source: "native",
-      schemaVersion: INGEST_SCHEMA_VERSION,
-      ...(event.idempotencyKey !== undefined && { idempotencyKey: event.idempotencyKey }),
-      body: event.body
-    }));
+    const events: IngestEvent[] = parsed.data.events.map((event) => {
+      const id = event.id ?? ulid();
+      return {
+        id,
+        type: event.type,
+        source: "native",
+        schemaVersion: INGEST_SCHEMA_VERSION,
+        // The event id rather than a hash of the body: nothing deduplicates on
+        // the key, and releases up to 0.3.0 require one to read the batch.
+        idempotencyKey: event.idempotencyKey ?? id,
+        body: event.body
+      };
+    });
 
     const batch: IngestBatch = {
       batchId,

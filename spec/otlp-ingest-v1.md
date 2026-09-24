@@ -84,4 +84,4 @@ OpenTelemetry has no cost attribute (the `open-telemetry/semantic-conventions-ge
 - M9-06 added protobuf decoding. The decompressed-size cap on gzip bodies came from a review finding on PR #38.
 - The M4-05 direct-ingest audit added the `gen_ai.request.*` to `modelParameters` mapping (`spec/direct-ingest-primacy-v1.md`). OTLP observations gained cost later, when the worker began deriving it (`spec/cost-pricing-v1.md`).
 - Issue #45 made OTLP the canonical integration surface for third-party frameworks and services.
-- Through 0.3.0 the API also filled each event's idempotency key with a hash of the body, which was identical for the protobuf and JSON encodings of an export. The envelope no longer computes that key (`spec/trace-envelope-v1.md`).
+- Through 0.3.0 the API also filled each event's idempotency key with a hash of the body, which was identical for the protobuf and JSON encodings of an export. The key is now the event id (`spec/trace-envelope-v1.md`).
