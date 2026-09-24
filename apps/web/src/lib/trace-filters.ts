@@ -1,3 +1,4 @@
+import { MAX_MIN_COST_USD, MAX_MIN_DURATION_MS } from "@ironside/shared/browser";
 import type { ListTracesParams } from "@/lib/api";
 import { parseTimeRange, rangeFrom, type TimeRange } from "@/lib/trace-analytics";
 
@@ -45,12 +46,23 @@ function parseLevel(value: string | null): LevelFilter {
   return value === "error" || value === "warning" ? value : "";
 }
 
-/** A typed floor, or undefined when it is empty or not a non-negative number. */
-export function parseFloor(value: string): number | undefined {
+/** Largest latency floor the API accepts, in seconds. */
+export const MAX_MIN_LATENCY_SECONDS = Math.floor(MAX_MIN_DURATION_MS / 1000);
+
+/** A typed floor, or undefined when it is empty or not a number from 0 to `max`. */
+export function parseFloor(value: string, max: number): number | undefined {
   const trimmed = value.trim();
   if (trimmed === "") return undefined;
   const parsed = Number(trimmed);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+  return Number.isFinite(parsed) && parsed >= 0 && parsed <= max ? parsed : undefined;
+}
+
+export function parseLatencyFloor(value: string): number | undefined {
+  return parseFloor(value, MAX_MIN_LATENCY_SECONDS);
+}
+
+export function parseCostFloor(value: string): number | undefined {
+  return parseFloor(value, MAX_MIN_COST_USD);
 }
 
 function splitTags(tags: string): string[] {
@@ -70,8 +82,8 @@ export function hasFilters(filters: Filters): boolean {
       filters.environment.trim() ||
       filters.level ||
       filters.model.trim() ||
-      parseFloor(filters.minLatencySeconds) !== undefined ||
-      parseFloor(filters.minCost) !== undefined
+      parseLatencyFloor(filters.minLatencySeconds) !== undefined ||
+      parseCostFloor(filters.minCost) !== undefined
   );
 }
 
@@ -83,8 +95,8 @@ export function clearLocalFilters(filters: Filters): Filters {
 export function toParams(filters: Filters, cursor: string | null, now: Date = new Date()): ListTracesParams {
   const tags = splitTags(filters.tags);
   const from = rangeFrom(filters.range, now);
-  const minLatencySeconds = parseFloor(filters.minLatencySeconds);
-  const minCost = parseFloor(filters.minCost);
+  const minLatencySeconds = parseLatencyFloor(filters.minLatencySeconds);
+  const minCost = parseCostFloor(filters.minCost);
   return {
     limit: 30,
     ...(from !== undefined && { from }),
@@ -126,10 +138,10 @@ export function searchParamsFromFilters(filters: Filters): URLSearchParams {
   if (filters.level) search.set("level", filters.level);
   if (filters.model.trim()) search.set("model", filters.model.trim());
   // Only valid floors reach the URL, so a shared link never carries one the list ignores.
-  if (parseFloor(filters.minLatencySeconds) !== undefined) {
+  if (parseLatencyFloor(filters.minLatencySeconds) !== undefined) {
     search.set("minLatency", filters.minLatencySeconds.trim());
   }
-  if (parseFloor(filters.minCost) !== undefined) search.set("minCost", filters.minCost.trim());
+  if (parseCostFloor(filters.minCost) !== undefined) search.set("minCost", filters.minCost.trim());
   for (const tag of splitTags(filters.tags)) search.append("tags", tag);
   return search;
 }

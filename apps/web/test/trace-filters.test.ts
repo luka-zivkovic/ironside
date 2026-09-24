@@ -4,7 +4,10 @@ import {
   clearLocalFilters,
   filtersFromSearchParams,
   hasFilters,
+  MAX_MIN_LATENCY_SECONDS,
+  parseCostFloor,
   parseFloor,
+  parseLatencyFloor,
   searchParamsFromFilters,
   toParams,
   type Filters
@@ -52,14 +55,19 @@ describe("trace explorer filters", () => {
     });
   });
 
-  it("parses only non-negative numbers as floors", () => {
-    expect(parseFloor("")).toBeUndefined();
-    expect(parseFloor("  ")).toBeUndefined();
-    expect(parseFloor("-0.1")).toBeUndefined();
-    expect(parseFloor("abc")).toBeUndefined();
-    expect(parseFloor("Infinity")).toBeUndefined();
-    expect(parseFloor("0")).toBe(0);
-    expect(parseFloor(" 1.5 ")).toBe(1.5);
+  it("parses only numbers from 0 to the API's limit as floors", () => {
+    expect(parseFloor("", 10)).toBeUndefined();
+    expect(parseFloor("  ", 10)).toBeUndefined();
+    expect(parseFloor("-0.1", 10)).toBeUndefined();
+    expect(parseFloor("abc", 10)).toBeUndefined();
+    expect(parseFloor("Infinity", 10)).toBeUndefined();
+    expect(parseFloor("10.5", 10)).toBeUndefined();
+    expect(parseFloor("0", 10)).toBe(0);
+    expect(parseFloor(" 1.5 ", 10)).toBe(1.5);
+    // Floors the API would reject with 400 are never sent.
+    expect(parseCostFloor("1e13")).toBeUndefined();
+    expect(parseLatencyFloor(String(MAX_MIN_LATENCY_SECONDS))).toBe(MAX_MIN_LATENCY_SECONDS);
+    expect(parseLatencyFloor(String(MAX_MIN_LATENCY_SECONDS + 1))).toBeUndefined();
   });
 
   it("counts every narrowing filter, and clearing keeps only the time range and environment", () => {

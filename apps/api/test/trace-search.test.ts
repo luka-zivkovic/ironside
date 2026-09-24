@@ -203,8 +203,33 @@ describe("GET /traces — search and filters", () => {
     expect(await listIds("search=refund&minCost=1")).toEqual([]);
   });
 
-  it("treats an empty value as an unset filter", async () => {
-    expect(await listIds("search=&model=&minDurationMs=&minCost=")).toEqual(Object.values(ids).sort());
+  it("treats an empty or blank value as an unset filter", async () => {
+    expect(await listIds("search=&model=&level=&minDurationMs=&minCost=")).toEqual(Object.values(ids).sort());
+    expect(await listIds("search=%20&model=%20&level=%20&minDurationMs=%20&minCost=%20")).toEqual(
+      Object.values(ids).sort()
+    );
+  });
+
+  it("sums costs exactly, so a trace costing exactly the floor matches", async () => {
+    const tag = `exact_${ulid()}`;
+    const exact = `trace_exact_${ulid()}`;
+    const eventTs = new Date().toISOString();
+    await insertTraces(clickhouse, [trace(exact, { tags: [tag] })], { eventTs });
+    await insertObservations(
+      clickhouse,
+      [
+        observation(exact, "first", { costDetails: { total: 0.7 } }),
+        observation(exact, "second", { costDetails: { input: 0.1 } })
+      ],
+      { eventTs }
+    );
+    // In floating point, 0.7 + 0.1 is 0.7999999999999999.
+    const list = await get(`/traces?tags=${tag}&minCost=0.8`);
+    const listed = ((await list.json()) as { traces: TraceSummary[] }).traces;
+    expect(listed.map((row) => row.id)).toEqual([exact]);
+    expect(listed[0]?.totalCost).toBe(0.8);
+    const aggregates = await get(`/traces/aggregates?tags=${tag}&minCost=0.8`);
+    expect(((await aggregates.json()) as { traceCount: number }).traceCount).toBe(1);
   });
 
   it("rejects invalid filter values", async () => {

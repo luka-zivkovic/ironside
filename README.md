@@ -118,6 +118,12 @@ The global picker and Configuration page discover/hide retained values; use a
 separate project whenever credentials, access, quotas, retention, or isolation
 must differ. See [`spec/environments-v1.md`](./spec/environments-v1.md).
 
+The trace explorer searches trace and step names, inputs and outputs (or an
+exact trace ID), filters by level, model, minimum latency and minimum cost, and
+shows each trace's latency, cost, tokens, models and errors. Filters live in
+the URL, so a filtered view can be shared. See
+[`spec/trace-search-v1.md`](./spec/trace-search-v1.md).
+
 ## Instrument your app
 
 For third-party frameworks and services, **OTLP/HTTP with OpenTelemetry's `gen_ai.*` semantic conventions is the canonical integration path**. Point the trace exporter at Ironside's signal-specific endpoint:

@@ -70,10 +70,12 @@ function traceActivityQuery(traceIdParam?: string, traceIdsParam?: string): stri
 /**
  * One observation's cost in USD: its `total` component when it reports one
  * (derived and LangFuse costs always do), otherwise the sum of its components.
+ * Kept Decimal so sums are exact: in Float64, 0.7 + 0.1 falls just short of a
+ * 0.8 floor.
  */
 const OBSERVATION_COST = `if(mapContains(cost_details, 'total'),
-  toFloat64(cost_details['total']),
-  toFloat64(arraySum(mapValues(cost_details))))`;
+  cost_details['total'],
+  arraySum(mapValues(cost_details)))`;
 
 /**
  * One observation's token count in the canonical usage vocabulary
@@ -174,7 +176,9 @@ function buildTraceConditions(filter: TraceFilter): {
     params.minDurationMs = filter.minDurationMs;
   }
   if (filter.minCost !== undefined) {
-    conditions.push(tracesWhereObservations(`sum(${OBSERVATION_COST}) >= {minCost:Float64}`));
+    conditions.push(
+      tracesWhereObservations(`sum(${OBSERVATION_COST}) >= toDecimal128({minCost:Float64}, 9)`)
+    );
     params.minCost = filter.minCost;
   }
 
@@ -350,7 +354,7 @@ export async function listTraceMetrics(
       select
         trace_id,
         toFloat64(${TRACE_DURATION_MS}) as duration_ms,
-        if(countIf(notEmpty(cost_details)) = 0, null, sum(${OBSERVATION_COST})) as total_cost,
+        if(countIf(notEmpty(cost_details)) = 0, null, toFloat64(sum(${OBSERVATION_COST}))) as total_cost,
         if(countIf(${OBSERVATION_HAS_TOKENS}) = 0, null, toFloat64(sum(${OBSERVATION_TOKENS}))) as total_tokens,
         toUInt32(countIf(level = 'error')) as error_count,
         arraySort(groupUniqArrayIf(assumeNotNull(model), model is not null)) as models

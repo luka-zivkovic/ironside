@@ -14,7 +14,7 @@ Status: implemented. Owner: `packages/clickhouse/src/queries.ts` (`buildTraceCon
 | `minDurationMs` (integer ≥ 0) | have a duration of at least this many milliseconds |
 | `minCost` (≥ 0, USD) | have a total cost of at least this |
 
-The existing `from`, `to`, `userId`, `sessionId`, `environment`, `tags` and `metadataKey`/`metadataValue` filters are unchanged. An empty value (`?minCost=`) leaves a filter unset; an invalid value is a `400`.
+The existing `from`, `to`, `userId`, `sessionId`, `environment`, `tags` and `metadataKey`/`metadataValue` filters are unchanged. An empty or blank value (`?minCost=`) leaves a filter unset; an invalid value is a `400`. The explorer never sends a value the API would reject.
 
 Inputs and outputs are searched as their stored JSON text. A search for text that JSON escapes (a quote, a backslash, a line break) must be written in its escaped form.
 
@@ -23,7 +23,7 @@ Inputs and outputs are searched as their stored JSON text. A search for text tha
 Each listed trace carries figures computed from its observations, with the same rules the filters use:
 
 - `durationMs`: the first observation start to the last observation end. `null` when no observation has ended, so `minDurationMs` never matches such a trace. This is the definition the latency percentiles in the aggregates use.
-- `totalCost`: the sum over observations of each observation's `total` cost, or the sum of its cost components when it has no `total`. `null` when no observation reports a cost.
+- `totalCost`: the sum over observations of each observation's `total` cost, or the sum of its cost components when it has no `total`. The sum is exact (ClickHouse `Decimal`), so a trace costing exactly the `minCost` floor matches it. `null` when no observation reports a cost.
 - `totalTokens`: the sum over observations of each observation's `total_tokens`, or its `input_tokens` plus `output_tokens`. Other usage keys, such as cache reads, can overlap those and are not added. `null` when no observation reports any of the three.
 - `errorCount`: observations at level `error`.
 - `models`: the distinct models of the observations, sorted.

@@ -1,7 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { ArrowRight, RefreshCcw, Search } from "lucide-react";
-import type { AggregatesResponse, TraceSummary } from "@ironside/shared/browser";
+import {
+  MAX_TRACE_FILTER_TEXT_LENGTH,
+  type AggregatesResponse,
+  type TraceSummary
+} from "@ironside/shared/browser";
 import { ApiError, fetchAggregates, fetchTraces, getApiBaseUrl } from "@/lib/api";
 import { buildNativeIngestCurl } from "@/lib/connection-snippets";
 import {
@@ -19,7 +23,8 @@ import {
   clearLocalFilters,
   filtersFromSearchParams,
   hasFilters,
-  parseFloor,
+  parseCostFloor,
+  parseLatencyFloor,
   searchParamsFromFilters,
   toParams,
   type Filters,
@@ -212,7 +217,7 @@ export function TracesScreen() {
                   value={pendingFilters.search}
                   onChange={(e) => setPendingFilters((f) => ({ ...f, search: e.target.value }))}
                   placeholder="Text in a name, input or output, or an exact trace ID"
-                  maxLength={200}
+                  maxLength={MAX_TRACE_FILTER_TEXT_LENGTH}
                   className="pl-8"
                 />
               </div>
@@ -251,6 +256,7 @@ export function TracesScreen() {
                   value={pendingFilters.model}
                   onChange={(e) => setPendingFilters((f) => ({ ...f, model: e.target.value }))}
                   placeholder="gpt-4o"
+                  maxLength={MAX_TRACE_FILTER_TEXT_LENGTH}
                   list="trace-models"
                   className="w-full sm:w-[160px]"
                 />
@@ -264,6 +270,7 @@ export function TracesScreen() {
                 <FloorInput
                   value={pendingFilters.minLatencySeconds}
                   onChange={(value) => setPendingFilters((f) => ({ ...f, minLatencySeconds: value }))}
+                  parse={parseLatencyFloor}
                   placeholder="2"
                 />
               </Field>
@@ -271,6 +278,7 @@ export function TracesScreen() {
                 <FloorInput
                   value={pendingFilters.minCost}
                   onChange={(value) => setPendingFilters((f) => ({ ...f, minCost: value }))}
+                  parse={parseCostFloor}
                   placeholder="0.05"
                 />
               </Field>
@@ -550,13 +558,15 @@ const PLACEHOLDER_TILES: SummaryTile[] = [
 function FloorInput({
   value,
   onChange,
+  parse,
   placeholder
 }: {
   value: string;
   onChange: (value: string) => void;
+  parse: (value: string) => number | undefined;
   placeholder: string;
 }) {
-  const invalid = value.trim() !== "" && parseFloor(value) === undefined;
+  const invalid = value.trim() !== "" && parse(value) === undefined;
   return (
     <Input
       type="number"
