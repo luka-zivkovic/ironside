@@ -5,7 +5,7 @@ import { createObjectStorage } from "@ironside/storage";
 import { Redis } from "ioredis";
 import { Pool } from "pg";
 import { ulid } from "ulid";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 import { createTestMachineCredential } from "./helpers/machine-credential.js";
@@ -95,6 +95,19 @@ afterAll(async () => {
   await clickhouse.close();
   storage.close();
 });
+
+/**
+ * The limiter counts in fixed 60-second windows, so a test whose requests
+ * straddle a window edge sees a fresh budget partway through. Each test starts
+ * at least five seconds before an edge.
+ */
+beforeEach(async () => {
+  const windowMs = 60_000;
+  const intoWindow = Date.now() % windowMs;
+  if (intoWindow > windowMs - 5_000) {
+    await new Promise((resolve) => setTimeout(resolve, windowMs - intoWindow + 50));
+  }
+}, 15_000);
 
 describe("ingest rate limiting", () => {
   it("allows requests up to the limit, then rejects with 429 and Retry-After", async () => {

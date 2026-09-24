@@ -7,8 +7,8 @@ import {
   type LangfuseIngestionRequest,
   type LangfuseIngestionResponse
 } from "@ironside/shared";
+import { createHash } from "node:crypto";
 import { normalizeEnvironment } from "@ironside/shared";
-import { ulid } from "ulid";
 import { canonicalizeUsageKeys } from "./usage-keys.js";
 
 // Maps a LangFuse /api/public/ingestion batch to Ironside's domain model.
@@ -80,7 +80,7 @@ export function mapLangfuseIngestionRequest(
   const sdkLogEventIds: string[] = [];
   const invalidEventIds: { id: string; message: string }[] = [];
 
-  for (const event of request.batch) {
+  for (const [index, event] of request.batch.entries()) {
     const kind = classify(event.type);
     if (kind === "invalid") {
       invalidEventIds.push({ id: event.id, message: `unsupported event type: ${event.type}` });
@@ -96,7 +96,8 @@ export function mapLangfuseIngestionRequest(
     }
     if (kind === "trace") {
       const bodyId = getBodyId(event);
-      const key = bodyId ?? `__no_id_${event.id}`; // no id -> can't be merged with anything else, own group
+      // Without a body id an event cannot be tied to any other: its own group.
+      const key = bodyId !== undefined ? `id:${bodyId.trim()}` : `event:${index}`;
       const group = traceGroups.get(key) ?? [];
       group.push(event);
       traceGroups.set(key, group);
@@ -104,7 +105,7 @@ export function mapLangfuseIngestionRequest(
     }
     // observation kinds (span/generation/event)
     const bodyId = getBodyId(event);
-    const key = bodyId ?? `__no_id_${event.id}`;
+    const key = bodyId !== undefined ? `id:${bodyId.trim()}` : `event:${index}`;
     const existing = observationGroups.get(key);
     if (existing) {
       existing.events.push(event);
@@ -117,7 +118,7 @@ export function mapLangfuseIngestionRequest(
   for (const { id, message } of invalidEventIds) response.errors.push({ id, status: 400, message });
 
   for (const events of traceGroups.values()) {
-    const result = mapMergedTrace(projectId, events);
+    const result = guarded(() => mapMergedTrace(projectId, events));
     recordResult(response, events, result);
     if (result.ok && result.row) {
       rows.traces.push(result.row);
@@ -126,7 +127,7 @@ export function mapLangfuseIngestionRequest(
   }
 
   for (const { type, events } of observationGroups.values()) {
-    const result = mapMergedObservation(projectId, events, type);
+    const result = guarded(() => mapMergedObservation(projectId, events, type));
     recordResult(response, events, result);
     if (result.ok && result.row) {
       rows.observations.push(result.row);
@@ -135,7 +136,7 @@ export function mapLangfuseIngestionRequest(
   }
 
   for (const event of scoreEvents) {
-    const result = mapScore(projectId, event);
+    const result = guarded(() => mapScore(projectId, event));
     recordResult(response, [event], result);
     if (result.ok && result.row) rows.scores.push(result.row);
   }
@@ -175,6 +176,37 @@ function classify(type: LangfuseBatchEvent["type"]): Classification {
   }
 }
 
+/**
+ * The id of a record sent without one, derived from its event: a hash of the
+ * event's type, id, timestamp and body. A worker retry replays the same stored
+ * batch and a client resend repeats the same event, so both write the same
+ * record again instead of a copy. The content is part of the hash because
+ * nothing makes event ids unique: a client reusing them for different records
+ * still gets distinct ones. A record without an id is its own group, so it has
+ * exactly one event.
+ */
+function idFromEvent(event: LangfuseBatchEvent): string {
+  const content = canonicalJson([event.type, event.id, event.timestamp ?? null, event.body ?? null]);
+  return `lf_${createHash("sha256").update(content).digest("hex").slice(0, 32)}`;
+}
+
+/**
+ * JSON with object keys sorted, so the same content always hashes the same.
+ * Native JSON.stringify does the walk, so it takes the same nesting the API's
+ * own serialization of the stored batch did.
+ */
+function canonicalJson(value: unknown): string {
+  return (
+    JSON.stringify(value, (_key, entry: unknown) =>
+      entry !== null && typeof entry === "object" && !Array.isArray(entry)
+        ? Object.fromEntries(
+            Object.entries(entry as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+          )
+        : entry
+    ) ?? "null"
+  );
+}
+
 /** Reads body.id without full schema validation, just to group events by target entity. */
 function getBodyId(event: LangfuseBatchEvent): string | undefined {
   if (event.body && typeof event.body === "object" && "id" in event.body) {
@@ -182,6 +214,15 @@ function getBodyId(event: LangfuseBatchEvent): string | undefined {
     return typeof id === "string" ? id : undefined;
   }
   return undefined;
+}
+
+/** Maps one group; an unexpected error fails only that group's events, not the whole request. */
+function guarded<Row>(map: () => MergedResult<Row>): MergedResult<Row> {
+  try {
+    return map();
+  } catch (error) {
+    return { ok: false, message: `could not map event: ${error instanceof Error ? error.message : String(error)}` };
+  }
 }
 
 type MergedResult<Row> =
@@ -237,7 +278,7 @@ function mapMergedTrace(
   const environment = normalizeEnvironment(body.environment);
 
   const trace: Trace = {
-    id: body.id ?? ulid(),
+    id: body.id ?? idFromEvent(events[0]!),
     projectId,
     timestamp: body.timestamp ?? latestTimestamp ?? new Date().toISOString(),
     tags: body.tags ?? [],
@@ -276,7 +317,7 @@ function mapMergedObservation(
   const latestTimestamp = events.map((e) => e.timestamp).filter(Boolean).at(-1);
 
   const observation: Observation = {
-    id: body.id ?? ulid(),
+    id: body.id ?? idFromEvent(events[0]!),
     traceId: body.traceId,
     projectId,
     type,
@@ -324,7 +365,7 @@ function mapScore(projectId: string, event: LangfuseBatchEvent): MergedResult<Sc
 
   const isNumeric = typeof body.value === "number";
   const score: Score = {
-    id: body.id ?? ulid(),
+    id: body.id ?? idFromEvent(event),
     projectId,
     traceId: body.traceId,
     name: body.name,

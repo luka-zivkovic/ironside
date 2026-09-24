@@ -1248,6 +1248,71 @@ describe("a record written again with a timestamp on another day", () => {
     expect(utc.deletions.traces).toEqual([{ projectId, id: traceId, timestamp: noon(2) }]);
   });
 
+  it("writes LangFuse records sent without an id once, when the batch is retried and when the request is resent on a later day", async () => {
+    const traceEvent = { id: `evt_${ulid()}`, timestamp: noon(2), type: "trace-create", body: { name: "no-id trace", timestamp: noon(2) } };
+    const events = (traceId: string) => [
+      traceEvent,
+      { id: `evt_span_${traceId}`, timestamp: noon(2), type: "span-create", body: { traceId, name: "no-id span", startTime: noon(2) } },
+      { id: `evt_score_${traceId}`, timestamp: noon(2), type: "score-create", body: { traceId, name: "verdict", value: 1 } }
+    ];
+    const traceId = `trace_${ulid()}`;
+    const langfuse = (day: number): IngestBatch => ({
+      ...nativeBatch(noon(day), []),
+      events: [
+        {
+          id: ulid(),
+          type: "langfuse-ingestion",
+          source: "langfuse",
+          schemaVersion: INGEST_SCHEMA_VERSION,
+          idempotencyKey: ulid(),
+          body: { batch: events(traceId) }
+        }
+      ]
+    });
+    const first = langfuse(2);
+    await run(first);
+    await run(first);
+    // The client resends the same request a day later.
+    await run(langfuse(1));
+
+    const count = async (table: string, column: string, value: string) => {
+      const result = await clickhouse.query({
+        query: `select id from ${table} final where project_id = {projectId:String} and ${column} = {value:String}`,
+        query_params: { projectId, value },
+        format: "JSONEachRow"
+      });
+      return (await result.json<{ id: string }>()).length;
+    };
+    expect(await count("traces", "name", "no-id trace")).toBe(1);
+    expect(await count("observations", "trace_id", traceId)).toBe(1);
+    expect(await count("scores", "trace_id", traceId)).toBe(1);
+  });
+
+  it("keeps LangFuse records apart when a client reuses event ids for different records", async () => {
+    const traceId = `trace_${ulid()}`;
+    const request = (day: number, name: string): IngestBatch => ({
+      ...nativeBatch(noon(day), []),
+      events: [
+        {
+          id: ulid(),
+          type: "langfuse-ingestion",
+          source: "langfuse",
+          schemaVersion: INGEST_SCHEMA_VERSION,
+          idempotencyKey: ulid(),
+          body: { batch: [{ id: "0", type: "score-create", body: { traceId, name, value: 1 } }] }
+        }
+      ]
+    });
+    await run(request(2, "helpful"));
+    await run(request(1, "correct"));
+    const scores = await clickhouse.query({
+      query: "select name from scores final where project_id = {projectId:String} and trace_id = {traceId:String} order by name",
+      query_params: { projectId, traceId },
+      format: "JSONEachRow"
+    });
+    expect(await scores.json()).toEqual([{ name: "correct" }, { name: "helpful" }]);
+  });
+
   it("removes duplicates written before this fix when the record is written again", async () => {
     const traceId = `trace_${ulid()}`;
     const trace = (day: number) => ({ id: traceId, projectId, timestamp: noon(day), tags: [], metadata: {} });
