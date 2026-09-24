@@ -930,3 +930,90 @@ describe("score feed publication", () => {
     expect(published).not.toContain(withActivity);
   });
 });
+
+describe("a record written again with a timestamp on another day", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const dayStart = Date.parse(new Date().toISOString().slice(0, 10) + "T00:00:00.000Z");
+  /** Noon on the day `days` before today, UTC. */
+  const noon = (days: number) => new Date(dayStart - days * DAY + 12 * 60 * 60 * 1000).toISOString();
+
+  function nativeBatch(receivedAt: string, events: { type: IngestBatch["events"][number]["type"]; body: unknown }[]): IngestBatch {
+    return {
+      batchId: ulid(),
+      projectId,
+      receivedAt,
+      events: events.map((event) => ({
+        id: ulid(),
+        type: event.type,
+        source: "native" as const,
+        schemaVersion: INGEST_SCHEMA_VERSION,
+        idempotencyKey: ulid(),
+        body: event.body
+      }))
+    };
+  }
+
+  async function run(batch: IngestBatch): Promise<void> {
+    const job = await storeAndEnqueue(batch);
+    await processBatch(job);
+    await job.remove();
+  }
+
+  async function liveRows(table: "traces" | "observations" | "scores", id: string, column: string): Promise<string[]> {
+    const result = await clickhouse.query({
+      query: `select toString(${column}) as at from ${table} final where project_id = {projectId:String} and id = {id:String}`,
+      query_params: { projectId, id },
+      format: "JSONEachRow"
+    });
+    return (await result.json<{ at: string }>()).map((row) => row.at.slice(0, 10));
+  }
+
+  it("keeps one trace and one observation, under the newer batch's day", async () => {
+    const traceId = `trace_${ulid()}`;
+    const observationId = `obs_${ulid()}`;
+    for (const day of [2, 1]) {
+      await run(
+        nativeBatch(noon(day), [
+          { type: "trace-upsert", body: { id: traceId, timestamp: noon(day), name: "checkout" } },
+          { type: "observation-upsert", body: { id: observationId, traceId, type: "span", startTime: noon(day) } }
+        ])
+      );
+    }
+    expect(await liveRows("traces", traceId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
+    expect(await liveRows("observations", observationId, "start_time")).toEqual([noon(1).slice(0, 10)]);
+  });
+
+  it("leaves out a stale batch's row when the record is stored newer under another day", async () => {
+    const traceId = `trace_${ulid()}`;
+    // Received second, processed first.
+    await run(nativeBatch(noon(1), [{ type: "trace-upsert", body: { id: traceId, timestamp: noon(1), name: "newer" } }]));
+    await run(nativeBatch(noon(2), [{ type: "trace-upsert", body: { id: traceId, timestamp: noon(2), name: "older" } }]));
+
+    expect(await liveRows("traces", traceId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
+    expect((await getTrace(clickhouse, projectId, traceId))?.name).toBe("newer");
+  });
+
+  it("keeps one score when it is sent again without a timestamp on a later day, and a retry lands on the same key", async () => {
+    const traceId = `trace_${ulid()}`;
+    const scoreId = `score_${ulid()}`;
+    const score = { id: scoreId, traceId, name: "helpful", dataType: "numeric", value: 1, source: "api", metadata: {} };
+    const first = nativeBatch(noon(2), [{ type: "score-upsert", body: score }]);
+    await run(first);
+    await run(first);
+    expect(await liveRows("scores", scoreId, "timestamp")).toEqual([noon(2).slice(0, 10)]);
+
+    await run(nativeBatch(noon(1), [{ type: "score-upsert", body: { ...score, value: 0 } }]));
+    expect(await liveRows("scores", scoreId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
+  });
+
+  it("removes duplicates written before this fix when the record is written again", async () => {
+    const traceId = `trace_${ulid()}`;
+    const trace = (day: number) => ({ id: traceId, projectId, timestamp: noon(day), tags: [], metadata: {} });
+    await insertTraces(clickhouse, [trace(3)], { eventTs: noon(3) });
+    await insertTraces(clickhouse, [trace(2)], { eventTs: noon(2) });
+    expect(await liveRows("traces", traceId, "timestamp")).toHaveLength(2);
+
+    await run(nativeBatch(noon(1), [{ type: "trace-upsert", body: { id: traceId, timestamp: noon(1) } }]));
+    expect(await liveRows("traces", traceId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
+  });
+});

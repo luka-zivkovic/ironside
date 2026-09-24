@@ -187,7 +187,7 @@ export async function mergeLangfuseRows(
 }
 
 /** The UTC day of an ISO timestamp: the day ClickHouse's sort key (toDate) puts a row under. */
-function utcDay(timestamp: string): string {
+export function utcDay(timestamp: string): string {
   const time = Date.parse(timestamp);
   return Number.isNaN(time) ? timestamp : new Date(time).toISOString().slice(0, 10);
 }

@@ -118,7 +118,7 @@ export const scoreObjectSchema = z.object({
   stringValue: z.string().optional(),
   source: scoreSourceSchema,
   comment: z.string().optional(),
-  /** When the score was originally created. Absent → the ClickHouse column defaults to insert time, which is wrong for backfilled/imported scores — importers must pass the source's own timestamp. */
+  /** When the score was originally created. Absent → the ingest worker uses the batch's receive time, which is wrong for backfilled/imported scores — importers must pass the source's own timestamp. */
   timestamp: timestampSchema.optional(),
   metadata: metadataSchema.default({})
 });
