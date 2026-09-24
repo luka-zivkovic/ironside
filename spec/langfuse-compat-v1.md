@@ -34,7 +34,7 @@ LangFuse's SDK sends `Authorization: Basic base64(publicKey:secretKey)`. Ironsid
 
 - `batch` must be a non-empty array. Each item needs a string `id` and a supported `type`; `timestamp` is optional.
 - `metadata` is accepted and ignored: it is SDK diagnostics, not data.
-- `batch[].id` is the envelope id of the ingestion event. `batch[].body.id` is the trace, observation or score id, and is what upserts.
+- `batch[].id` is the envelope id of the ingestion event. `batch[].body.id` is the trace, observation or score id, and is what upserts. Event ids are not required to be unique, so they never identify a record on their own.
 - A request that does not match this envelope (not JSON, no `batch`, an empty `batch`, an item without an `id`, an unsupported `type`) returns 400 `{ error: "invalid LangFuse ingestion payload", issues }`.
 
 Supported `type` values and the native event each becomes:
@@ -53,11 +53,11 @@ Supported `type` values and the native event each becomes:
 
 Body schemas accept `null` as well as omission for every optional field, because the SDK sends explicit `null` for fields it is not setting. Record ids follow the native identifier rules (trimmed, 1 to 512 UTF-8 bytes, no NUL).
 
-- **Trace:** `id` (when absent, the event's `id`: see below), `timestamp` (falls back to the event's `timestamp`, then to the processing time), `name`, `userId`, `sessionId`, `release`, `version`, `tags`, `metadata`, `input` and `output`. `environment` is normalized and registered for discovery as in `spec/environments-v1.md`, and an invalid value is dropped without failing the trace.
+- **Trace:** `id` (when absent, derived from the event: see below), `timestamp` (falls back to the event's `timestamp`, then to the processing time), `name`, `userId`, `sessionId`, `release`, `version`, `tags`, `metadata`, `input` and `output`. `environment` is normalized and registered for discovery as in `spec/environments-v1.md`, and an invalid value is dropped without failing the trace.
 - **Observation:** requires `traceId`. `id` falls back like a trace's and `startTime` falls back like a trace timestamp. `level` arrives uppercase (`DEBUG`, `DEFAULT`, `WARNING`, `ERROR`) and is lowercased; it defaults to `default`. `parentObservationId`, `name`, `endTime`, `completionStartTime` (a streamed generation's first-token time), `statusMessage`, `model`, `modelParameters`, `input`, `output` and `costDetails` map directly.
 - **Usage:** `usageDetails`, or `usage` when `usageDetails` is absent, in any of LangFuse's historical shapes: the legacy `{ input, output, total, unit }`, the OpenAI-shaped `{ promptTokens, completionTokens, totalTokens }`, or a plain map of numbers. Every finite, non-negative number is rounded to an integer (the column is an unsigned integer map, and one bad value would fail the whole insert), other values such as `unit` are ignored, and key names are canonicalized (`spec/usage-keys-v1.md`). An observation with usage and a model but no cost gets a derived cost (`spec/cost-pricing-v1.md`).
 - **Score:** requires `traceId`, `name` and `value`. A numeric `value` is stored as `numeric` and a string as `categorical` with `stringValue`; `dataType`, if sent, must be `NUMERIC`, `CATEGORICAL` or `BOOLEAN` but does not change the stored type. `observationId` and `comment` map directly, `source` is `api`, and a missing `id` falls back like a trace's. The score is stored with its batch's receive time as its timestamp.
-- A record sent without an `id` takes its event's `id`, which the stored batch keeps across worker retries and the SDK keeps when it resends a request, so a retry writes the same record rather than a copy. An event `id` that is not a valid identifier is hashed into one (`lf_` and 32 hex characters).
+- A record sent without an `id` gets one derived from its event: `lf_` and the first 32 hex characters of a SHA-256 of the event's type, id, timestamp and body (keys sorted). A worker retry replays the stored batch and a client resend repeats the event, so both write the same record again rather than a copy, while a client that reuses an event id for different records still gets distinct ones. An event without a body id is never grouped with another event. The LangFuse JS SDK always sends body ids; this covers other clients.
 - Metadata values that are not strings are JSON-stringified, as are `modelParameters` values that are not strings, numbers, booleans or `null`.
 
 ### Response

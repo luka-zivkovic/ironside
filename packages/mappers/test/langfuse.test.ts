@@ -481,24 +481,41 @@ describe("mapLangfuseIngestionRequest — records sent without an id", () => {
       batchEvent({ id: "evt_span", type: "span-create", body: { traceId: "trace_1", name: "step" } }),
       batchEvent({ id: "evt_score", type: "score-create", body: { traceId: "trace_1", name: "helpful", value: 1 } })
     ]);
+  const score = (id: string, body: Record<string, unknown>) =>
+    batchEvent({ id, type: "score-create", body: { traceId: "trace_1", ...body } });
 
-  it("takes each record's event id, so mapping the same request again writes the same records", () => {
+  it("derives each record's id from its event, so mapping the same request again writes the same records", () => {
     const first = mapLangfuseIngestionRequest("proj_x", withoutIds()).rows;
     const again = mapLangfuseIngestionRequest("proj_x", withoutIds()).rows;
 
-    expect(first.traces.map((row) => row.id)).toEqual(["evt_trace"]);
-    expect(first.observations.map((row) => row.id)).toEqual(["evt_span"]);
-    expect(first.scores.map((row) => row.id)).toEqual(["evt_score"]);
+    for (const row of [...first.traces, ...first.observations, ...first.scores]) {
+      expect(row.id).toMatch(/^lf_[0-9a-f]{32}$/);
+    }
     expect(again).toEqual(first);
   });
 
-  it("hashes an event id that is not a valid identifier into a stable one", () => {
-    const map = () =>
-      mapLangfuseIngestionRequest(
-        "proj_x",
-        request([batchEvent({ id: "", type: "score-create", body: { traceId: "trace_1", name: "helpful", value: 1 } })])
-      ).rows.scores[0]?.id;
-    expect(map()).toMatch(/^lf_[0-9a-f]{32}$/);
-    expect(map()).toBe(map());
+  it("keeps records apart when a client reuses an event id for different content", () => {
+    const { rows } = mapLangfuseIngestionRequest(
+      "proj_x",
+      request([
+        score("dup", { name: "helpful", value: 1 }),
+        score("dup", { name: "correct", value: 0 }),
+        batchEvent({ id: "dup", body: { name: "first" } }),
+        batchEvent({ id: "dup", body: { name: "second" } })
+      ])
+    );
+    expect(rows.scores.map((row) => row.name)).toEqual(["helpful", "correct"]);
+    expect(new Set(rows.scores.map((row) => row.id)).size).toBe(2);
+    // Without a body id an event is never merged with another.
+    expect(rows.traces.map((row) => row.name)).toEqual(["first", "second"]);
+    expect(new Set(rows.traces.map((row) => row.id)).size).toBe(2);
+  });
+
+  it("gives the same event the same id whatever the order of its keys, and never the raw event id", () => {
+    const id = (body: Record<string, unknown>) =>
+      mapLangfuseIngestionRequest("proj_x", request([score("evt_1", body)])).rows.scores[0]?.id;
+    expect(id({ name: "helpful", value: 1 })).toBe(id({ value: 1, name: "helpful" }));
+    expect(id({ name: "helpful", value: 1 })).not.toBe(id({ name: "helpful", value: 2 }));
+    expect(id({ name: "helpful", value: 1 })).not.toBe("evt_1");
   });
 });

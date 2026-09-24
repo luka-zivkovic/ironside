@@ -8,7 +8,7 @@ import {
   type LangfuseIngestionResponse
 } from "@ironside/shared";
 import { createHash } from "node:crypto";
-import { identifierSchema, normalizeEnvironment } from "@ironside/shared";
+import { normalizeEnvironment } from "@ironside/shared";
 import { canonicalizeUsageKeys } from "./usage-keys.js";
 
 // Maps a LangFuse /api/public/ingestion batch to Ironside's domain model.
@@ -80,7 +80,7 @@ export function mapLangfuseIngestionRequest(
   const sdkLogEventIds: string[] = [];
   const invalidEventIds: { id: string; message: string }[] = [];
 
-  for (const event of request.batch) {
+  for (const [index, event] of request.batch.entries()) {
     const kind = classify(event.type);
     if (kind === "invalid") {
       invalidEventIds.push({ id: event.id, message: `unsupported event type: ${event.type}` });
@@ -96,7 +96,8 @@ export function mapLangfuseIngestionRequest(
     }
     if (kind === "trace") {
       const bodyId = getBodyId(event);
-      const key = bodyId ?? `__no_id_${event.id}`; // no id -> can't be merged with anything else, own group
+      // Without a body id an event cannot be tied to any other: its own group.
+      const key = bodyId !== undefined ? `id:${bodyId}` : `event:${index}`;
       const group = traceGroups.get(key) ?? [];
       group.push(event);
       traceGroups.set(key, group);
@@ -104,7 +105,7 @@ export function mapLangfuseIngestionRequest(
     }
     // observation kinds (span/generation/event)
     const bodyId = getBodyId(event);
-    const key = bodyId ?? `__no_id_${event.id}`;
+    const key = bodyId !== undefined ? `id:${bodyId}` : `event:${index}`;
     const existing = observationGroups.get(key);
     if (existing) {
       existing.events.push(event);
@@ -176,15 +177,29 @@ function classify(type: LangfuseBatchEvent["type"]): Classification {
 }
 
 /**
- * The id of a record sent without one: its event's id. The stored batch keeps
- * it across worker retries and the SDK keeps it when it resends a request, so
- * a retry writes the same record again instead of a copy. A record without an
- * id is its own group, so it has exactly one event. An event id that is not a
- * valid identifier is hashed into one.
+ * The id of a record sent without one, derived from its event: a hash of the
+ * event's type, id, timestamp and body. A worker retry replays the same stored
+ * batch and a client resend repeats the same event, so both write the same
+ * record again instead of a copy. The content is part of the hash because
+ * nothing makes event ids unique: a client reusing them for different records
+ * still gets distinct ones. A record without an id is its own group, so it has
+ * exactly one event.
  */
 function idFromEvent(event: LangfuseBatchEvent): string {
-  const parsed = identifierSchema.safeParse(event.id);
-  return parsed.success ? parsed.data : `lf_${createHash("sha256").update(event.id).digest("hex").slice(0, 32)}`;
+  const content = canonicalJson([event.type, event.id, event.timestamp ?? null, event.body ?? null]);
+  return `lf_${createHash("sha256").update(content).digest("hex").slice(0, 32)}`;
+}
+
+/** JSON with object keys sorted, so the same content always hashes the same. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, entry]) => entry !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
 }
 
 /** Reads body.id without full schema validation, just to group events by target entity. */
