@@ -4,11 +4,10 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { runMigrations } from "../src/migrate.js";
 import {
   claimWebhookDelivery,
-  coverScannerDelivery,
   createWebhookRule,
   getWebhookDeliveryStatus,
   getWebhookRule,
-  listScannerDeliveries,
+  markWebhookCovered,
   markWebhookDelivered,
   markWebhookFailed,
   recordWebhookRun
@@ -185,61 +184,20 @@ describe("claimWebhookDelivery — exactly-once per settled version", () => {
   });
 });
 
-describe("scanner deliveries — keyed by activity time before migration 0006", () => {
-  async function scannerDelivery(traceId: string, status: "delivered" | "failed" | "pending" | "stale") {
-    const id = (await claimWebhookDelivery(pool, `d_${ulid()}`, ruleId, traceId, TRACE_VERSION))!;
-    if (status === "delivered") await markWebhookDelivered(pool, id);
-    if (status === "failed") await markWebhookFailed(pool, id, "HTTP 500");
-    if (status === "stale") {
-      await pool.query("update webhook_deliveries set attempted_at = now() - interval '11 minutes' where id = $1", [id]);
-    }
-  }
+describe("markWebhookCovered", () => {
+  it("leaves a key that a claim cannot take, and that reads back as covered", async () => {
+    const traceId = `trace_${ulid()}`;
+    const claimed = (await claimWebhookDelivery(pool, `d_${ulid()}`, ruleId, traceId, TRACE_VERSION))!;
+    await markWebhookCovered(pool, claimed);
 
-  it("reports a delivered or freshly pending scanner delivery, and nothing for failed, stale or covered keys", async () => {
-    const traces = {
-      delivered: `trace_${ulid()}`,
-      pending: `trace_${ulid()}`,
-      stale: `trace_${ulid()}`,
-      failed: `trace_${ulid()}`,
-      covered: `trace_${ulid()}`,
-      none: `trace_${ulid()}`
-    };
-    await scannerDelivery(traces.delivered, "delivered");
-    await scannerDelivery(traces.pending, "pending");
-    await scannerDelivery(traces.stale, "stale");
-    await scannerDelivery(traces.failed, "failed");
-    await coverScannerDelivery(pool, `d_${ulid()}`, ruleId, traces.covered, TRACE_VERSION);
-
-    const found = await listScannerDeliveries(
-      pool,
-      ruleId,
-      Object.values(traces).map((traceId) => ({ traceId, activityVersion: TRACE_VERSION }))
+    expect(await getWebhookDeliveryStatus(pool, ruleId, traceId, TRACE_VERSION)).toBe("covered");
+    // The 0.3.0 claim is the same statement: it takes over only failed or stale pending rows.
+    expect(await claimWebhookDelivery(pool, `d_${ulid()}`, ruleId, traceId, TRACE_VERSION)).toBeNull();
+    await pool.query(
+      "update webhook_deliveries set attempted_at = now() - interval '1 hour' where id = $1",
+      [claimed]
     );
-    expect(Object.fromEntries(found)).toEqual({
-      [traces.delivered]: "delivered",
-      [traces.pending]: "in-flight"
-    });
-    expect(await listScannerDeliveries(pool, ruleId, [])).toEqual(new Map());
-  });
-
-  it("covering a key stops a previous-release claim, takes over a failed or stale attempt, and never touches a delivered one", async () => {
-    const fresh = `trace_${ulid()}`;
-    await coverScannerDelivery(pool, `d_${ulid()}`, ruleId, fresh, TRACE_VERSION);
-    expect(await getWebhookDeliveryStatus(pool, ruleId, fresh, TRACE_VERSION)).toBe("covered");
-    expect(await claimWebhookDelivery(pool, `d_${ulid()}`, ruleId, fresh, TRACE_VERSION)).toBeNull();
-
-    for (const status of ["failed", "stale"] as const) {
-      const traceId = `trace_${ulid()}`;
-      await scannerDelivery(traceId, status);
-      await coverScannerDelivery(pool, `d_${ulid()}`, ruleId, traceId, TRACE_VERSION);
-      expect(await getWebhookDeliveryStatus(pool, ruleId, traceId, TRACE_VERSION)).toBe("covered");
-      expect(await claimWebhookDelivery(pool, `d_${ulid()}`, ruleId, traceId, TRACE_VERSION)).toBeNull();
-    }
-
-    const delivered = `trace_${ulid()}`;
-    await scannerDelivery(delivered, "delivered");
-    await coverScannerDelivery(pool, `d_${ulid()}`, ruleId, delivered, TRACE_VERSION);
-    expect(await getWebhookDeliveryStatus(pool, ruleId, delivered, TRACE_VERSION)).toBe("delivered");
+    expect(await claimWebhookDelivery(pool, `d_${ulid()}`, ruleId, traceId, TRACE_VERSION)).toBeNull();
     expect(await getWebhookDeliveryStatus(pool, ruleId, `trace_${ulid()}`, TRACE_VERSION)).toBeNull();
   });
 });

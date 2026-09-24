@@ -2,9 +2,8 @@ import { createHmac } from "node:crypto";
 import type { ClickHouseClient, VersionedTraceSummaryRow } from "@ironside/clickhouse";
 import {
   claimWebhookDelivery,
-  coverScannerDelivery,
   getWebhookDeliveryStatus,
-  listScannerDeliveries,
+  markWebhookCovered,
   markWebhookDelivered,
   markWebhookFailed,
   recordWebhookRun,
@@ -13,7 +12,7 @@ import {
 import { traceSettledBefore } from "@ironside/shared";
 import type { Pool } from "pg";
 import { ulid } from "ulid";
-import { readSettledTraceFeed, type SettledFeedEntry } from "../exporters/settled-trace-feed.js";
+import { readSettledTraceFeed } from "../exporters/settled-trace-feed.js";
 import { matchesExportFilter } from "../exporters/trace-filter.js";
 import { assertPublicHttpDestination } from "../lib/ssrf-guard.js";
 
@@ -75,6 +74,13 @@ interface WebhookPayload {
 type DeliveryOutcome = "delivered" | "already-delivered" | "in-flight" | { error: string };
 
 /**
+ * How a run treats a trace's scanner key, the activity-time key a pre-0006
+ * worker delivers under: claim it like that worker does while one may still
+ * be running, only look for its delivery once none can be, or ignore it.
+ */
+type ScannerKeyMode = "claim" | "check" | "none";
+
+/**
  * Delivers a webhook POST for each matching settled trace version published
  * to the durable trace feed after the rule's position, in feed order
  * (spec/webhooks-v1.md). Each version is delivered successfully exactly once:
@@ -87,11 +93,12 @@ type DeliveryOutcome = "delivered" | "already-delivered" | "in-flight" | { error
  * still sending. Every run records its status on the rule.
  *
  * Workers before migration 0006 keyed a delivery by the trace's activity
- * time instead of its feed version. A run honors those deliveries for feed
- * entries published before the rule's scanner handoff, and for a day after
- * it, when such a worker may still be running beside this one; in that window
- * it also marks each trace it delivers under the old key, so the older worker
- * does not send it again.
+ * time (its scanner key) instead of its feed version. For a day after the
+ * rule's scanner handoff, when such a worker may still be running beside this
+ * one, a run claims the scanner key before sending, exactly as that worker
+ * does, and marks it covered after sending, so each trace is sent by only one
+ * of them. After that day it only skips traces that worker delivered, for
+ * entries published before the day ended.
  *
  * Body is signed with HMAC-SHA256 over the raw JSON string (not a
  * re-serialized object, which could differ byte-for-byte from what was
@@ -107,7 +114,9 @@ type DeliveryOutcome = "delivered" | "already-delivered" | "in-flight" | { error
 export async function runWebhooks(options: RunWebhooksOptions): Promise<WebhookRunResult> {
   const { pool, clickhouse, rule } = options;
   const settledBefore = traceSettledBefore(options.traceQuietPeriodSeconds);
-  const handoffOpen = Date.now() < Date.parse(rule.scannerHandoffAt) + SCANNER_HANDOFF_WINDOW_MS;
+  const handoffEnds = Date.parse(rule.scannerHandoffAt) + SCANNER_HANDOFF_WINDOW_MS;
+  const scannerKeyMode = (entry: { cursor: { publishedAt: string } }): ScannerKeyMode =>
+    Date.now() < handoffEnds ? "claim" : Date.parse(entry.cursor.publishedAt) <= handoffEnds ? "check" : "none";
 
   let cursor = rule.feedCursor;
   let backlog = false;
@@ -129,24 +138,14 @@ export async function runWebhooks(options: RunWebhooksOptions): Promise<WebhookR
           limit: Math.min(FEED_PAGE_SIZE, MAX_DELIVERIES_PER_RUN - result.delivered)
         }
       );
-      const scannerDeliveries = await listScannerDeliveriesOnPage(pool, rule, page.entries, handoffOpen);
 
       for (const entry of page.entries) {
         const { trace, version } = entry;
         if (trace && version !== undefined && matchesExportFilter(trace, rule.filter)) {
           result.matched += 1;
-          const scanner = scannerDeliveries.get(trace.id);
-          const outcome =
-            scanner === "delivered"
-              ? "already-delivered"
-              : scanner === "in-flight"
-                ? "in-flight"
-                : await deliver(options, trace, version);
+          const outcome = await deliver(options, trace, version, scannerKeyMode(entry));
           if (outcome === "delivered") {
             result.delivered += 1;
-            if (handoffOpen) {
-              await coverScannerDelivery(pool, ulid(), rule.id, trace.id, trace.trace_version);
-            }
           } else if (outcome === "already-delivered") {
             result.skipped += 1;
           } else if (outcome === "in-flight") {
@@ -194,36 +193,41 @@ export async function runWebhooks(options: RunWebhooksOptions): Promise<WebhookR
   }
 }
 
-/**
- * What a pre-0006 worker delivered, or is delivering, for this page's traces
- * under their activity time, which a feed entry carries as
- * `trace.trace_version`. Only entries published before the rule's handoff can
- * have such a delivery, unless a previous-release worker may still be running.
- */
-async function listScannerDeliveriesOnPage(
-  pool: Pool,
-  rule: WebhookRule,
-  entries: SettledFeedEntry[],
-  handoffOpen: boolean
-): Promise<Map<string, "delivered" | "in-flight">> {
-  const versions = entries.flatMap((entry) =>
-    entry.trace && (handoffOpen || entry.cursor.publishedAt <= rule.scannerHandoffAt)
-      ? [{ traceId: entry.trace.id, activityVersion: entry.trace.trace_version }]
-      : []
-  );
-  return listScannerDeliveries(pool, rule.id, versions);
-}
-
 async function deliver(
   options: RunWebhooksOptions,
   trace: VersionedTraceSummaryRow,
-  version: string
+  version: string,
+  scannerKeyMode: ScannerKeyMode
 ): Promise<DeliveryOutcome> {
   const { pool, rule } = options;
+  // The scanner key is the trace's activity time, which a feed entry carries as trace_version.
+  const scannerKey = trace.trace_version;
+  let scannerClaimId: string | null = null;
+  if (scannerKeyMode === "claim") {
+    scannerClaimId = await claimWebhookDelivery(pool, ulid(), rule.id, trace.id, scannerKey);
+    if (!scannerClaimId) {
+      const status = await getWebhookDeliveryStatus(pool, rule.id, trace.id, scannerKey);
+      if (status === "delivered") return "already-delivered";
+      // "covered": an earlier feed version of this trace, with the same
+      // activity time, already holds the key; this version is still new.
+      if (status !== "covered") return "in-flight";
+    }
+  } else if (scannerKeyMode === "check") {
+    if ((await getWebhookDeliveryStatus(pool, rule.id, trace.id, scannerKey)) === "delivered") {
+      return "already-delivered";
+    }
+  }
+
   const deliveryId = await claimWebhookDelivery(pool, ulid(), rule.id, trace.id, version);
   if (!deliveryId) {
     const status = await getWebhookDeliveryStatus(pool, rule.id, trace.id, version);
-    return status === "delivered" || status === "covered" ? "already-delivered" : "in-flight";
+    const delivered = status === "delivered" || status === "covered";
+    if (scannerClaimId) {
+      await (delivered
+        ? markWebhookCovered(pool, scannerClaimId)
+        : markWebhookFailed(pool, scannerClaimId, "not sent: another run holds this version"));
+    }
+    return delivered ? "already-delivered" : "in-flight";
   }
 
   const body = JSON.stringify({
@@ -257,6 +261,8 @@ async function deliver(
     // destination has not (confirmably) received this webhook yet.
     const message = error instanceof Error ? error.message : String(error);
     await markWebhookFailed(pool, deliveryId, message);
+    // Released, so whichever worker retries first may send it.
+    if (scannerClaimId) await markWebhookFailed(pool, scannerClaimId, message);
     return { error: message };
   }
 
@@ -267,5 +273,6 @@ async function deliver(
   // would let a future run send a genuine duplicate). Let it propagate
   // so the caller/ops sees "delivered but failed to record" distinctly.
   await markWebhookDelivered(pool, deliveryId);
+  if (scannerClaimId) await markWebhookCovered(pool, scannerClaimId);
   return "delivered";
 }

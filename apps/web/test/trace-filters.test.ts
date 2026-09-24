@@ -35,6 +35,13 @@ describe("trace explorer filters", () => {
     );
   });
 
+  it("cuts search and model text from a shared link to the length the API accepts", () => {
+    const long = "x".repeat(250);
+    const filters = filtersFromSearchParams(new URLSearchParams({ q: long, model: long }));
+    expect(filters.search).toHaveLength(200);
+    expect(filters.model).toHaveLength(200);
+  });
+
   it("drops an unknown level and invalid floors instead of sharing a filter the list ignores", () => {
     expect(filtersFromSearchParams(new URLSearchParams("level=fatal")).level).toBe("");
     expect(searchParamsFromFilters(filters({ minLatencySeconds: "-1", minCost: "cheap" })).toString()).toBe("");

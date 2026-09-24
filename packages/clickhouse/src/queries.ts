@@ -177,9 +177,10 @@ function buildTraceConditions(filter: TraceFilter): {
   }
   if (filter.minCost !== undefined) {
     conditions.push(
-      tracesWhereObservations(`sum(${OBSERVATION_COST}) >= toDecimal128({minCost:Float64}, 9)`)
+      tracesWhereObservations(`sum(${OBSERVATION_COST}) >= toDecimal128({minCost:String}, 9)`)
     );
-    params.minCost = filter.minCost;
+    // As decimal text: converting a Float64 truncates, so 1.001 would become 1.000999999.
+    params.minCost = filter.minCost.toFixed(9);
   }
 
   if (filter.settledBefore) {

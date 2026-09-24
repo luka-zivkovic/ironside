@@ -23,8 +23,7 @@ export interface WebhookRule {
    * When the rule moved to feed-version deliveries: the migration time for a
    * rule that existed before migration 0006, otherwise its creation time. In
    * the feed cursor's microsecond ISO format. A worker from the previous
-   * release keys deliveries by the trace's activity time; see
-   * listScannerDeliveries.
+   * release keys deliveries by the trace's activity time; see runWebhooks.
    */
   scannerHandoffAt: string;
   lastRunAt: Date | null;
@@ -240,7 +239,7 @@ export async function recordWebhookRun(
 const UNCHANGED = `feed_cursor_published_at is not distinct from $5::timestamptz
   and feed_cursor_trace_id is not distinct from $6::text`;
 
-/** "covered" marks a scanner key already delivered under the trace's feed version (coverScannerDelivery). */
+/** "covered" marks a scanner key already delivered under the trace's feed version (markWebhookCovered). */
 export type WebhookDeliveryStatus = "pending" | "delivered" | "failed" | "covered";
 
 /**
@@ -330,59 +329,15 @@ export async function getWebhookDeliveryStatus(
 }
 
 /**
- * Deliveries a pre-0006 worker (the scanner) made or is making for these
- * traces, which it keys by the trace's activity time. A trace is "delivered"
- * when the scanner's delivery succeeded, and "in-flight" while its attempt is
- * pending and not yet stale. Rows this release writes are keyed by feed
- * version, or marked "covered" (coverScannerDelivery), so they never match.
+ * Marks a claimed delivery row "covered": its trace was delivered under
+ * another key. Used for a trace's scanner key (its activity time), which a
+ * pre-0006 worker still running beside this one would otherwise claim and
+ * send; its claim takes over only a failed or stale pending row, which a
+ * covered row is neither.
  */
-export async function listScannerDeliveries(
-  pool: Pool,
-  webhookRuleId: string,
-  versions: { traceId: string; activityVersion: string }[]
-): Promise<Map<string, "delivered" | "in-flight">> {
-  if (versions.length === 0) return new Map();
-  const result = await pool.query<{ trace_id: string; status: "delivered" | "in-flight" }>(
-    `select delivery.trace_id,
-            case when delivery.status = 'delivered' then 'delivered' else 'in-flight' end as status
-     from webhook_deliveries as delivery
-     join unnest($2::text[], $3::timestamptz[]) as version(trace_id, trace_version)
-       on delivery.trace_id = version.trace_id and delivery.trace_version = version.trace_version
-     where delivery.webhook_rule_id = $1
-       and (delivery.status = 'delivered'
-            or (delivery.status = 'pending'
-                and delivery.attempted_at >= now() - interval '${STALE_PENDING_MINUTES} minutes'))`,
-    [
-      webhookRuleId,
-      versions.map((version) => version.traceId),
-      versions.map((version) => version.activityVersion)
-    ]
-  );
-  return new Map(result.rows.map((row) => [row.trace_id, row.status]));
-}
-
-/**
- * Records that a trace's delivery by feed version also covers its scanner key
- * (its activity time), so a pre-0006 worker still running beside this one
- * finds the key taken and does not send the trace again. Its claim takes over
- * only a failed or stale pending row, which "covered" is neither.
- */
-export async function coverScannerDelivery(
-  pool: Pool,
-  id: string,
-  webhookRuleId: string,
-  traceId: string,
-  activityVersion: string
-): Promise<void> {
+export async function markWebhookCovered(pool: Pool, deliveryId: string): Promise<void> {
   await pool.query(
-    `insert into webhook_deliveries
-       (id, webhook_rule_id, trace_id, trace_version, status, attempted_at, delivered_at)
-     values ($1, $2, $3, $4::timestamptz, 'covered', now(), now())
-     on conflict (webhook_rule_id, trace_id, trace_version) do update
-       set status = 'covered', delivered_at = now()
-       where webhook_deliveries.status = 'failed'
-          or (webhook_deliveries.status = 'pending'
-              and webhook_deliveries.attempted_at < now() - interval '${STALE_PENDING_MINUTES} minutes')`,
-    [id, webhookRuleId, traceId, activityVersion]
+    "update webhook_deliveries set status = 'covered', delivered_at = now() where id = $1",
+    [deliveryId]
   );
 }

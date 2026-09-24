@@ -1,4 +1,4 @@
-import { MAX_MIN_COST_USD, MAX_MIN_DURATION_MS } from "@ironside/shared/browser";
+import { MAX_MIN_COST_USD, MAX_MIN_DURATION_MS, MAX_TRACE_FILTER_TEXT_LENGTH } from "@ironside/shared/browser";
 import type { ListTracesParams } from "@/lib/api";
 import { parseTimeRange, rangeFrom, type TimeRange } from "@/lib/trace-analytics";
 
@@ -114,15 +114,17 @@ export function toParams(filters: Filters, cursor: string | null, now: Date = ne
 }
 
 export function filtersFromSearchParams(search: URLSearchParams): Filters {
+  // A shared link can carry longer text than the inputs allow; the API would reject it.
+  const text = (name: string) => (search.get(name) ?? "").slice(0, MAX_TRACE_FILTER_TEXT_LENGTH);
   return {
-    search: search.get("q") ?? "",
+    search: text("q"),
     userId: search.get("userId") ?? "",
     sessionId: search.get("sessionId") ?? "",
     tags: search.getAll("tags").join(", "),
     environment: search.get("environment") ?? "",
     range: parseTimeRange(search.get("range")),
     level: parseLevel(search.get("level")),
-    model: search.get("model") ?? "",
+    model: text("model"),
     minLatencySeconds: search.get("minLatency") ?? "",
     minCost: search.get("minCost") ?? ""
   };

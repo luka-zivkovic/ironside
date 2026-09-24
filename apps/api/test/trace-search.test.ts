@@ -232,6 +232,19 @@ describe("GET /traces — search and filters", () => {
     expect(((await aggregates.json()) as { traceCount: number }).traceCount).toBe(1);
   });
 
+  it("compares against the floor exactly as written, not as a rounded-down float", async () => {
+    const tag = `floor_${ulid()}`;
+    const justBelow = `trace_below_${ulid()}`;
+    const eventTs = new Date().toISOString();
+    await insertTraces(clickhouse, [trace(justBelow, { tags: [tag] })], { eventTs });
+    await insertObservations(clickhouse, [observation(justBelow, "call", { costDetails: { total: 1.000999999 } })], {
+      eventTs
+    });
+    // As a Float64, 1.001 converts to the Decimal 1.000999999.
+    const list = await get(`/traces?tags=${tag}&minCost=1.001`);
+    expect(((await list.json()) as { traces: TraceSummary[] }).traces).toEqual([]);
+  });
+
   it("rejects invalid filter values", async () => {
     for (const query of [
       "level=fatal",

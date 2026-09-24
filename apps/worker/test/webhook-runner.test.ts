@@ -318,7 +318,7 @@ describe("runWebhooks", () => {
       expect(await claimWebhookDelivery(pool, `d_${ulid()}`, hook.id, hooked.id, activity)).toBeNull();
     });
 
-    it("after the handoff window, honors old deliveries only for traces published before the handoff", async () => {
+    it("after the handoff window, honors old deliveries only for traces published before the window ended", async () => {
       const projectId = await newProject();
       const early = trace(projectId);
       const late = trace(projectId);
@@ -338,6 +338,56 @@ describe("runWebhooks", () => {
       expect(payloads().map((payload) => payload.traceId)).toEqual([late.id]);
       // Outside the window nothing is marked under the old key.
       expect(await getWebhookDeliveryStatus(pool, hook.id, late.id, lateActivity)).toBe("delivered");
+    });
+
+    it("holds the old key while it sends, so the previous release cannot claim the trace meanwhile", async () => {
+      const projectId = await newProject();
+      const hooked = trace(projectId);
+      const activity = await publish(hooked);
+      const hook = await rule(projectId);
+
+      let oldClaimDuringSend: string | null | undefined;
+      const fetchImpl = (async () => {
+        oldClaimDuringSend = await claimWebhookDelivery(pool, `d_${ulid()}`, hook.id, hooked.id, activity);
+        return new Response("{}", { status: 200 });
+      }) as unknown as typeof fetch;
+
+      expect((await run(hook, { fetchImpl })).delivered).toBe(1);
+      expect(oldClaimDuringSend).toBeNull();
+      expect(await getWebhookDeliveryStatus(pool, hook.id, hooked.id, activity)).toBe("covered");
+    });
+
+    it("releases the old key when its send fails, so either release may retry", async () => {
+      const projectId = await newProject();
+      const hooked = trace(projectId);
+      const activity = await publish(hooked);
+      const hook = await rule(projectId);
+
+      respondWithStatus = 503;
+      expect((await run(hook)).failed).toHaveLength(1);
+      expect(await getWebhookDeliveryStatus(pool, hook.id, hooked.id, activity)).toBe("failed");
+
+      // The previous release retries first and delivers; this release then skips the trace.
+      await scannerDelivery(hook, hooked.id, activity);
+      respondWithStatus = 200;
+      expect(await run(hook)).toEqual({ matched: 1, delivered: 0, skipped: 1, failed: [] });
+    });
+
+    it("after the window, still skips what the previous release sent for entries published inside it", async () => {
+      const projectId = await newProject();
+      const hooked = trace(projectId);
+      const activity = await publish(hooked);
+      const hook = await rule(projectId);
+      await scannerDelivery(hook, hooked.id, activity);
+      // Handed off 48 hours ago; the trace was published an hour into the window.
+      await moveHandoff(hook, "now() - interval '48 hours'");
+      await pool.query(
+        "update evaluator_trace_feed set published_at = now() - interval '47 hours' where project_id = $1 and trace_id = $2",
+        [projectId, hooked.id]
+      );
+
+      expect(await run(hook)).toEqual({ matched: 1, delivered: 0, skipped: 1, failed: [] });
+      expect(receivedRequests).toHaveLength(0);
     });
 
     it("sends a republished trace again even when its activity time matches an old delivery, once the window has passed", async () => {
