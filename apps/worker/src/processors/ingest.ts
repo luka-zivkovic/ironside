@@ -1,6 +1,7 @@
 import type { ClickHouseClient } from "@ironside/clickhouse";
 import {
   deleteMovedObservationRows,
+  deleteMovedScoreRows,
   deleteMovedTraceRows,
   hasPendingRawObjectRefs,
   insertObservations,
@@ -42,6 +43,7 @@ import { ulid } from "ulid";
 import { observeTraceEnvironments } from "../environments/environment-registry.js";
 import { enrichObservationCosts } from "./cost-enrichment.js";
 import { foldLangfuseRows, langfuseEntities, mergeLangfuseRows } from "./langfuse-merge.js";
+import { resolveMovedRows } from "./moved-rows.js";
 
 export interface IngestProcessorDeps {
   storage: ObjectStorage;
@@ -211,13 +213,28 @@ export function createIngestProcessor(deps: IngestProcessorDeps) {
         receivedAt: batch.receivedAt,
         rows: langfuse
       });
-      const traces = [...nativeRows.traces, ...otlpTraces, ...merged.traces];
-      const observations = [
-        ...nativeRows.observations,
-        ...otlpObservations,
-        ...merged.observations
-      ];
-      const scores = [...nativeRows.scores, ...langfuse.scores];
+      // A score without a timestamp takes the batch's receive time rather than
+      // the insert time, so a retried batch writes it under the same sort key.
+      const incomingScores = [...nativeRows.scores, ...langfuse.scores].map((score) =>
+        score.timestamp ? score : { ...score, timestamp: batch.receivedAt }
+      );
+      // Records written again on another day: delete their old rows, or skip
+      // this batch's row when a stored one is newer (moved-rows.ts).
+      const resolved = await resolveMovedRows(deps.clickhouse, {
+        projectId,
+        receivedAt: batch.receivedAt,
+        traces: [...nativeRows.traces, ...otlpTraces],
+        observations: [...nativeRows.observations, ...otlpObservations],
+        scores: incomingScores,
+        merged: { traces: merged.traces, observations: merged.observations, rowEventTs: merged.rowEventTs }
+      });
+      const traces = [...resolved.traces, ...merged.traces];
+      const observations = [...resolved.observations, ...merged.observations];
+      const scores = resolved.scores;
+      // Every trace this batch touched, including through rows left out as
+      // stale: its raw object still holds their events.
+      const batchTraces = [...nativeRows.traces, ...otlpTraces, ...merged.traces];
+      const batchObservations = [...nativeRows.observations, ...otlpObservations, ...merged.observations];
 
       // Derive cost where the source reported usage and a model but no cost.
       // Client-sent cost is never touched; a project override or the vendored
@@ -227,9 +244,9 @@ export function createIngestProcessor(deps: IngestProcessorDeps) {
 
       const traceIds = [
         ...new Set([
-          ...traces.map((trace) => trace.id),
-          ...observations.map((observation) => observation.traceId),
-          ...scores.map((score) => score.traceId)
+          ...batchTraces.map((trace) => trace.id),
+          ...batchObservations.map((observation) => observation.traceId),
+          ...incomingScores.map((score) => score.traceId)
         ])
       ];
 
@@ -240,8 +257,8 @@ export function createIngestProcessor(deps: IngestProcessorDeps) {
         receivedAt: batch.receivedAt
       }));
       const snapshotTraceIds = new Set([
-        ...traces.map((trace) => trace.id),
-        ...observations.map((observation) => observation.traceId)
+        ...batchTraces.map((trace) => trace.id),
+        ...batchObservations.map((observation) => observation.traceId)
       ]);
       const snapshotRawRefs = rawRefs.filter((ref) => snapshotTraceIds.has(ref.traceId));
       const annotationOnlyRawRefs = rawRefs.filter((ref) => !snapshotTraceIds.has(ref.traceId));
@@ -265,11 +282,17 @@ export function createIngestProcessor(deps: IngestProcessorDeps) {
         await Promise.all([
           insertTraces(deps.clickhouse, traces, traceOptions),
           insertObservations(deps.clickhouse, observations, observationOptions),
-          insertScores(deps.clickhouse, scores, insertOptions),
-          // A merge that moved a record to another day leaves its old row
-          // under the old sort key; delete it with the moved row's version.
-          deleteMovedTraceRows(deps.clickhouse, merged.moved.traces, traceOptions),
-          deleteMovedObservationRows(deps.clickhouse, merged.moved.observations, observationOptions)
+          insertScores(deps.clickhouse, scores, insertOptions)
+        ]);
+        // Then the rows these records left under another day, with the
+        // version of the row that replaces them (moved-rows.ts). A failure in
+        // between leaves a duplicate until the retry, never a missing record.
+        await Promise.all([
+          deleteMovedTraceRows(deps.clickhouse, resolved.deletions.traces, insertOptions),
+          deleteMovedObservationRows(deps.clickhouse, resolved.deletions.observations, insertOptions),
+          deleteMovedScoreRows(deps.clickhouse, resolved.deletions.scores, insertOptions),
+          deleteMovedTraceRows(deps.clickhouse, resolved.mergedDeletions.traces, traceOptions),
+          deleteMovedObservationRows(deps.clickhouse, resolved.mergedDeletions.observations, observationOptions)
         ]);
         // Evaluator score receipts suppress later HTTP retries only after the
         // durable ingest intent exists. Record the second commit point once its

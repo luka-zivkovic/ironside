@@ -4,11 +4,14 @@ import {
   getTraceRawIndex,
   getVersionedTrace,
   hasPendingTraceRawRefs,
+  insertObservations,
   insertRawEventRefs,
+  insertScores,
   insertTraces,
   listObservationsForTrace,
   runMigrations as runChMigrations
 } from "@ironside/clickhouse";
+import { mapNativeEvents } from "@ironside/mappers";
 import {
   claimEvaluatorScoreReceipt,
   claimRawRetentionIntentExecution,
@@ -37,6 +40,7 @@ import {
   recoverTerminalEvaluatorTraceRefs,
   settlePublishedEvaluatorTraceRefs
 } from "../src/processors/ingest.js";
+import { resolveMovedRows } from "../src/processors/moved-rows.js";
 
 // End-to-end pipeline test: build the same envelope apps/api would produce,
 // store it, enqueue it, then run the processor directly against the
@@ -928,5 +932,330 @@ describe("score feed publication", () => {
     );
     expect(published).toContain(scoredOnly);
     expect(published).not.toContain(withActivity);
+  });
+});
+
+describe("a record written again with a timestamp on another day", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const dayStart = Date.parse(new Date().toISOString().slice(0, 10) + "T00:00:00.000Z");
+  /** Noon on the day `days` before today, UTC. */
+  const noon = (days: number) => new Date(dayStart - days * DAY + 12 * 60 * 60 * 1000).toISOString();
+
+  function nativeBatch(receivedAt: string, events: { type: IngestBatch["events"][number]["type"]; body: unknown }[]): IngestBatch {
+    return {
+      batchId: ulid(),
+      projectId,
+      receivedAt,
+      events: events.map((event) => ({
+        id: ulid(),
+        type: event.type,
+        source: "native" as const,
+        schemaVersion: INGEST_SCHEMA_VERSION,
+        idempotencyKey: ulid(),
+        body: event.body
+      }))
+    };
+  }
+
+  async function run(batch: IngestBatch): Promise<void> {
+    const job = await storeAndEnqueue(batch);
+    await processBatch(job);
+    await job.remove();
+  }
+
+  /** Writes observations and scores directly, as a race between batches could have left them. */
+  async function observationsAndScores(
+    events: { type: "observation-upsert" | "score-upsert"; body: Record<string, unknown> }[],
+    eventTs: string
+  ): Promise<void> {
+    const { rows } = mapNativeEvents(projectId, nativeBatch(eventTs, events).events);
+    await insertObservations(clickhouse, rows.observations, { eventTs });
+    await insertScores(clickhouse, rows.scores, { eventTs });
+  }
+
+  async function liveRows(table: "traces" | "observations" | "scores", id: string, column: string): Promise<string[]> {
+    const result = await clickhouse.query({
+      query: `select toString(${column}) as at from ${table} final where project_id = {projectId:String} and id = {id:String}`,
+      query_params: { projectId, id },
+      format: "JSONEachRow"
+    });
+    return (await result.json<{ at: string }>()).map((row) => row.at.slice(0, 10));
+  }
+
+  it("keeps one trace and one observation, under the newer batch's day", async () => {
+    const traceId = `trace_${ulid()}`;
+    const observationId = `obs_${ulid()}`;
+    for (const day of [2, 1]) {
+      await run(
+        nativeBatch(noon(day), [
+          { type: "trace-upsert", body: { id: traceId, timestamp: noon(day), name: "checkout" } },
+          { type: "observation-upsert", body: { id: observationId, traceId, type: "span", startTime: noon(day) } }
+        ])
+      );
+    }
+    expect(await liveRows("traces", traceId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
+    expect(await liveRows("observations", observationId, "start_time")).toEqual([noon(1).slice(0, 10)]);
+  });
+
+  it("leaves out a stale batch's row when the record is stored newer under another day", async () => {
+    const traceId = `trace_${ulid()}`;
+    // Received second, processed first.
+    await run(nativeBatch(noon(1), [{ type: "trace-upsert", body: { id: traceId, timestamp: noon(1), name: "newer" } }]));
+    await run(nativeBatch(noon(2), [{ type: "trace-upsert", body: { id: traceId, timestamp: noon(2), name: "older" } }]));
+
+    expect(await liveRows("traces", traceId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
+    expect((await getTrace(clickhouse, projectId, traceId))?.name).toBe("newer");
+  });
+
+  it("keeps one score when it is sent again without a timestamp on a later day, and a retry lands on the same key", async () => {
+    const traceId = `trace_${ulid()}`;
+    const scoreId = `score_${ulid()}`;
+    const score = { id: scoreId, traceId, name: "helpful", dataType: "numeric", value: 1, source: "api", metadata: {} };
+    const first = nativeBatch(noon(2), [{ type: "score-upsert", body: score }]);
+    await run(first);
+    await run(first);
+    expect(await liveRows("scores", scoreId, "timestamp")).toEqual([noon(2).slice(0, 10)]);
+
+    await run(nativeBatch(noon(1), [{ type: "score-upsert", body: { ...score, value: 0 } }]));
+    expect(await liveRows("scores", scoreId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
+  });
+
+  it("keeps a record's last row when one batch writes it on two days, also when the batch is retried", async () => {
+    const traceId = `trace_${ulid()}`;
+    const scoreId = `score_${ulid()}`;
+    const score = { id: scoreId, traceId, name: "helpful", dataType: "numeric", source: "api", metadata: {} };
+    const batch = nativeBatch(noon(1), [
+      { type: "trace-upsert", body: { id: traceId, timestamp: noon(2), name: "first" } },
+      { type: "trace-upsert", body: { id: traceId, timestamp: noon(1), name: "last" } },
+      { type: "score-upsert", body: { ...score, value: 0, timestamp: noon(2) } },
+      { type: "score-upsert", body: { ...score, value: 1, timestamp: noon(1) } }
+    ]);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await run(batch);
+      expect(await liveRows("traces", traceId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
+      expect((await getTrace(clickhouse, projectId, traceId))?.name).toBe("last");
+      expect(await liveRows("scores", scoreId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
+    }
+  });
+
+  it("keeps the batch's last row when it moves a stored record away and back", async () => {
+    const traceId = `trace_${ulid()}`;
+    await run(nativeBatch(noon(3), [{ type: "trace-upsert", body: { id: traceId, timestamp: noon(3), name: "stored" } }]));
+    await run(
+      nativeBatch(noon(1), [
+        { type: "trace-upsert", body: { id: traceId, timestamp: noon(2), name: "moved" } },
+        { type: "trace-upsert", body: { id: traceId, timestamp: noon(3), name: "moved back" } }
+      ])
+    );
+    expect(await liveRows("traces", traceId, "timestamp")).toEqual([noon(3).slice(0, 10)]);
+    expect((await getTrace(clickhouse, projectId, traceId))?.name).toBe("moved back");
+  });
+
+  it("leaves out stale observations and scores too, and still removes stored rows older than the batch", async () => {
+    const traceId = `trace_${ulid()}`;
+    const observationId = `obs_${ulid()}`;
+    const scoreId = `score_${ulid()}`;
+    const events = (day: number, name: string) => [
+      { type: "observation-upsert" as const, body: { id: observationId, traceId, type: "span", name, startTime: noon(day) } },
+      { type: "score-upsert" as const, body: { id: scoreId, traceId, name, dataType: "numeric", value: 1, source: "api", metadata: {}, timestamp: noon(day) } }
+    ];
+    // An older duplicate on day 3 and the newest row on day 1, as a race could leave them.
+    await observationsAndScores(events(3, "old"), noon(3));
+    await observationsAndScores(events(1, "newest"), noon(1));
+    // Received on day 2 with rows on day 3: stale, but newer than the old duplicate.
+    await run(nativeBatch(noon(2), events(3, "stale")));
+
+    expect(await liveRows("observations", observationId, "start_time")).toEqual([noon(1).slice(0, 10)]);
+    expect(await liveRows("scores", scoreId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
+  });
+
+  it("lets the later-processed batch win when two batches with the same receive time write different days", async () => {
+    const traceId = `trace_${ulid()}`;
+    await run(nativeBatch(noon(1), [{ type: "trace-upsert", body: { id: traceId, timestamp: noon(2), name: "first" } }]));
+    await run(nativeBatch(noon(1), [{ type: "trace-upsert", body: { id: traceId, timestamp: noon(1), name: "second" } }]));
+    expect(await liveRows("traces", traceId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
+    expect((await getTrace(clickhouse, projectId, traceId))?.name).toBe("second");
+  });
+
+  it("applies to OTLP spans and LangFuse-compatible scores", async () => {
+    const traceHex = ulid().toLowerCase().padEnd(32, "0").slice(0, 32).replace(/[^0-9a-f]/g, "a");
+    const spanHex = traceHex.slice(0, 16);
+    const nanos = (iso: string) => `${BigInt(Date.parse(iso)) * 1_000_000n}`;
+    const otlp = (day: number): IngestBatch => ({
+      ...nativeBatch(noon(day), []),
+      events: [
+        {
+          id: ulid(),
+          type: "otlp-export",
+          source: "otlp",
+          schemaVersion: INGEST_SCHEMA_VERSION,
+          idempotencyKey: ulid(),
+          body: {
+            resourceSpans: [
+              {
+                resource: { attributes: [] },
+                scopeSpans: [
+                  {
+                    spans: [
+                      { traceId: traceHex, spanId: spanHex, name: "root", startTimeUnixNano: nanos(noon(day)), endTimeUnixNano: nanos(noon(day)) }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    });
+    await run(otlp(2));
+    await run(otlp(1));
+    expect(await liveRows("traces", traceHex, "timestamp")).toEqual([noon(1).slice(0, 10)]);
+    expect(await liveRows("observations", spanHex, "start_time")).toEqual([noon(1).slice(0, 10)]);
+
+    const scoreId = `score_${ulid()}`;
+    const langfuseScore = (day: number): IngestBatch => ({
+      ...nativeBatch(noon(day), []),
+      events: [
+        {
+          id: ulid(),
+          type: "langfuse-ingestion",
+          source: "langfuse",
+          schemaVersion: INGEST_SCHEMA_VERSION,
+          idempotencyKey: ulid(),
+          body: {
+            batch: [
+              { id: ulid(), timestamp: noon(day), type: "score-create", body: { id: scoreId, traceId: traceHex, name: "verdict", value: 1 } }
+            ]
+          }
+        }
+      ]
+    });
+    await run(langfuseScore(2));
+    await run(langfuseScore(1));
+    expect(await liveRows("scores", scoreId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
+  });
+
+  it("never deletes a record whose timestamp is outside the range ClickHouse's Date keys by calendar day", async () => {
+    const traceId = `trace_${ulid()}`;
+    const batch = nativeBatch(noon(1), [{ type: "trace-upsert", body: { id: traceId, timestamp: "9999-12-31T12:00:00.000Z", name: "far" } }]);
+    await run(batch);
+    await run(batch);
+    expect(await liveRows("traces", traceId, "timestamp")).toHaveLength(1);
+    expect((await getTrace(clickhouse, projectId, traceId))?.name).toBe("far");
+  });
+
+  /** A processor whose ClickHouse client fails the first insert `failWhen` matches. */
+  function processorFailingOnce(failWhen: (insert: { table: string; values: unknown }) => boolean) {
+    let failed = false;
+    const flaky = new Proxy(clickhouse, {
+      get(target, property) {
+        if (property === "insert") {
+          return async (insert: Parameters<typeof clickhouse.insert>[0]) => {
+            if (!failed && failWhen(insert as { table: string; values: unknown })) {
+              failed = true;
+              throw new Error("simulated ClickHouse failure");
+            }
+            return target.insert(insert);
+          };
+        }
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+    });
+    return createIngestProcessor({ storage, clickhouse: flaky, pool });
+  }
+
+  function langfuseTraceBatch(day: number, body: Record<string, unknown>): IngestBatch {
+    return {
+      ...nativeBatch(noon(day), []),
+      events: [
+        {
+          id: ulid(),
+          type: "langfuse-ingestion",
+          source: "langfuse",
+          schemaVersion: INGEST_SCHEMA_VERSION,
+          idempotencyKey: ulid(),
+          body: { batch: [{ id: ulid(), timestamp: noon(day), type: "trace-create", body }] }
+        }
+      ]
+    };
+  }
+
+  it("keeps every stored LangFuse field when writing a moved record fails and the batch is retried", async () => {
+    const traceId = `trace_${ulid()}`;
+    await run(langfuseTraceBatch(2, { id: traceId, timestamp: noon(2), name: "checkout", userId: "u1" }));
+    const move = langfuseTraceBatch(1, { id: traceId, timestamp: noon(1), output: { answer: "done" } });
+
+    const job = await storeAndEnqueue(move);
+    const isTraceRow = (insert: { table: string; values: unknown }) =>
+      insert.table === "traces" &&
+      Array.isArray(insert.values) &&
+      insert.values.every((value) => (value as { is_deleted?: number }).is_deleted === undefined);
+    await expect(processorFailingOnce(isTraceRow)(job)).rejects.toThrow("simulated");
+    // Nothing was deleted before the rows were written.
+    expect(await liveRows("traces", traceId, "timestamp")).toEqual([noon(2).slice(0, 10)]);
+    await processBatch(job);
+    await job.remove();
+
+    expect(await liveRows("traces", traceId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
+    expect(await getTrace(clickhouse, projectId, traceId)).toMatchObject({ name: "checkout", user_id: "u1" });
+    expect(JSON.parse((await getTrace(clickhouse, projectId, traceId))?.output ?? "null")).toEqual({ answer: "done" });
+  });
+
+  it("leaves a duplicate, not a missing record, when the deletions fail, and the retry removes it", async () => {
+    const traceId = `trace_${ulid()}`;
+    await run(nativeBatch(noon(2), [{ type: "trace-upsert", body: { id: traceId, timestamp: noon(2), name: "old" } }]));
+    const move = nativeBatch(noon(1), [{ type: "trace-upsert", body: { id: traceId, timestamp: noon(1), name: "new" } }]);
+    const isDeletion = (insert: { values: unknown }) =>
+      Array.isArray(insert.values) && insert.values.some((value) => (value as { is_deleted?: number }).is_deleted === 1);
+
+    const job = await storeAndEnqueue(move);
+    await expect(processorFailingOnce(isDeletion)(job)).rejects.toThrow("simulated");
+    expect((await liveRows("traces", traceId, "timestamp")).sort()).toEqual([noon(2), noon(1)].map((at) => at.slice(0, 10)).sort());
+    await processBatch(job);
+    await job.remove();
+
+    expect(await liveRows("traces", traceId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
+    expect((await getTrace(clickhouse, projectId, traceId))?.name).toBe("new");
+  });
+
+  it("deletes no old-day row on a ClickHouse server outside UTC, where toDate's day can differ", async () => {
+    const traceId = `trace_${ulid()}`;
+    await run(nativeBatch(noon(2), [{ type: "trace-upsert", body: { id: traceId, timestamp: noon(2) } }]));
+    const moved = { id: traceId, projectId, timestamp: noon(1), tags: [], metadata: {} };
+    const merged = { traces: [], observations: [], rowEventTs: { traces: new Map(), observations: new Map() } };
+
+    const santiago = await resolveMovedRows(clickhouse, {
+      projectId,
+      receivedAt: noon(1),
+      traces: [moved],
+      observations: [],
+      scores: [],
+      merged,
+      serverTimezone: "America/Santiago"
+    });
+    expect(santiago.traces).toEqual([moved]);
+    expect(santiago.deletions.traces).toEqual([]);
+
+    const utc = await resolveMovedRows(clickhouse, {
+      projectId,
+      receivedAt: noon(1),
+      traces: [moved],
+      observations: [],
+      scores: [],
+      merged
+    });
+    expect(utc.deletions.traces).toEqual([{ projectId, id: traceId, timestamp: noon(2) }]);
+  });
+
+  it("removes duplicates written before this fix when the record is written again", async () => {
+    const traceId = `trace_${ulid()}`;
+    const trace = (day: number) => ({ id: traceId, projectId, timestamp: noon(day), tags: [], metadata: {} });
+    await insertTraces(clickhouse, [trace(3)], { eventTs: noon(3) });
+    await insertTraces(clickhouse, [trace(2)], { eventTs: noon(2) });
+    expect(await liveRows("traces", traceId, "timestamp")).toHaveLength(2);
+
+    await run(nativeBatch(noon(1), [{ type: "trace-upsert", body: { id: traceId, timestamp: noon(1) } }]));
+    expect(await liveRows("traces", traceId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
   });
 });

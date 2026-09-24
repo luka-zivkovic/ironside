@@ -1,5 +1,6 @@
 import type { ClickHouseClient } from "@clickhouse/client";
 import { fromClickHouseDateTime, toClickHouseDateTime } from "./datetime.js";
+import { chunkByParamBytes } from "./params.js";
 
 export interface RawEventRefInput {
   projectId: string;
@@ -114,19 +115,9 @@ export async function getRetentionVisibleTraceIds(
   return visible;
 }
 
-/**
- * ClickHouse's HTTP interface rejects a query parameter longer than
- * http_max_field_value_size (128 KiB by default), about 3,700 trace ids, so
- * large id sets are queried in chunks well under it.
- */
-const TRACE_ID_PARAM_CHUNK = 1_000;
-
+/** Large trace id sets are queried in chunks under the HTTP parameter limit (params.ts). */
 function traceIdChunks(traceIds: string[]): string[][] {
-  const chunks: string[][] = [];
-  for (let start = 0; start < traceIds.length; start += TRACE_ID_PARAM_CHUNK) {
-    chunks.push(traceIds.slice(start, start + TRACE_ID_PARAM_CHUNK));
-  }
-  return chunks;
+  return chunkByParamBytes([...new Set(traceIds)], [(traceId) => traceId]);
 }
 
 async function getRetentionVisibleTraceIdChunk(

@@ -1,5 +1,6 @@
 import type { ClickHouseClient } from "@clickhouse/client";
 import { fromClickHouseDateTime, toClickHouseDateTime } from "./datetime.js";
+import { chunkByParamBytes } from "./params.js";
 
 export interface TraceFilter {
   projectId: string;
@@ -715,7 +716,18 @@ export async function listTracesByIds(
   projectId: string,
   traceIds: string[]
 ): Promise<StoredTraceRow[]> {
-  if (traceIds.length === 0) return [];
+  const rows: StoredTraceRow[] = [];
+  for (const chunk of chunkByParamBytes([...new Set(traceIds)], [(traceId) => traceId])) {
+    rows.push(...(await listTracesByIdChunk(client, projectId, chunk)));
+  }
+  return rows;
+}
+
+async function listTracesByIdChunk(
+  client: ClickHouseClient,
+  projectId: string,
+  traceIds: string[]
+): Promise<StoredTraceRow[]> {
   const result = await client.query({
     query: `
       select id, timestamp, name, user_id, session_id, environment, release, version,
@@ -725,7 +737,7 @@ export async function listTracesByIds(
       order by id, event_ts desc
       limit 1 by id
     `,
-    query_params: { projectId, traceIds: [...new Set(traceIds)] },
+    query_params: { projectId, traceIds },
     clickhouse_settings: SKIP_INDEXES_WITH_FINAL,
     format: "JSONEachRow"
   });
@@ -743,7 +755,17 @@ export async function listObservationsByIds(
   projectId: string,
   observations: { id: string; traceId: string }[]
 ): Promise<StoredObservationRow[]> {
-  if (observations.length === 0) return [];
+  const rows: StoredObservationRow[] = [];
+  const chunks = chunkByParamBytes(observations, [(row) => row.traceId, (row) => row.id]);
+  for (const chunk of chunks) rows.push(...(await listObservationsByIdChunk(client, projectId, chunk)));
+  return rows;
+}
+
+async function listObservationsByIdChunk(
+  client: ClickHouseClient,
+  projectId: string,
+  observations: { id: string; traceId: string }[]
+): Promise<StoredObservationRow[]> {
   const result = await client.query({
     // Same Map value casts as listObservationsForTrace.
     query: `
@@ -776,6 +798,125 @@ export async function listObservationsByIds(
       ? fromClickHouseDateTime(row.completion_start_time)
       : null
   }));
+}
+
+/** The server's default timezone, which toDate uses for the sort key of columns declared without one. */
+export async function getServerTimezone(client: ClickHouseClient): Promise<string> {
+  const result = await client.query({ query: "select timezone() as timezone", format: "JSONEachRow" });
+  const [row] = await result.json<{ timezone: string }>();
+  return row?.timezone ?? "";
+}
+
+/** Where a stored record sits in its table's sort key, and the version it was written with. */
+export interface StoredRowKey {
+  kind: "trace" | "observation" | "score";
+  id: string;
+  /** Empty for a trace. */
+  trace_id: string;
+  /** The timestamp (trace, score) or start time (observation) whose day is in the sort key, as ISO. */
+  sort_time: string;
+  /** Exact ReplacingMergeTree version, as ClickHouse renders DateTime64(6). */
+  event_ts: string;
+}
+
+/**
+ * Every live row stored for these records, whichever day of the sort key it
+ * sits under: traces by id, observations and scores by (trace id, id). A
+ * record written again with a timestamp on another day lands under a new
+ * sort key, so its old row is only found this way. One query for the three
+ * tables; the skip indexes on id and trace_id are safe under FINAL here, for
+ * the reason SKIP_INDEXES_WITH_FINAL gives.
+ */
+export async function listStoredRowKeys(
+  client: ClickHouseClient,
+  projectId: string,
+  records: {
+    traceIds: string[];
+    observations: { traceId: string; id: string }[];
+    scores: { traceId: string; id: string }[];
+  }
+): Promise<StoredRowKey[]> {
+  type Entry = { kind: StoredRowKey["kind"]; traceId: string; id: string };
+  const entries: Entry[] = [
+    ...records.traceIds.map((id) => ({ kind: "trace" as const, traceId: "", id })),
+    ...records.observations.map((row) => ({ kind: "observation" as const, ...row })),
+    ...records.scores.map((row) => ({ kind: "score" as const, ...row }))
+  ];
+  const of = (kind: Entry["kind"], field: "traceId" | "id") => (entry: Entry) =>
+    entry.kind === kind ? entry[field] : "";
+  const chunks = chunkByParamBytes(entries, [
+    of("trace", "id"),
+    of("observation", "traceId"),
+    of("observation", "id"),
+    of("score", "traceId"),
+    of("score", "id")
+  ]);
+  const rows: StoredRowKey[] = [];
+  for (const chunk of chunks) {
+    const byKind = (kind: Entry["kind"]) => chunk.filter((entry) => entry.kind === kind);
+    rows.push(
+      ...(await listStoredRowKeyChunk(client, projectId, {
+        traceIds: byKind("trace").map((entry) => entry.id),
+        observations: byKind("observation"),
+        scores: byKind("score")
+      }))
+    );
+  }
+  return rows;
+}
+
+async function listStoredRowKeyChunk(
+  client: ClickHouseClient,
+  projectId: string,
+  records: {
+    traceIds: string[];
+    observations: { traceId: string; id: string }[];
+    scores: { traceId: string; id: string }[];
+  }
+): Promise<StoredRowKey[]> {
+  const { traceIds, observations, scores } = records;
+  const unique = (values: string[]) => [...new Set(values)];
+  const result = await client.query({
+    query: `
+      select 'trace' as kind, id, '' as trace_id, toString(timestamp) as sort_time,
+             toString(event_ts) as event_ts
+        from traces final
+       where project_id = {projectId:String} and id in {traceIds:Array(String)}
+      union all
+      select 'observation' as kind, id, trace_id, toString(start_time) as sort_time,
+             toString(event_ts) as event_ts
+        from observations final
+       where project_id = {projectId:String}
+         and trace_id in {observationTraceIds:Array(String)}
+         and id in {observationIds:Array(String)}
+      union all
+      select 'score' as kind, id, trace_id, toString(timestamp) as sort_time,
+             toString(event_ts) as event_ts
+        from scores final
+       where project_id = {projectId:String}
+         and trace_id in {scoreTraceIds:Array(String)}
+         and id in {scoreIds:Array(String)}
+    `,
+    query_params: {
+      projectId,
+      traceIds: unique(traceIds),
+      observationTraceIds: unique(observations.map((row) => row.traceId)),
+      observationIds: unique(observations.map((row) => row.id)),
+      scoreTraceIds: unique(scores.map((row) => row.traceId)),
+      scoreIds: unique(scores.map((row) => row.id))
+    },
+    clickhouse_settings: SKIP_INDEXES_WITH_FINAL,
+    format: "JSONEachRow"
+  });
+  const rows = await result.json<StoredRowKey>();
+  // The id and trace-id sets can pair an id with another record's trace.
+  const wanted = new Set([
+    ...observations.map((row) => `observation\u0000${row.traceId}\u0000${row.id}`),
+    ...scores.map((row) => `score\u0000${row.traceId}\u0000${row.id}`)
+  ]);
+  return rows
+    .filter((row) => row.kind === "trace" || wanted.has(`${row.kind}\u0000${row.trace_id}\u0000${row.id}`))
+    .map((row) => ({ ...row, sort_time: fromClickHouseDateTime(row.sort_time) }));
 }
 
 export interface AggregatesRow {

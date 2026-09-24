@@ -218,6 +218,28 @@ export async function deleteMovedObservationRows(
   });
 }
 
+/** deleteMovedTraceRows for scores, whose sort key holds the day of their timestamp. */
+export async function deleteMovedScoreRows(
+  client: ClickHouseClient,
+  rows: { projectId: string; id: string; traceId: string; timestamp: string }[],
+  options: InsertOptions
+): Promise<void> {
+  if (rows.length === 0) return;
+  const eventTs = toClickHouseDateTime(options.eventTs);
+  await client.insert({
+    table: "scores",
+    values: rows.map((row) => ({
+      project_id: row.projectId,
+      id: row.id,
+      trace_id: row.traceId,
+      timestamp: toClickHouseDateTime(row.timestamp),
+      event_ts: options.rowEventTs?.get(row.id) ?? eventTs,
+      is_deleted: 1
+    })),
+    format: "JSONEachRow"
+  });
+}
+
 export async function insertTraces(
   client: ClickHouseClient,
   traces: Trace[],
@@ -305,9 +327,10 @@ export async function insertScores(
       import_source: options.importSource ?? null,
       comment: s.comment ?? null,
       metadata: s.metadata,
-      // Omit when absent so the column DEFAULT (insert time) applies —
-      // correct for live-ingested scores; importers pass the source's
-      // original timestamp so backfilled scores keep their history.
+      // Omit when absent so the column DEFAULT (insert time) applies. The
+      // ingest worker always sets it (the batch's receive time), and
+      // importers pass the source's original timestamp so backfilled scores
+      // keep their history.
       ...(s.timestamp && { timestamp: toClickHouseDateTime(s.timestamp) }),
       event_ts: eventTs
     })),

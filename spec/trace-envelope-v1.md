@@ -57,7 +57,17 @@ canonical request instead.
 **Score**: `id, projectId, traceId, observationId?, name, dataType: "numeric"|"categorical"|"boolean", value?: number, stringValue?, source: "api"|"eval"|"annotation", comment?, timestamp?, metadata` (at least one of `value` and `stringValue`).
 
 Rules:
-- Upsert semantics: same id twice = update (ClickHouse ReplacingMergeTree handles dedup by event timestamp).
+- Upsert semantics: same id twice = update (ClickHouse ReplacingMergeTree handles dedup by event timestamp). A record is a trace by id, or an observation or score by trace id and id.
+  - The day of a trace's or score's timestamp, and of an observation's start time, is part of its ClickHouse sort key, and ReplacingMergeTree replaces a row only under the same key. So before writing a batch, the ingest worker (`apps/worker/src/processors/moved-rows.ts`):
+    - keeps a record's last row when the batch holds it more than once, as a single key would;
+    - looks up each record's stored rows, in queries split to stay under ClickHouse's HTTP parameter limit (measured URL-encoded, as the client sends them);
+    - when no stored row is newer than the batch, writes the batch's row and deletes the stored rows under other days;
+    - when a stored row is newer, leaves the batch's row out as stale and deletes the stored rows older than the batch;
+    - writes a LangFuse-compatible row after merging it with the stored row (`spec/langfuse-compat-v1.md`) and deletes that record's stored rows under other days with the merged row's version.
+
+    Deletions are written after the rows, so a failure in between leaves a duplicate that the retry removes, never a missing record. Days are compared only between 1970-01-01 and 2149-06-06, the range of the Date type the sort key uses, and only when the ClickHouse server's timezone is UTC, as in the shipped Compose files. Outside that range `toDate` does not return the calendar day, and in another timezone its day can differ from the UTC day (a daylight-saving jump at midnight moves a time to the previous day). So such rows are never deleted as moved and never share a key with a row the batch writes; a duplicate can remain there, a record cannot be lost. Imports delete every earlier row of a trace they rewrite.
+  - Two batches writing the same record on different days at the same moment can both be written; the record's next write removes the extra row.
+  - A score without a `timestamp` takes its batch's receive time, so a retried batch writes it under the same key.
 - Usage/cost unavailable = **null/absent, never zero** (rubrist convention).
 - Arbitrary metadata values are stringified for the CH Map column; original preserved in the raw envelope.
 - Trace tree must flatten to rubrist's `TraceStep[] { name?, input, output, metadata? }` via depth-first ordered observations.
