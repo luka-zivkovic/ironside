@@ -64,8 +64,9 @@ by Coolify, and trustctl does not update a Coolify Service.
 Every tagged release (`vX.Y.Z`) runs the build, typecheck, and test suite,
 validates the generic Compose checksum and render, and then publishes
 multi-architecture `ghcr.io/luka-zivkovic/ironside-{api,worker,web}:X.Y.Z`
-images. The `0.3.0` images are the current release and are public and
-anonymously pullable (amd64 and arm64). `0.2.0` was the first version
+images. The `0.3.1` images are the current release and are public and
+anonymously pullable (amd64 and arm64); `0.3.1` is `0.3.0` with MinIO moved to
+a pullable image (see [Upgrading](#upgrading)). `0.2.0` was the first version
 installable this way; `0.3.0` changed the clean-install baselines, so install it
 fresh rather than updating a `0.2.0` instance. `0.1.0` predates the
 public-image contract. The release tag is immutable; a `sha-<full commit>` tag is published
@@ -232,8 +233,17 @@ scheduled work. Concurrent starts are safe, in-flight queue jobs survive
 ordinary worker restarts, and durable pending-ingest intents reconstruct lost
 Redis jobs.
 
-**Upgrading from 0.3.0 starts deleting raw event objects.** Raw retention is
-on by default from the next release: within 15 minutes of the first boot, the
+**MinIO's image moved in 0.3.1.** MinIO no longer publishes public images:
+`quay.io/minio/minio` refuses anonymous pulls, so an installation on the 0.3.0
+Compose file keeps running from its cached image but cannot pull it again. From
+0.3.1 the Compose files use Chainguard's build of the same server, pinned by
+digest, and run it as root like the official image did, so it opens the
+existing data volume unchanged. The change is in the Compose file, not in the
+application images: take the new `compose.yaml` (or `docker-compose.yml`)
+along with the new version. Back up MinIO first as usual.
+
+**Upgrading from 0.3.x to 0.4.0 starts deleting raw event objects.** Raw
+retention is on by default from 0.4.0: within 15 minutes of the first boot, the
 worker begins deleting raw event objects whose receive day is past their
 project's retention (default 90 days). To keep raw events, set
 `RAW_RETENTION_EXECUTION_ENABLED=false` (in the self-host bundle,

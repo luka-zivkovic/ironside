@@ -5,7 +5,7 @@
 - **TARGET:** an Ironside release is one exact semantic version shared by the
   API, worker, and web images and deployed as one Coolify Service.
 - **CURRENT:** `deploy/coolify.yaml` defines that seven-container Service. It
-  is installable now with `IRONSIDE_VERSION=0.3.0`: the `v0.3.0` release
+  is installable now with `IRONSIDE_VERSION=0.3.1`: the `v0.3.1` release
   published public, multi-architecture (amd64/arm64) GHCR images for the API,
   worker, and web, verified by anonymous manifest pulls. Its Postgres and
   ClickHouse baselines changed, so it needs a clean instance; do not update a
@@ -79,6 +79,13 @@ tag edit.
 Take Postgres, ClickHouse, and MinIO backups first. Then change the single
 `IRONSIDE_VERSION` so API, worker, and web move together; pending migrations
 apply when they start. Verify health and the primary ingest/read paths.
+
+A Service created before 0.3.1 also needs the current `deploy/coolify.yaml` as
+its Compose file. Its saved Compose names `quay.io/minio/minio`, which MinIO no
+longer serves publicly, so any redeploy that pulls images fails. 0.3.1 uses
+Chainguard's build of the same server, pinned by digest and run as root, which
+opens the existing MinIO volume unchanged. Keep the Service's environment
+variables; only the Compose text changes.
 
 Do not use **Pull Latest Images & Restart** for Ironside. Exact semantic-version
 tags are immutable, so a normal redeploy is enough. Pulling a mutable tag can

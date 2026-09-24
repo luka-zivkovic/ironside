@@ -63,7 +63,12 @@ services:
       retries: 10
 
   minio:
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # MinIO no longer publishes public images, so this is Chainguard's build of
+    # the same server, pinned by digest. It runs as root like the official
+    # image did: its default user (65532) cannot write a data volume the
+    # official image created, and MinIO then refuses to start.
+    image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
+    user: "0"
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ironside
@@ -74,8 +79,7 @@ services:
     volumes:
       - miniodata:/data
     healthcheck:
-      # mc is bundled in the minio image; curl has been removed from these
-      # images before, so don't depend on it.
+      # mc is bundled in the minio image; curl is not, so don't depend on it.
       test: ["CMD", "mc", "ready", "local"]
       interval: 5s
       timeout: 5s
