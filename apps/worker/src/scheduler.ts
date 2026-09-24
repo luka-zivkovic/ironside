@@ -325,9 +325,23 @@ export function startScheduler(options: SchedulerOptions): Scheduler {
     if (stopped || ticking) return;
     ticking = true;
     try {
-      await tickExports();
-      await tickOtlpForwards();
-      await tickWebhooks();
+      // Per-row failures are handled inside each tick. This guard covers a
+      // failed claim query (Postgres unreachable): the fire-and-forget timer
+      // must not raise an unhandled rejection, which would stop the worker,
+      // and one subsystem's failed claim must not skip the others.
+      const ticks = [
+        ["export", tickExports],
+        ["otlp-forward", tickOtlpForwards],
+        ["webhook", tickWebhooks]
+      ] as const;
+      for (const [subsystem, tick] of ticks) {
+        try {
+          await tick();
+        } catch (error) {
+          onError(subsystem, error);
+          onRunOutcome(subsystem, "error");
+        }
+      }
     } finally {
       ticking = false;
     }

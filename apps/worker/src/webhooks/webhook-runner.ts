@@ -244,6 +244,8 @@ async function deliver(
         "x-ironside-signature": `sha256=${signature}`
       },
       body,
+      // The SSRF guard checked this URL only; a redirect could lead anywhere.
+      redirect: "manual",
       signal: AbortSignal.timeout(options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS)
     });
     await response.body?.cancel().catch(() => {});

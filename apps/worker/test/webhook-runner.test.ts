@@ -26,7 +26,7 @@ const ORG_NAME = "webhook-runner-test-org";
 let orgId: string;
 let server: Server;
 let serverUrl: string;
-let receivedRequests: { headers: Record<string, string>; body: string }[] = [];
+let receivedRequests: { url: string; headers: Record<string, string>; body: string }[] = [];
 let respondWithStatus = 200;
 
 beforeAll(async () => {
@@ -39,8 +39,9 @@ beforeAll(async () => {
     let body = "";
     req.on("data", (chunk) => (body += chunk));
     req.on("end", () => {
-      receivedRequests.push({ headers: req.headers as Record<string, string>, body });
+      receivedRequests.push({ url: req.url ?? "", headers: req.headers as Record<string, string>, body });
       res.statusCode = respondWithStatus;
+      if (respondWithStatus >= 300 && respondWithStatus < 400) res.setHeader("location", "/elsewhere");
       res.end("{}");
     });
   });
@@ -235,6 +236,22 @@ describe("runWebhooks", () => {
     receivedRequests = [];
     expect(await run(hook)).toEqual({ matched: 2, delivered: 2, skipped: 0, failed: [] });
     expect(payloads().map((payload) => payload.traceId)).toEqual([first.id, second.id]);
+  });
+
+  it("does not follow a redirect, which could lead past the SSRF guard", async () => {
+    const projectId = await newProject();
+    const hooked = trace(projectId);
+    await publish(hooked);
+    const hook = await rule(projectId);
+
+    respondWithStatus = 307;
+    expect(await run(hook)).toEqual({
+      matched: 1,
+      delivered: 0,
+      skipped: 0,
+      failed: [{ traceId: hooked.id, error: "destination responded HTTP 307" }]
+    });
+    expect(receivedRequests.map((request) => request.url)).toEqual(["/hook"]);
   });
 
   it("stops without sending at a version another run is still delivering, and says so on the rule", async () => {

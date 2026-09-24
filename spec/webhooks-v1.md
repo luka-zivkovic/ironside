@@ -54,7 +54,7 @@ The position advances past every delivered, already-delivered, or non-matching e
 
 ## SSRF guard
 
-`destinationUrl` is customer-supplied, so each run first resolves it and rejects loopback, link-local, private and reserved addresses (`apps/worker/src/lib/ssrf-guard.ts`, `assertPublicHttpDestination`), checking the resolved IP so DNS rebinding is covered. IPv4-mapped IPv6 addresses are checked by extracting the embedded IPv4 address, including the hex-group form Node's `URL` parser produces (`::ffff:172.20.1.1` becomes `::ffff:ac14:101`). A rejected destination fails the run and is recorded on the rule. Tests opt out with `allowPrivateDestinations: true` to reach a local server; production code never sets it.
+`destinationUrl` is customer-supplied, so each run first resolves it and rejects loopback, link-local, private and reserved addresses (`apps/worker/src/lib/ssrf-guard.ts`, `assertPublicHttpDestination`), checking the resolved addresses rather than the hostname string. IPv4-mapped IPv6 addresses are checked by extracting the embedded IPv4 address, including the hex-group form Node's `URL` parser produces (`::ffff:172.20.1.1` becomes `::ffff:ac14:101`). A rejected destination fails the run and is recorded on the rule. Requests do not follow redirects: a 3xx response is a failed delivery, because its target was never checked. The check runs once per run and each request resolves the hostname again, so DNS rebinding between the two is not caught. Tests opt out with `allowPrivateDestinations: true` to reach a local server; production code never sets it.
 
 ## Upgrading from 0.3.0
 
@@ -76,4 +76,4 @@ Receivers see `traceVersion` change meaning from the activity time to the feed v
 
 - M6-03 added webhooks, scanning matching traces with `exportTraces` on every run. Issue #44 made delivery exactly once per settled version, keyed by activity time.
 - Migration `0006` moved webhooks onto the trace feed: runs read only new publications instead of every matching trace, deliveries are keyed by feed version with a handoff from the old activity-time key, a failed delivery stops the run instead of being retried out of order, and each run's outcome is recorded on the rule. `exportTraces` was removed.
-- Still open: webhooks fire on the scheduler's poll cadence, not the instant a trace settles (the same trade-off as `spec/otlp-forwarding-v1.md`).
+- Still open: webhooks fire on the scheduler's poll cadence, not the instant a trace settles (the same trade-off as `spec/otlp-forwarding-v1.md`). The SSRF guard does not pin the checked address for the request, so DNS rebinding is not caught.

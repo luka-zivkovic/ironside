@@ -64,14 +64,14 @@ Environment-registry rebuilds use the same `for update skip locked` claim on `pr
 One failing row never stops a tick. Each row's run is wrapped, and its outcome goes to two callbacks: `onError(subsystem, error)` (default `console.error`, prefixed `[scheduler:<subsystem>]`) and `onRunOutcome(subsystem, "success" | "error")`, which the worker counts in `ironside_scheduler_runs_total` (`spec/metrics-v1.md`). Where each outcome is stored:
 
 - **Export:** `runExport` records its own outcome on every path it reaches. The scheduler records only errors, to cover failures before `runExport` starts (for example a secret that does not decrypt); recording a `runExport` failure a second time is harmless because an error outcome never moves the position. It never records success, which would overwrite the run's row count.
-- **OTLP forward:** `forwardOtlpTraces` records its run, and a run in which any trace failed or was skipped counts as `error`. A decryption failure or SSRF rejection happens before the run records anything, so it shows only in `onError` and the metric.
+- **OTLP forward:** `forwardOtlpTraces` records its run, including an SSRF rejection, and a run in which any trace failed or was skipped counts as `error`. A decryption failure happens before the run starts, so it shows only in `onError` and the metric.
 - **Webhook:** `runWebhooks` records its run, including an SSRF rejection, and a run that stopped at a failed delivery counts as `error`. A decryption failure is not recorded on the rule.
 - **Import:** the importers record their own outcome in `import_checkpoints`; the scheduler's handler covers decrypting and parsing the credentials. A failure recovering an abandoned evaluator import goes to `onError("import-recovery", …)` without an outcome. A failure of the imports tick itself (the cutoff refresh or a claim query) counts as an `import` error.
 - **Environment registry:** a failed chunk is recorded with `failEnvironmentRegistryRebuild`; a failed claim query counts as an error.
 - **Retention:** reported through the callbacks only.
 - **Ingest recovery and raw retention** report through their own callbacks in `index.ts`, to the same counter as `ingest-recovery` and `raw-retention`.
 
-The destinations tick does not catch a failure of its claim queries (for example, Postgres unreachable). The tick's promise rejects with no handler, and under Node's default unhandled-rejection behavior the worker process exits.
+A failed claim query (for example, Postgres unreachable) counts as an error for that subsystem, and the destinations tick still runs the other two subsystems. No loop lets a failure escape as an unhandled rejection, which would stop the worker.
 
 ## Configuration
 
@@ -89,7 +89,7 @@ The destinations tick does not catch a failure of its claim queries (for example
 
 `packages/db/test/scheduling.test.ts` covers claim selection (due, not yet due, disabled), rescheduling to the row's own `poll_interval_seconds`, and two concurrent claims of one row producing one winner; the forward and webhook claims are spot-checked. `packages/shared/test/encryption.test.ts` covers the round trip, random IVs, a tampered auth tag, an unknown version prefix and a missing `IRONSIDE_ENCRYPTION_SECRET`.
 
-`apps/worker/test/scheduler.test.ts` runs `startScheduler` in its own Postgres schema and ClickHouse database, with real MinIO. It covers a claimed export running end to end and recording success; an unreachable export destination recording an error while `next_run_at` still advances; an export matching nothing recording row count 0; an undecryptable row reported without blocking a healthy row in the same tick; a LangFuse import source decrypted and dispatched to the importer; a provider mismatch rejected before any importer runs; one project's broken import source not blocking another project's import; forward and webhook rules with a loopback destination being claimed (the SSRF rejection itself is asserted in `otlp-forwarder.test.ts` and `webhook-runner.test.ts`); and `stop()` preventing further ticks. The ingest recovery and raw retention loops are covered by their own specs' tests.
+`apps/worker/test/scheduler.test.ts` runs `startScheduler` in its own Postgres schema and ClickHouse database, with real MinIO. It covers a claimed export running end to end and recording success; an unreachable export destination recording an error while `next_run_at` still advances; an export matching nothing recording row count 0; an undecryptable row reported without blocking a healthy row in the same tick; a LangFuse import source decrypted and dispatched to the importer; a provider mismatch rejected before any importer runs; one project's broken import source not blocking another project's import; forward and webhook rules with a loopback destination being claimed (the SSRF rejection itself is asserted in `otlp-forwarder.test.ts` and `webhook-runner.test.ts`); and `stop()` preventing further ticks. `apps/worker/test/scheduler-claim-failure.test.ts` runs it against an unreachable Postgres and checks that each destination subsystem reports its failed claim. The ingest recovery and raw retention loops are covered by their own specs' tests.
 
 ## History
 
@@ -97,4 +97,5 @@ The destinations tick does not catch a failure of its claim queries (for example
 - M5-07 (PR #31) added the imports timer and `claimDueImportSources` (`spec/import-source-scheduling-v1.md`). The environment-registry timer, the cutoff refresh and abandoned-import recovery on the imports tick, and the ingest recovery and raw retention loops in the entrypoint came with their own features.
 - The scheduler used to record a successful export a second time, and for an empty run its `rowCount ?? null` overwrote the `0` that `runExport` had stored. It now records only failures; a regression test in `scheduler.test.ts` covers the empty case.
 - Because claims span every project, scheduler tests in the shared test database claimed other test files' rows and failed on their unrelated errors. `scheduler.test.ts` now uses its own Postgres schema and ClickHouse database.
-- Still open: retention is one global sweep on one interval, with no per-project schedule. A failed claim query on the destinations tick is not caught (see Failure handling and outcomes).
+- A failed claim query on the destinations tick used to escape as an unhandled rejection, which stops the worker under Node's default; it is now caught per subsystem.
+- Still open: retention is one global sweep on one interval, with no per-project schedule.
