@@ -1288,6 +1288,31 @@ describe("a record written again with a timestamp on another day", () => {
     expect(await count("scores", "trace_id", traceId)).toBe(1);
   });
 
+  it("keeps LangFuse records apart when a client reuses event ids for different records", async () => {
+    const traceId = `trace_${ulid()}`;
+    const request = (day: number, name: string): IngestBatch => ({
+      ...nativeBatch(noon(day), []),
+      events: [
+        {
+          id: ulid(),
+          type: "langfuse-ingestion",
+          source: "langfuse",
+          schemaVersion: INGEST_SCHEMA_VERSION,
+          idempotencyKey: ulid(),
+          body: { batch: [{ id: "0", type: "score-create", body: { traceId, name, value: 1 } }] }
+        }
+      ]
+    });
+    await run(request(2, "helpful"));
+    await run(request(1, "correct"));
+    const scores = await clickhouse.query({
+      query: "select name from scores final where project_id = {projectId:String} and trace_id = {traceId:String} order by name",
+      query_params: { projectId, traceId },
+      format: "JSONEachRow"
+    });
+    expect(await scores.json()).toEqual([{ name: "correct" }, { name: "helpful" }]);
+  });
+
   it("removes duplicates written before this fix when the record is written again", async () => {
     const traceId = `trace_${ulid()}`;
     const trace = (day: number) => ({ id: traceId, projectId, timestamp: noon(day), tags: [], metadata: {} });

@@ -97,7 +97,7 @@ export function mapLangfuseIngestionRequest(
     if (kind === "trace") {
       const bodyId = getBodyId(event);
       // Without a body id an event cannot be tied to any other: its own group.
-      const key = bodyId !== undefined ? `id:${bodyId}` : `event:${index}`;
+      const key = bodyId !== undefined ? `id:${bodyId.trim()}` : `event:${index}`;
       const group = traceGroups.get(key) ?? [];
       group.push(event);
       traceGroups.set(key, group);
@@ -105,7 +105,7 @@ export function mapLangfuseIngestionRequest(
     }
     // observation kinds (span/generation/event)
     const bodyId = getBodyId(event);
-    const key = bodyId !== undefined ? `id:${bodyId}` : `event:${index}`;
+    const key = bodyId !== undefined ? `id:${bodyId.trim()}` : `event:${index}`;
     const existing = observationGroups.get(key);
     if (existing) {
       existing.events.push(event);
@@ -118,7 +118,7 @@ export function mapLangfuseIngestionRequest(
   for (const { id, message } of invalidEventIds) response.errors.push({ id, status: 400, message });
 
   for (const events of traceGroups.values()) {
-    const result = mapMergedTrace(projectId, events);
+    const result = guarded(() => mapMergedTrace(projectId, events));
     recordResult(response, events, result);
     if (result.ok && result.row) {
       rows.traces.push(result.row);
@@ -127,7 +127,7 @@ export function mapLangfuseIngestionRequest(
   }
 
   for (const { type, events } of observationGroups.values()) {
-    const result = mapMergedObservation(projectId, events, type);
+    const result = guarded(() => mapMergedObservation(projectId, events, type));
     recordResult(response, events, result);
     if (result.ok && result.row) {
       rows.observations.push(result.row);
@@ -136,7 +136,7 @@ export function mapLangfuseIngestionRequest(
   }
 
   for (const event of scoreEvents) {
-    const result = mapScore(projectId, event);
+    const result = guarded(() => mapScore(projectId, event));
     recordResult(response, [event], result);
     if (result.ok && result.row) rows.scores.push(result.row);
   }
@@ -190,16 +190,21 @@ function idFromEvent(event: LangfuseBatchEvent): string {
   return `lf_${createHash("sha256").update(content).digest("hex").slice(0, 32)}`;
 }
 
-/** JSON with object keys sorted, so the same content always hashes the same. */
+/**
+ * JSON with object keys sorted, so the same content always hashes the same.
+ * Native JSON.stringify does the walk, so it takes the same nesting the API's
+ * own serialization of the stored batch did.
+ */
 function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  if (value !== null && typeof value === "object") {
-    const entries = Object.entries(value as Record<string, unknown>)
-      .filter(([, entry]) => entry !== undefined)
-      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-    return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`).join(",")}}`;
-  }
-  return JSON.stringify(value) ?? "null";
+  return (
+    JSON.stringify(value, (_key, entry: unknown) =>
+      entry !== null && typeof entry === "object" && !Array.isArray(entry)
+        ? Object.fromEntries(
+            Object.entries(entry as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+          )
+        : entry
+    ) ?? "null"
+  );
 }
 
 /** Reads body.id without full schema validation, just to group events by target entity. */
@@ -209,6 +214,15 @@ function getBodyId(event: LangfuseBatchEvent): string | undefined {
     return typeof id === "string" ? id : undefined;
   }
   return undefined;
+}
+
+/** Maps one group; an unexpected error fails only that group's events, not the whole request. */
+function guarded<Row>(map: () => MergedResult<Row>): MergedResult<Row> {
+  try {
+    return map();
+  } catch (error) {
+    return { ok: false, message: `could not map event: ${error instanceof Error ? error.message : String(error)}` };
+  }
 }
 
 type MergedResult<Row> =

@@ -511,11 +511,72 @@ describe("mapLangfuseIngestionRequest — records sent without an id", () => {
     expect(new Set(rows.traces.map((row) => row.id)).size).toBe(2);
   });
 
+  it("hashes the event's type and timestamp and sorts nested keys", () => {
+    const observationId = (event: Partial<LangfuseBatchEvent>) =>
+      mapLangfuseIngestionRequest(
+        "proj_x",
+        request([batchEvent({ id: "evt_1", type: "span-create", body: { traceId: "trace_1", input: { b: 1, a: 2 } }, ...event })])
+      ).rows.observations[0]?.id;
+    expect(observationId({})).toBe(observationId({ body: { traceId: "trace_1", input: { a: 2, b: 1 } } }));
+    expect(observationId({})).not.toBe(observationId({ type: "event-create" }));
+    expect(observationId({})).not.toBe(observationId({ timestamp: "2026-07-12T00:00:01.000Z" }));
+  });
+
+  it("never groups observations without an id by their event id", () => {
+    const { rows } = mapLangfuseIngestionRequest(
+      "proj_x",
+      request([
+        batchEvent({ id: "dup", type: "span-create", body: { traceId: "trace_1", name: "first" } }),
+        batchEvent({ id: "dup", type: "span-create", body: { traceId: "trace_1", name: "second" } })
+      ])
+    );
+    expect(rows.observations.map((row) => row.name)).toEqual(["first", "second"]);
+  });
+
+  it("maps a deeply nested body, and a body too deep to map fails only its own event", () => {
+    const nested = (depth: number) => {
+      const root: Record<string, unknown> = {};
+      let node = root;
+      for (let level = 0; level < depth; level += 1) {
+        const child: Record<string, unknown> = {};
+        node.next = child;
+        node = child;
+      }
+      return root;
+    };
+    const { rows, response } = mapLangfuseIngestionRequest(
+      "proj_x",
+      request([
+        batchEvent({ id: "evt_ok", body: { id: "trace_ok", name: "ok" } }),
+        batchEvent({ id: "evt_deep", body: { name: "deep", input: nested(2_000) } }),
+        batchEvent({ id: "evt_too_deep", body: { name: "too deep", input: nested(100_000) } })
+      ])
+    );
+    expect(rows.traces.map((row) => row.name).sort()).toEqual(["deep", "ok"]);
+    expect(response.errors.map((error) => error.id)).toEqual(["evt_too_deep"]);
+  });
+
   it("gives the same event the same id whatever the order of its keys, and never the raw event id", () => {
     const id = (body: Record<string, unknown>) =>
       mapLangfuseIngestionRequest("proj_x", request([score("evt_1", body)])).rows.scores[0]?.id;
     expect(id({ name: "helpful", value: 1 })).toBe(id({ value: 1, name: "helpful" }));
     expect(id({ name: "helpful", value: 1 })).not.toBe(id({ name: "helpful", value: 2 }));
     expect(id({ name: "helpful", value: 1 })).not.toBe("evt_1");
+  });
+});
+
+describe("mapLangfuseIngestionRequest — body ids with surrounding whitespace", () => {
+  it("treats them as the record the trimmed id names, keeping every field either event sent", () => {
+    const { rows } = mapLangfuseIngestionRequest(
+      "proj_x",
+      request([
+        batchEvent({ id: "evt_1", type: "generation-create", body: { id: "obs_1", traceId: "trace_1", startTime: "2026-07-12T00:00:00.000Z", name: "llm" } }),
+        batchEvent({ id: "evt_2", type: "generation-update", body: { id: "obs_1 ", traceId: "trace_1", endTime: "2026-07-12T00:00:02.000Z" } })
+      ])
+    );
+    expect(rows.observations).toHaveLength(1);
+    expect(rows.observations[0]).toMatchObject({ id: "obs_1", name: "llm", startTime: "2026-07-12T00:00:00.000Z", endTime: "2026-07-12T00:00:02.000Z" });
+    expect(rows.providedFields.observations.get("obs_1")?.has("startTime")).toBe(true);
+    expect(rows.providedFields.observations.get("obs_1")?.has("endTime")).toBe(true);
   });
 });
