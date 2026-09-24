@@ -1,5 +1,7 @@
+import { lookup as lookupCallback, type LookupAddress, type LookupAllOptions, type LookupOptions } from "node:dns";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
+import { Agent, buildConnector, fetch as undiciFetch } from "undici";
 
 /**
  * Blocks server-side requests to a customer-supplied URL from reaching
@@ -12,7 +14,10 @@ import { isIP } from "node:net";
  *
  * Resolves the hostname and checks the actual resolved IP(s), not just
  * the hostname string, so a public-looking hostname that resolves to a
- * private address (DNS rebinding) is still blocked.
+ * private address is still blocked. This check runs once, before a run's
+ * requests; `publicFetch` checks each connection again, at the address it
+ * connects to, so a hostname that re-resolves in between (DNS rebinding)
+ * is blocked as well.
  */
 export async function assertPublicHttpDestination(rawUrl: string): Promise<void> {
   const url = new URL(rawUrl);
@@ -30,10 +35,96 @@ export async function assertPublicHttpDestination(rawUrl: string): Promise<void>
 
   for (const address of addresses) {
     if (isPrivateOrReservedAddress(address)) {
-      throw new Error(`destination URL resolves to a non-public address: ${address}`);
+      throw new NonPublicAddressError(address);
     }
   }
 }
+
+export class NonPublicAddressError extends Error {
+  constructor(address: string) {
+    super(`destination URL resolves to a non-public address: ${address}`);
+    this.name = "NonPublicAddressError";
+  }
+}
+
+type LookupCallback = (
+  error: NodeJS.ErrnoException | null,
+  address: string | LookupAddress[],
+  family?: number
+) => void;
+type LookupAll = (
+  hostname: string,
+  options: LookupAllOptions,
+  callback: (error: NodeJS.ErrnoException | null, addresses: LookupAddress[]) => void
+) => void;
+
+export interface GuardedFetchOptions {
+  /** Resolves a hostname to all its addresses; `dns.lookup` by default. Tests inject answers. */
+  lookupAll?: LookupAll;
+  /** Whether a connection to `address` is refused; the private and reserved ranges by default. */
+  isBlockedAddress?: (address: string) => boolean;
+}
+
+/**
+ * A fetch whose connections go only to public addresses. The check runs when
+ * the socket connects, on the addresses it connects to: a hostname is
+ * resolved once, every address in the answer is checked (one non-public
+ * address refuses the connection, as in assertPublicHttpDestination), and
+ * the socket connects to those same addresses, so the checked address is the
+ * one used. TLS still verifies the certificate against the hostname. An IP
+ * address in the URL is checked directly, since it is never resolved.
+ *
+ * A refused connection rejects with NonPublicAddressError. Pooled
+ * connections were checked when they were opened. HTTP/2 stays off, as in
+ * Node's built-in fetch. Only string and URL inputs are accepted.
+ */
+export function createGuardedFetch(options: GuardedFetchOptions = {}): typeof fetch {
+  const lookupAll: LookupAll = options.lookupAll ?? ((hostname, lookupOptions, callback) => lookupCallback(hostname, lookupOptions, callback));
+  const isBlocked = options.isBlockedAddress ?? isPrivateOrReservedAddress;
+
+  const guardedLookup = (hostname: string, lookupOptions: LookupOptions, callback: LookupCallback): void => {
+    lookupAll(hostname, { ...lookupOptions, all: true }, (error, addresses) => {
+      if (error) return callback(error, []);
+      const blocked = addresses.find((entry) => isBlocked(entry.address));
+      if (blocked) return callback(new NonPublicAddressError(blocked.address), []);
+      if (addresses.length === 0) {
+        return callback(Object.assign(new Error(`no addresses found for ${hostname}`), { code: "ENOTFOUND" }), []);
+      }
+      if (lookupOptions.all) return callback(null, addresses);
+      callback(null, addresses[0]!.address, addresses[0]!.family);
+    });
+  };
+
+  const connector = buildConnector({ lookup: guardedLookup, allowH2: false });
+  const dispatcher = new Agent({
+    allowH2: false,
+    connect: (connectOptions, callback) => {
+      // A literal address is never passed to lookup.
+      const literal = connectOptions.hostname.replace(/^\[|\]$/g, "");
+      if (isIP(literal) !== 0 && isBlocked(literal)) {
+        callback(new NonPublicAddressError(literal), null);
+        return;
+      }
+      connector(connectOptions, callback);
+    }
+  });
+
+  return (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    if (typeof input !== "string" && !(input instanceof URL)) {
+      throw new TypeError("publicFetch accepts a URL string or URL only");
+    }
+    try {
+      return (await undiciFetch(input, { ...(init as object), dispatcher } as Parameters<typeof undiciFetch>[1])) as unknown as Response;
+    } catch (error) {
+      // fetch reports every connection failure as "fetch failed"; surface the refusal itself.
+      if (error instanceof TypeError && error.cause instanceof NonPublicAddressError) throw error.cause;
+      throw error;
+    }
+  }) as typeof fetch;
+}
+
+/** The fetch webhook and OTLP forward deliveries use: see createGuardedFetch. */
+export const publicFetch: typeof fetch = createGuardedFetch();
 
 function isPrivateOrReservedIpv4(address: string): boolean {
   const octets = address.split(".").map(Number);

@@ -14,7 +14,7 @@ import type { Pool } from "pg";
 import { ulid } from "ulid";
 import { readSettledTraceFeed } from "../exporters/settled-trace-feed.js";
 import { matchesExportFilter } from "../exporters/trace-filter.js";
-import { assertPublicHttpDestination } from "../lib/ssrf-guard.js";
+import { assertPublicHttpDestination, publicFetch } from "../lib/ssrf-guard.js";
 
 const FEED_PAGE_SIZE = 100;
 /** Deliveries per run; a larger backlog continues on the next scheduler tick. */
@@ -241,7 +241,9 @@ async function deliver(
   const signature = createHmac("sha256", options.signingSecret).update(body).digest("hex");
 
   try {
-    const response = await (options.fetchImpl ?? fetch)(rule.destinationUrl, {
+    // publicFetch checks each connection's address again, so DNS rebinding after the guard is refused too.
+    const fetchImpl = options.fetchImpl ?? (options.allowPrivateDestinations ? fetch : publicFetch);
+    const response = await fetchImpl(rule.destinationUrl, {
       method: "POST",
       headers: {
         "content-type": "application/json",
