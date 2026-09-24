@@ -1,36 +1,68 @@
-# Direct-Ingest Primacy Audit (M4-05)
+# Direct-Ingest Primacy v1
 
-Status: implemented. Owner: `packages/sdk/src/`, `packages/mappers/src/otlp.ts`. Integration roles were clarified by issue #45; see `spec/integration-contract-v1.md`.
+Status: implemented. Owner: `packages/sdk/src/`, `packages/mappers/src/otlp.ts`, `packages/mappers/src/native.ts`.
 
 ## Purpose
 
-User directive (2026-07-12): direct SDK/OTLP/native-JSON ingest into Ironside is the **primary** product path — "make sure it's easy to integrate this without any platform so that the traces go directly to the app." LangFuse/LangSmith compatibility and importers exist only for teams migrating off another platform, not as the recommended integration surface for new instrumentation. Since M5 had just brought the LangFuse/LangSmith importers up to full-data parity (observations, scores, usage, cost), this audit checked whether the primary path had silently fallen behind the "migration tooling" path on data completeness.
+Direct ingest into Ironside, through the `ironside` package, OTLP/HTTP, or native JSON, is the primary product path. LangFuse and LangSmith compatibility endpoints and importers exist for teams migrating from another platform and are not the recommended basis for new instrumentation. This spec states what each direct path captures, so the primary path does not fall behind the migration tooling on data completeness. `spec/integration-contract-v1.md` sets the role of each surface.
 
-Within that primary path, OTLP/HTTP plus `gen_ai.*` is now the canonical portable contract for third-party frameworks and services. The official `ironside` package is the ergonomic Node.js contract, while native JSON remains the complete low-level contract. "Canonical" describes which integration a third party should implement; it does not give OTLP capabilities that OpenTelemetry lacks, notably cost and scores.
+## Roles
 
-## Findings
+- OTLP/HTTP with `gen_ai.*` attributes is the canonical portable contract for third-party frameworks and services (`spec/otlp-ingest-v1.md`). "Canonical" says which integration a third party should implement; it does not give OTLP capabilities OpenTelemetry lacks, notably client-reported cost and scores.
+- The `ironside` package is the ergonomic Node.js contract: provider wrappers, manual trace, span and generation handles, scores, and media uploads.
+- Native JSON (`POST /api/v1/ingest`) is the complete low-level contract. Event bodies are validated against the domain Zod schemas with `projectId` omitted (`packages/mappers/src/native.ts`), so every domain field can be set.
 
-The native JSON `POST /api/v1/ingest` wire contract was already schema-complete — it's derived directly from the domain Zod schemas (`packages/mappers/src/native.ts`), so it was never the bottleneck. The gap was entirely in **client-side ergonomics**: the official `ironside` package and the OTLP mapper didn't exercise the full contract they could.
+## Coverage
 
-Three concrete gaps found and fixed:
+| Data | `ironside` package | OTLP | Native JSON |
+| --- | --- | --- | --- |
+| Scores | `trace.score()`, `observation.score()` | Not available | `score-upsert` events |
+| Model parameters | Read from wrapped requests; `modelParameters` option on `generation()` and `recordGenerateTextResult()` | `gen_ai.request.*` attributes | `modelParameters` |
+| Trace `environment`, `release`, `version` | `trace()` options | `environment` from the `deployment.environment.name` resource attribute; release and version are not mapped, and resource attributes stay in trace metadata | Trace fields |
+| Cost | Derived by the worker; a client figure can be sent with `end({ costDetails })` | Derived by the worker | Derived by the worker, or `costDetails` as sent |
+| Usage keys | Canonical keys | Canonical keys | Known aliases renamed to canonical keys |
 
-1. **No way to record a score via the SDK at all.** The wire format has supported `score-upsert` since M1, and the LangFuse/LangSmith importers write `Score` rows, but `IronsideClient`/`TraceHandle`/`ObservationHandle` had no `score()` method — a user wanting to record human feedback or an eval result had to hand-craft a raw ingest POST. Fixed: `trace.score()` and `observation.score()` now both enqueue a `score-upsert` (`packages/sdk/src/client.ts`), matching `ScoreOptions` in `packages/sdk/src/types.ts`. `dataType` is inferred from whether `value` (numeric) or `stringValue` (categorical) is set, matching the domain schema's own invariant.
-   - **Code review caught a real bug here**: the first version's `ScoreOptions` made both `value`/`stringValue` independently optional, so `score({ name: "x" })` (neither set) type-checked but produced a body that violates the domain schema's `value !== undefined || stringValue !== undefined` invariant — the worker (`packages/mappers/src/native.ts`) re-checks this and silently drops the event into its internal `errors` list, which the SDK's fire-and-forget batching never surfaces back to the caller. A score could vanish with zero signal. Symmetrically, passing *both* fields produced an internally inconsistent `dataType`/payload pairing. Fixed by making `ScoreOptions` a discriminated union requiring exactly one of `value`/`stringValue` — verified by adding `@ts-expect-error` regression tests for both the neither- and both-set cases (`packages/sdk/test/client.test.ts`).
-2. **`modelParameters` (temperature, max_tokens, top_p, etc.) was never captured**, despite `StartGenerationOptions` and the domain schema fully supporting it. `wrapOpenAI`/`wrapAnthropic` only read `model` and `messages` off the request body; the OTLP mapper only read `gen_ai.request.model`/`gen_ai.usage.*`, never `gen_ai.request.temperature`/`.max_tokens`/etc. Fixed in both:
-   - SDK wrappers (`packages/sdk/src/wrappers/{openai,anthropic}.ts`) now extract the common cross-provider sampling parameters directly off the request body a caller already passed in (OpenAI: `temperature`/`top_p`/`max_tokens`/`max_completion_tokens`/`presence_penalty`/`frequency_penalty`/`seed`; Anthropic: `temperature`/`top_p`/`top_k`/`max_tokens`). `recordGenerateTextResult` (Vercel AI SDK) gained an explicit `modelParameters` option since that recorder doesn't intercept the call and can't read them off the result.
-   - OTLP mapper (`packages/mappers/src/otlp.ts`) now maps `gen_ai.request.{temperature,max_tokens,top_p,top_k,frequency_penalty,presence_penalty,seed}` to `Observation.modelParameters`, verified against the live `open-telemetry/semantic-conventions-genai` registry (all still Development-stability, same caveat as the usage/model attributes already mapped). `gen_ai.request.stop_sequences` (a string array) isn't included — `modelParameters` values are scalar-only — but it still survives via the existing generic metadata fallback, not dropped.
-3. **`StartTraceOptions` was missing `environment`/`release`/`version`**, all three present on the domain `Trace` schema and settable via native JSON ingest, but not exposed as SDK options. Fixed: added to `StartTraceOptions`, threaded through both the initial `trace-upsert` and `update()`'s upsert (same "carry every field forward" contract `update()` already follows for name/userId/sessionId/input).
+Cost derivation is described in `spec/cost-pricing-v1.md` and usage keys in `spec/usage-keys-v1.md`. The wrappers record streamed provider calls as well (`spec/sdk-streaming-v1.md`).
 
-## Deliberately NOT fixed — real gaps, documented rather than silently patched
+## SDK contract
 
-- ~~**No cost capture anywhere in the direct-ingest path.**~~ — **fixed** (spec/cost-pricing-v1.md): the worker now derives cost at ingest from a vendored LiteLLM-derived price table plus per-project overrides whenever an observation reports usage and a model but no cost; client-sent cost is never touched. Original note kept for history: No pricing table existed in the codebase, and none was added in this audit — computing USD cost from token counts requires an up-to-date, provider-specific pricing table that goes stale independently of Ironside releases (a genuine product/maintenance decision, not a one-line fix). `wrapOpenAI`/`wrapAnthropic`/`recordGenerateTextResult` still never populate `costDetails`; a caller who wants cost recorded must compute it themselves and either pass it to a manual `generation.end({ costDetails })` call or use `EndObservationOptions.costDetails` directly. The LangFuse/LangSmith importers only get cost because those source platforms already computed it — this is an inherent asymmetry between "importing already-computed data" and "computing cost from scratch," not something this audit could close without inventing pricing data.
-- **OTLP has no score support** (cost is now derived from `gen_ai.usage.*` plus the model name per spec/cost-pricing-v1.md), and cannot get scores without inventing non-standard attributes: verified against the live semconv registry that no cost attribute exists upstream, and OTel has no score concept at all. Documented as a known gap in `spec/otlp-ingest-v1.md` rather than left silent — a user needing cost/scores alongside OTLP traces should send them via native JSON ingest instead.
-- ~~**Streaming (`stream: true`) is still unsupported** by `wrapOpenAI`/`wrapAnthropic`~~ — **fixed in M9-07** (spec/sdk-streaming-v1.md): the returned Stream's asyncIterator is patched in place, output/tool-calls/usage accumulate as the caller iterates, and the generation ends on done/break/error.
-- ~~**Cross-importer usage-key inconsistency**~~ — **fixed in M9-04** (spec/usage-keys-v1.md): a shared `canonicalizeUsageKeys` now maps every writer to `input_tokens`/`output_tokens`/`total_tokens`, with unknown provider-specific keys passing through; cross-source aggregation proven by a real-mappers-through-real-ClickHouse test.
+### Scores
 
-## Verification
+`trace.score(options)` and `observation.score(options)` enqueue a `score-upsert` for that trace or that observation (`packages/sdk/src/client.ts`).
 
-- SDK: 8 new tests (`packages/sdk/test/client.test.ts`, `packages/sdk/test/wrappers.test.ts`) covering `trace.score()`/`observation.score()` (including a value-`0` case, since 0 is meaningful data not falsy noise), `environment`/`release`/`version` round-tripping through both `trace()` and `update()`, and `modelParameters` capture (present and absent) for all three wrapper/recorder entry points.
-- Mappers: 2 new tests (`packages/mappers/test/otlp.test.ts`) covering `gen_ai.request.*` → `modelParameters` mapping and its absence when no sampling attributes are present.
-- Manually ran the updated `examples/chatbot/index.js` flow against a mocked fetch to confirm the new `trace.score()` call produces a correctly-shaped `score-upsert` event end-to-end (numeric `value: 1`, `dataType: "numeric"`, correct `traceId`, no stray `observationId`).
-- Full repo `pnpm build && pnpm test`: 268/268 tests passing, zero typecheck errors.
+- `ScoreOptions` (`packages/sdk/src/types.ts`) is a discriminated union that requires exactly one of `value` (a number) and `stringValue` (a string), so a score with neither or both fails to type-check. The type is the only place to catch it: the worker rejects a score with neither as a dead letter (`spec/dead-letters-v1.md`), and the SDK's background delivery never reports per-event rejections to the caller.
+- `dataType` is `numeric` when `value` is set and `categorical` otherwise. A `value` of 0 is sent as data.
+- `source` defaults to `api` and `id` to a new ULID; `comment` and `metadata` are optional.
+
+### Model parameters
+
+Only fields present on the request are recorded, and a request with none of them records no `modelParameters`.
+
+- `wrapOpenAI`: `temperature`, `top_p`, `max_tokens`, `max_completion_tokens`, `presence_penalty`, `frequency_penalty`, `seed`.
+- `wrapAnthropic`: `temperature`, `top_p`, `top_k`, `max_tokens`.
+- `recordGenerateTextResult` (Vercel AI SDK) takes an explicit `modelParameters` option, because it records a completed result and never sees the request.
+- Manual instrumentation passes `modelParameters` to `generation()`.
+
+### Trace fields
+
+`trace()` accepts `environment`, `release` and `version` alongside `name`, `userId`, `sessionId`, `tags`, `metadata` and `input`. A `trace-upsert` replaces the whole stored row, since ClickHouse has no field-level merge, so `update()` re-sends every field given to `trace()` and the original timestamp, together with the new `output` and the merged metadata.
+
+### Cost
+
+The wrappers do not compute cost; the worker derives it from usage and model. A caller with a provider-billed figure passes `costDetails` to `end()`, and it is stored as sent.
+
+## OTLP contract
+
+- `gen_ai.request.temperature`, `.max_tokens`, `.top_p`, `.top_k`, `.frequency_penalty`, `.presence_penalty` and `.seed` map to `modelParameters`. `gen_ai.request.stop_sequences` is a string array and stays in metadata, because `modelParameters` values are scalars.
+- OpenTelemetry has no cost attribute and no score concept, and Ironside does not invent `gen_ai.*` attributes for them. Cost is derived from the mapped usage and model; a custom cost attribute stays in metadata. An application that needs scores or an exact provider-billed cost alongside OTLP sends them through native JSON or the `ironside` package.
+
+## Verified
+
+`packages/sdk/test/client.test.ts` covers `trace.score()` and `observation.score()`, including a `value` of 0 and a categorical score, compile-time rejection of a score with neither or both values (`@ts-expect-error`), and `environment`, `release` and `version` through both `trace()` and `update()`. `packages/sdk/test/wrappers.test.ts` covers `modelParameters` capture, present and absent, for `wrapOpenAI`, `wrapAnthropic` and `recordGenerateTextResult`. `packages/mappers/test/otlp.test.ts` covers the `gen_ai.request.*` mapping and its absence. `packages/mappers/test/native.test.ts` covers rejection of a native score with neither value.
+
+## History
+
+- M4-05 audited the direct paths after M5 brought the LangFuse and LangSmith importers to full data parity (observations, scores, usage, cost), following the direction that traces should reach Ironside directly without another platform. The native JSON contract was already schema-complete; the gaps were in the SDK and the OTLP mapper. The audit added the SDK's `score()` methods, `modelParameters` capture in the wrappers and the OTLP mapper, and the `environment`, `release` and `version` trace options.
+- The first `ScoreOptions` made `value` and `stringValue` independently optional. `score({ name })` type-checked, and the worker then dropped the event with no signal to the caller; setting both produced an inconsistent `dataType`. Review caught it and the type became a discriminated union.
+- The audit deferred three gaps, all resolved later: cost (derived at ingest, `spec/cost-pricing-v1.md`), streaming in the wrappers (M9-07, `spec/sdk-streaming-v1.md`), and the split usage-key vocabulary across writers (M9-04, `spec/usage-keys-v1.md`, proven by `apps/worker/test/usage-key-unification.test.ts`).
+- Issue #45 made OTLP the canonical contract for third-party integrations (`spec/integration-contract-v1.md`).

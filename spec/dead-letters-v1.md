@@ -1,39 +1,56 @@
-# Ingest Dead Letters v1 (M9-03)
+# Ingest Dead Letters v1
 
-Status: implemented, verified live end-to-end. Owner: `packages/db/migrations/0001_baseline.sql`, `packages/db/src/ingest-failures.ts`, `apps/worker/src/processors/ingest.ts`, `apps/api/src/routes/ingest-failures.ts`.
+Status: implemented. Owner: `apps/worker/src/processors/ingest.ts`, `packages/db/src/ingest-failures.ts`, `apps/api/src/routes/ingest-failures.ts`, `packages/db/migrations/0001_baseline.sql` (`ingest_event_failures`).
 
 ## Purpose
 
-M9 Phase 1: since M5-01, an ingest event the worker couldn't map surfaced ONLY as a worker log line — a documented visibility gap. The LangFuse compat route's 207 response optimistically reports every event accepted (the API edge can't see worker-side mapping outcomes), so a client had *no* way to learn an event was silently dropped. Failed events are now persisted queryably: what was dropped, from which batch, and why.
+Record every ingest event the worker could not map, so a client can find out what was dropped, from which batch, and why. Ingest acknowledges before the worker maps events (native `202`, LangFuse-compatible `207` reporting every event accepted, OTLP `200`), so the API response cannot report these failures; the dead-letter table is the queryable record.
 
-## Design
+## What is recorded
 
-- **One row per failed EVENT** (`ingest_event_failures`), not per batch — a batch retries whole on infrastructure errors, but a mapping failure is deterministic and per-event. Rows carry `batch_id`, `object_key`, `event_id`, `source`, `event_type`, `error`.
-- **The payload is a pointer, not a copy.** The full raw batch already lives durably in object storage (the immutable ingest log); `object_key` + `event_id` locate the exact failed body for debugging or replay. Duplicating bodies into Postgres would bloat it with exactly the malformed-and-possibly-huge payloads least worth storing twice.
-- **All four failure paths dead-letter**: native mapper validation errors, invalid OTLP export bodies, invalid LangFuse ingestion envelopes, and per-event LangFuse mapping errors (where the failure's `event_id` is the *inner* LangFuse SDK event id — what a 207 response would key on — since many SDK events nest inside one envelope event).
-- **Best-effort persistence.** The failure rows are written AFTER the batch's valid rows insert into ClickHouse; a failure writing the diagnostics themselves logs and continues — it must never fail the batch and trigger a full retry over a bookkeeping write. Postgres is a required worker dependency.
-- **Retried batches can duplicate failure rows** (per-attempt ulid ids) — accepted deliberately: duplicates in a diagnostics table beat inventing a cross-retry idempotency scheme for rows whose whole purpose is "look at me".
-- **`GET /api/v1/projects/:projectId/ingest-failures`** (owner-session, project-scoped, newest-first, `limit` ≤ 200) — read-only; no delete/ack route, because rows age out automatically: the retention sweep purges failures older than a fixed 30 days (`purgeIngestFailuresOlderThan`, wired into `runRetention`), so the table can't grow unbounded and a diagnostics table needs no manual grooming.
-- **`ironside_ingest_events_dead_lettered_total`** counter on the worker's metrics (M9-02's `onDeadLetter` hook) — the third actionable signal alongside queue depth and batch failures.
+The ingest worker skips an event it cannot map and still writes the rest of the batch, so one malformed event never blocks a project's other traces. Each skipped event becomes one row in `ingest_event_failures`. Rows are per event, not per batch: a mapping failure is deterministic and specific to one event, while infrastructure errors retry the whole batch.
 
-## A latent build bug found and fixed along the way
+| Failure | `source` | `event_type` | `event_id` | `error` |
+|---|---|---|---|---|
+| A native event fails mapping or validation | `native` | the event's type, or `unknown` | the event id | the mapper's message |
+| An OTLP export body fails the schema | `otlp` | `otlp-export` | the envelope event id | `invalid OTLP export body` |
+| A LangFuse ingestion envelope fails the schema | `langfuse` | `langfuse-ingestion` | the envelope event id | `invalid LangFuse ingestion body` |
+| One LangFuse SDK event inside a valid envelope fails mapping | `langfuse` | `langfuse-ingestion` | the inner LangFuse event id | the mapper's message, or `event failed LangFuse mapping (no detail provided)` |
 
-The new migration never reached `packages/db/dist/migrations` on incremental rebuilds: the build script's `cp -r migrations dist/migrations` copies the source *into* the destination when it already exists, silently nesting `dist/migrations/migrations/` — so compiled processes ran with a stale migration list (dev mode masked this by resolving migrations from the source tree; Docker images masked it by always building fresh). `packages/clickhouse` had the identical bug and identical nesting corruption in its `dist`. Both build scripts now `rm -rf dist/migrations` first. Found because the new test genuinely failed against the compiled path — not by inspection.
+- A row also carries `id` (`ingfail_<ulid>`), `project_id`, `batch_id`, `object_key` and `created_at`.
+- The payload is a pointer, not a copy. `object_key` is the batch's immutable raw object in object storage (`raw/<projectId>/<yyyy>/<mm>/<dd>/<batchId>.json`), and `event_id` locates the failed event in it, for debugging or replay. Copying bodies into Postgres would store the malformed and possibly large payloads twice.
+- For a failed inner LangFuse event, `event_id` is the inner SDK event id, which is what LangFuse's own `207` response keys on; many SDK events share one envelope event.
+- Each failure is also logged as `[ingest] batch=<batchId> event=<eventId> skipped: <error>`.
 
-## Verification
+## Write behavior
 
-- `apps/worker/test/ingest-processor.test.ts`: a batch with one valid native trace + three malformed events (native/OTLP/LangFuse) inserts the valid trace, records exactly 3 failure rows with correct source/eventType/eventId and an `object_key` pointing at the stored batch, and fires the metrics hook with the count; a dead-letter WRITE failure (pool whose `query` always rejects) never fails the batch — the trace data still lands.
-- `packages/db/test/ingest-failures.test.ts` (4): batch insert + newest-first project-scoped listing, empty-array no-op, limit, and the 30-day purge (old row backdated and purged, recent kept).
-- `apps/api/test/ingest-failures.test.ts` (3): 401 unauthenticated, full pointer fields round-trip with cross-project isolation, out-of-range limit 400.
-- **Live end-to-end**: real API + worker; posted a batch with one valid trace and one invalid score (`score requires value or stringValue`); the failure appeared via `GET /api/v1/ingest-failures` with the real Zod-derived error and the exact `raw/<project>/<date>/<batch>.json` object key, the metrics counter read 1, and the valid sibling trace inserted into ClickHouse.
+- Rows are written after the batch's valid rows are written to ClickHouse, in chunks of at most 8,000 rows per `INSERT`. Postgres allows 65,535 bind parameters per statement and each row uses 8, and one LangFuse envelope can nest an unbounded number of inner events, limited only by the 10 MB request body limit.
+- Persistence is best-effort. If writing the rows fails, the worker logs `failed to persist <n> dead-letter rows` and the batch still succeeds: the trace data is already written, and failing the batch would retry all of it over a bookkeeping write.
+- `ironside_ingest_events_dead_lettered_total` (`spec/metrics-v1.md`) is incremented by the number of failures before the rows are written, so it counts failures even when storing them fails.
+- A retried batch can record the same event's failure again, because ids are generated per attempt. Duplicates in a diagnostics table are accepted rather than adding cross-retry idempotency.
 
-## Two more real bugs surfaced by this batch's review and tests
+## Reading failures
 
-1. **Bind-param overflow could silently lose a whole batch's diagnostics (review-flagged).** `recordIngestFailures` used one multi-row INSERT at 8 params/row against Postgres's 65535 wire-protocol param cap (~8191 rows). The native path is bounded (500 events/batch), but one LangFuse envelope event nests an UNBOUNDED inner batch (`.min(1)`, no `.max()` — only the 10MB body limit, ~200k minimal events) — a huge all-failing LangFuse batch would blow the single INSERT, the processor's best-effort catch would swallow the throw, and ZERO rows would persist for exactly the batch most worth seeing (while the metrics counter, incremented before the write, still reported them — a silent counter/table divergence). Fixed by chunking at 8000 rows/statement; regression-tested with an 8500-row call.
-2. **The LangFuse compat mapper silently accepted value-less scores (test-discovered).** Writing the per-event-mapping-failure processor test revealed `mapScore` mapped a score with no `value` "successfully" into a row with both `value` and `string_value` NULL — violating the domain invariant, indistinguishable from data loss, and the exact bug class M5-06 fixed in the LangSmith feedback mapper. Now rejected as a per-event mapping error (`score requires a value`), which dead-letters visibly. Pinned by a mapper-level regression test.
+`GET /api/v1/projects/:projectId/ingest-failures?limit=<n>` requires an owner session whose organization owns the project (`spec/project-session-routing-v1.md`).
 
-## Not yet done (deliberate)
+- `limit` is an integer from 1 to 200, default 50. A value outside that range returns `400` `{ "error": "invalid query", "issues": [...] }`.
+- The response is `{ "failures": [...] }`, newest first (`created_at desc, id desc`). Each item has `id`, `projectId`, `batchId`, `objectKey`, `eventId`, `source`, `eventType`, `error` and `createdAt`.
+- The route is read-only. There is no delete or acknowledge route, because rows expire on their own.
 
-- The API-edge responses (native 202, LangFuse 207) still can't reflect worker-side outcomes — inherent to fast-ACK async ingest; the dead-letter store is the queryable record, not a synchronous one.
-- No web UI for the dead-letter list — API-only, same route-before-UI sequencing as the destination CRUD.
-- The 30-day purge window is fixed, not configurable — add a knob when someone actually needs one.
+## Lifetime
+
+- Every retention pass (`runRetention`, every 6 hours by default; `spec/scheduler-v1.md`) deletes rows older than 30 days (`purgeIngestFailuresOlderThan`). The window is fixed and independent of project retention, because the rows are diagnostics, not trace data.
+- Raw retention (`spec/raw-retention-intents-v1.md`) does not delete a raw object while it has dead-letter rows newer than the retention cutoff. When it deletes an object, it first deletes that object's rows in one locked set of at most 1,000, so no row outlives the object it points to.
+- Deleting a project deletes its rows.
+
+## Verified
+
+`apps/worker/test/ingest-processor.test.ts` covers a batch with one valid trace and malformed native, OTLP and LangFuse events: the trace is inserted, one row is recorded per failed event with its source, type, event id and the stored batch's object key, and the metrics hook receives the count. It also covers a failed inner LangFuse event recorded under the inner SDK event id, and a failing dead-letter write that does not fail the batch. `packages/db/test/ingest-failures.test.ts` covers the batch insert and newest-first, project-scoped listing, an empty input, 8,500 rows in one call, the limit, the 30-day purge, and the bounded per-object delete raw retention uses. `apps/api/test/ingest-failures.test.ts` covers `401` without an owner session, the pointer fields in the response, no rows from another project, and `400` for an out-of-range limit. `packages/mappers/test/langfuse.test.ts` covers a LangFuse score without a value becoming a per-event mapping error.
+
+## History
+
+- M9-03 (PR #35) added the table, the route and the counter. Before it, an unmappable event appeared only as a worker log line.
+- `recordIngestFailures` first wrote one `INSERT` per batch. A large all-failing LangFuse batch would exceed the bind-parameter limit, the best-effort handler would swallow the error, and no rows would be stored while the counter still counted them. Inserts are now chunked at 8,000 rows.
+- The LangFuse compatibility mapper used to accept a score with no value and store it with both value columns null. It now rejects it with `score requires a value`, which dead-letters it.
+- The `packages/db` and `packages/clickhouse` build scripts copied `migrations` into an existing `dist/migrations`, nesting it and leaving compiled processes with a stale migration list. Both now remove `dist/migrations` first.
+- Still open: ingest responses cannot report worker-side mapping failures, which follows from acknowledging before mapping. No web UI lists dead letters. The 30-day window is not configurable.

@@ -1,6 +1,10 @@
 # Evaluator Integration v1
 
-Status: implemented. Owner: Ironside. Protocol identifier:
+Status: implemented. Owner: `apps/api/src/routes/evaluator.ts`,
+`packages/db/src/evaluator-trace-feed.ts`,
+`packages/db/src/evaluator-lifecycle-fence.ts`,
+`apps/worker/src/importers/evaluator-publication.ts`,
+`packages/shared/src/evaluator.ts`. Protocol identifier:
 `ironside/evaluator/v1`.
 
 ## Purpose
@@ -57,9 +61,10 @@ so it cannot remove part of a snapshot during materialization.
 
 ## Recovery and retention
 
-The ingest worker advances `evaluator_trace_feed` after ClickHouse and the raw
-index succeed and before marking the durable pending-ingest intent applied. A
-batch ID makes a retry idempotent. Publications are serialized per project so
+The ingest worker advances `evaluator_trace_feed` after the ClickHouse rows and
+their pending raw-index references are written, and before it marks those
+references applied and deletes the durable pending-ingest intent. A batch ID
+makes a retry idempotent. Publications are serialized per project so
 cursor order is commit order; timestamps retain PostgreSQL microsecond
 precision in opaque cursors. Exact detail reads also reject a version with 409
 while any durable raw reference for the trace is pending. Feed polling keeps
@@ -160,3 +165,15 @@ This protocol does not define release policy, evaluator thresholds, automatic
 promotion, webhooks, or ownership of evaluator evidence. Polling is the
 correctness path; push notification may later reduce latency without replacing
 reconciliation.
+
+## Verified
+
+`apps/api/test/evaluator-integration.test.ts` covers project discovery,
+bootstrap of settled versions, reopen activity, idempotent assessments, a
+bootstrap held before a pending trace, score-only import reconciliation, and
+retention-regressed activity. `packages/db/test/evaluator-trace-feed.test.ts`
+covers microsecond cursors, retry deduplication, late older activity,
+concurrent publications, version-guarded pruning, score receipts across days,
+and staged import snapshots. `packages/db/test/evaluator-lifecycle-fence.test.ts`,
+`apps/api/test/evaluator-cursor.test.ts`, and `apps/web/test/rubrist-link.test.ts`
+cover the lifecycle fence, cursor encoding, and viewer deep links.

@@ -1,48 +1,49 @@
-# Web app v1 (M7-01)
+# Web app v1
 
-> Issue #66 subsequently added the project-global URL environment selector and observed-value management described in `spec/environments-v1.md`.
-
-Status: implemented; authentication and project routing updated by issues #63–#65.
+Status: implemented. Owner: `apps/web/src/`, `apps/web/vite.config.ts`, `apps/web/nginx.conf`, `apps/api/src/app.ts` (CORS).
 
 ## Purpose
 
-The first slice of `apps/web`: a React 19 + Vite + Tailwind 4 + Radix SPA (mirroring rubrist's stack and conventions) that gives an operator a place to browse traces without curling the API directly. Scoped to the read-only trace-viewing DoD item first; project/API-key CRUD screens are a separate follow-up batch since no API routes exist yet to back them (see "Not yet done" below).
+`apps/web` is the operator's browser interface to a deployment: sign in as the owner, choose a project, explore and inspect its traces, and manage its machine credentials and configuration. It is a React 19 single-page app built with Vite, Tailwind CSS 4, Radix primitives and React Router 7.
 
-## Auth model
+## Access model
 
-The browser uses only the HttpOnly owner-session cookie. Project context is
-explicit in `/projects/:projectId/...` URLs and validated against the owner's
-organization. Machine credentials are created on the Connections page,
-displayed once, and never persisted by the SPA. See
-`spec/project-session-routing-v1.md`.
+The browser authenticates only with the HttpOnly owner-session cookie; every API call is sent with `credentials: "include"`. The project is explicit in every URL (`/projects/:projectId/...`) and validated against the owner's project list. Machine credentials are created on the Connections page, shown once, and never stored by the app. Contracts: `spec/owner-auth-v1.md`, `spec/project-session-routing-v1.md`, `spec/scoped-machine-credentials-v1.md`.
 
-## CORS
-
-Ironside's API previously had zero CORS configuration (`apps/api/src/app.ts`) — never needed, since every prior consumer (SDKs, importers, curl) is server-to-server. A browser SPA changes that: without CORS headers, the browser blocks the response before the page's JS ever sees it, regardless of whether the `Authorization` header was correct. Added `hono/cors` (already bundled with the installed `hono` version, no new dependency) with an explicit allowed-origin list from `Config.webOrigins` (env `WEB_ORIGINS`, comma-separated, defaults to `http://localhost:5174`) rather than a wildcard — `credentials` is not enabled since there are no cookies to protect, but an explicit origin list is still the correct default over `*` for a self-hosted product where the operator's actual web app origin is knowable.
-
-In dev, this mostly doesn't matter in practice: `apps/web/vite.config.ts` proxies `/api` and `/health` to the API's port 8788, so the browser sees same-origin requests and CORS never triggers — same pattern as rubrist's dev proxy. CORS becomes load-bearing once the web app is served from a different origin than the API (e.g. a production self-host where they're on different ports/hosts, or a Docker Compose setup that doesn't front both behind one reverse proxy).
-
-## Design tokens — deliberately not a copy of rubrist's
-
-Rubrist's `apps/web` uses a bespoke "paper & ink" warm/editorial palette (custom CSS variables: `--paper`, `--ink`, `--signal` orange, serif headers). Ironside's `src/styles.css` mirrors the *mechanical* structure exactly (Tailwind v4 `@theme inline` mapping, light/dark via `.dark` class, the same token-naming scheme: `ink-*`/`paper-*`/`rule-*`/`signal`) but with Ironside's own distinct palette: cool graphite/slate base, wire-blue signal accent, monospace-forward (no serif) — an infra/observability tool's aesthetic, not an editorial one, and dark-mode-default rather than light-mode-default since this is a tool engineers live in while debugging traces. Reusing rubrist's exact palette would make the two products visually indistinguishable, which is wrong for two separate products in the same author's suite.
+- Before mounting, the app calls `GET /health`; if the API is unreachable it shows a retryable unavailable screen.
+- `/setup`, `/login` and `/recover` are the owner-auth screens. Every other route requires a session; without one the app redirects to `/login` (or `/setup` before the owner exists) with a safe `next` path back.
+- A `401` from any API call refreshes the session state and returns to `/login` with the current path as `next`.
+- `/`, `/connections`, `/settings` and the legacy `/traces/:id` redirect to the same page in the last-used project (`ironside.lastProjectId` in local storage, a non-secret hint checked against the project list) or the first project. With no projects, the app shows the create-first-project screen.
+- A project id the owner cannot see shows "Project not found".
 
 ## Screens
 
-- `screens/traces.tsx` — the trace list. Text filters apply on submit (the button or Enter), not on every keystroke, to avoid a request per character; the select filters apply at once. Search, the level, model, latency and cost filters, and the per-trace columns are specified in [`trace-search-v1.md`](./trace-search-v1.md). Backed by the owner-session `GET /api/v1/projects/:projectId/traces` route. Pagination uses the API's opaque keyset cursor: a `cursorStack` of previously-visited cursors makes "Previous" possible (the list API only returns a `nextCursor`, not a `prevCursor`) by popping the last-pushed cursor rather than re-deriving it.
-- `screens/trace.tsx` — the tree viewer. Recursively renders `ObservationNode.children` with accessible expand/collapse and depth-first keyboard navigation, a type badge (span/generation/event), computed duration (`endTime - startTime`), and a resizable detail pane showing the selected node's (or the trace's, if nothing selected) input/output/usage/cost/metadata. String payloads default to readable source, losslessly pretty JSON, or bounded sanitized Markdown according to content, with the exact API value available as Raw JSON; structured messages retain their interpreted view. The rendering modes and untrusted-content boundary are specified in [`markdown-payload-rendering-v1.md`](./markdown-payload-rendering-v1.md).
-- Trace detail lives at the stable, deep-linkable route `/projects/:projectId/traces/:traceId`. When the API's optional `IRONSIDE_RUBRIST_URL` is set, the owner-session `GET /api/v1/viewer-config` returns it at runtime and the header shows an "Open in Rubrist" link; otherwise the view is unchanged. Both link directions are specified in [`evaluator-integration-v1.md`](./evaluator-integration-v1.md#viewer-deep-links).
-- `screens/connections.tsx` / `screens/settings.tsx` — scoped machine credential management, project quotas, and environment discovery preferences.
+Canonical routes are `/projects/:projectId/traces`, `/projects/:projectId/traces/:traceId`, `/projects/:projectId/connections` and `/projects/:projectId/settings`. The sidebar's project switcher navigates to the chosen project's trace explorer, and the top bar's environment selector sets a project-wide `environment` URL filter (`spec/environments-v1.md`).
 
-## Verified against a real, running stack — not just a build check
+- **Trace explorer** (`screens/traces.tsx`), backed by `GET /api/v1/projects/:projectId/traces` and `/traces/aggregates`. Filters live in the URL so a filtered view can be shared. Text fields apply on submit (the button or Enter) rather than on every keystroke; selects apply at once. Search, the level, model, latency and cost filters, the per-trace columns and the summary tiles are specified in [`trace-search-v1.md`](./trace-search-v1.md); the summary covers the whole filtered set, not the current page. Pagination uses the API's opaque keyset cursor: the list returns only `nextCursor`, so the screen keeps a stack of visited cursors and "Previous" pops it. Cursors are not written to the URL. With no traces and no filters, the screen shows first-trace onboarding and polls every 3 seconds, up to 40 times, because ingest is queued and a trace appears only after the worker writes it.
+- **Trace detail** (`screens/trace.tsx`), at the deep-linkable `/projects/:projectId/traces/:traceId`. It renders the observation tree with expand/collapse and depth-first keyboard navigation (arrow keys, Home, End), a type badge per observation and its duration (`endTime - startTime`). A resizable detail pane shows the selected observation's, or the trace's, input, output, usage, cost and metadata. String payloads render as readable source, lossless pretty JSON, or bounded sanitized Markdown depending on content, with the exact API value available as raw JSON; structured messages keep their interpreted view ([`markdown-payload-rendering-v1.md`](./markdown-payload-rendering-v1.md)). `ironside://media/<id>` references load through the owner-session media route (`spec/media-v1.md`). When the API has `IRONSIDE_RUBRIST_URL`, `GET /api/v1/viewer-config` returns it and the header shows "Open in Rubrist" ([`evaluator-integration-v1.md`](./evaluator-integration-v1.md#viewer-deep-links)).
+- **Connections** (`screens/connections.tsx`): create Ingest or Integration credentials with optional expiry, reveal the token once, list and revoke credentials, and copy connection snippets.
+- **Configuration** (`screens/settings.tsx`): list the organization's projects and create one (its initial Ingest credential is shown once), show or hide observed environments, edit per-project model prices (`spec/cost-pricing-v1.md`), and sign the owner out. Project quotas have no screen.
 
-The current application is covered by repository build, typecheck, API contract, and web rendering tests. The live flow starts with owner setup, creates a project plus its one-time Ingest credential, sends traces with that machine credential, and reads them through the HttpOnly owner session and explicit project route. The contract checks prove that:
-- The CORS preflight (`OPTIONS` with `Origin: http://localhost:5174`) returns the correct `Access-Control-Allow-*` headers, and a request from an untrusted origin gets no `Access-Control-Allow-Origin` header at all (rejected).
-- `GET /api/v1/projects/:projectId/traces` and `GET /api/v1/projects/:projectId/traces/:id` return exactly the JSON shape `listTracesResponseSchema`/`traceTreeResponseSchema` expect the frontend to `.parse()` — including correct parent/child observation nesting.
-- A missing or invalid owner session gets a real `401`, foreign projects are non-enumerating `404`s, and the Vite dev proxy correctly forwards both `/health` and `/api/v1/*` to the API server same-origin.
-- `checkHealth()`'s target (`GET /health`) is reachable and reports all four stores healthy.
+## API origin and CORS
 
-This is real proof the wire contract the frontend was built against is correct, not an assumption. What this does NOT cover: actual browser rendering (the Claude-in-Chrome browser tool was unavailable in this environment — extension not connected), so visual layout, click interactions, and React state transitions were verified by careful code re-reading (cursor pagination push/pop logic, the `cancelled` race guard in `traces.tsx`'s fetch effect, the `onUnauthorized` 401 handler wiring) rather than by driving an actual browser. This is a real gap, flagged rather than glossed over.
+The app calls the API with relative paths unless `VITE_API_URL` is set at build time. In development, the Vite server (port 5174) proxies `/api`, `/v1` and `/health` to `http://localhost:8788`; in the container, nginx proxies the same paths to the `api` service (`spec/self-host-release-v1.md`). Both are same-origin, so CORS applies only when the app is served from a different origin than the API.
 
-## Remaining test gap
+The API's CORS middleware (`hono/cors`) allows exactly the origins in `WEB_ORIGINS` (comma-separated, default `http://localhost:5174`), with credentials, the `Content-Type` and `Authorization` headers, the `GET`, `POST`, `PATCH`, `DELETE` and `OPTIONS` methods, and a 600-second preflight cache. Each origin must be an exact `http(s)` origin with no path or wildcard; the API refuses to start otherwise. Owner-session mutations additionally require an allowed `Origin` and reject cross-site Fetch Metadata (`spec/owner-auth-v1.md`).
 
-There is still no automated full-browser end-to-end suite that drives owner setup, project creation, ingestion, filtering, and trace navigation in one scenario. Component/SSR tests, API integration tests, schema validation, and typechecking cover the individual boundaries meanwhile.
+## Design tokens
+
+`src/styles.css` maps design tokens into Tailwind v4 through `@theme inline`. Ironside shares Rubrist's paper and ink tokens, geometry, typography (Geist Sans and Geist Mono) and component rhythm, and uses a steel-blue `signal` accent to distinguish the data plane from Rubrist's judgment layer. The light theme is the default; a `.dark` class supplies the dark palette, toggled from the sidebar and top bar.
+
+## Verified
+
+`apps/web/test` covers the pure logic and server-rendered components: project URL context and shareable filters (`project-context.test.ts`, `trace-filters.test.ts`), tree keyboard navigation (`trace-tree-nav.test.ts`), the split layout (`trace-layout.test.ts`), the trace record view and its Rubrist link (`trace-record-view.test.ts`), payload and Markdown rendering, connection snippets, and the owner setup screen. On the API side, `apps/api/test/contract.test.ts` checks that the trace list, tree and aggregates responses parse with the schemas the web app uses, including observation nesting, and `apps/api/test/projects.test.ts` covers the owner-session boundary: `401` without a session, the same `404` for foreign and unknown projects, removed flat routes, rejected cross-site mutations, and `viewer-config`.
+
+## History
+
+- M7-01 built the first read-only trace list and tree viewer. The browser then sent a project API key, and CORS was added without credentials. Project and key management screens came later.
+- #63–#65 moved the app to owner sessions, project-explicit URLs and scoped machine credentials; CORS now allows credentials for the configured origins only.
+- #66 added the project-wide environment selector and observed-environment management (`spec/environments-v1.md`). Media rendering, safe Markdown payload rendering, Rubrist deep links, model prices, and trace search with its summary tiles were added by their own specs.
+- The first design used a separate graphite palette with dark mode as the default. The app now shares Rubrist's paper and ink tokens with its own steel-blue accent, and defaults to light.
+- The M7-01 check verified the wire contract against a live stack but not browser rendering, because no browser tool was available. The trace explorer has since been checked in a real browser as part of the search and filters work (`spec/trace-search-v1.md`).
+- Still open: no automated full-browser end-to-end suite drives owner setup, project creation, ingestion, filtering and trace navigation in one scenario.

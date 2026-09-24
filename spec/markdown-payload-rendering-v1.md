@@ -1,5 +1,10 @@
 # Markdown Payload Rendering v1
 
+Status: implemented. Owner: `apps/web/src/lib/markdown.ts`,
+`apps/web/src/components/markdown-body.tsx`,
+`apps/web/src/components/payload-viewer.tsx`,
+`apps/web/src/lib/payload-view-preference.tsx`.
+
 Trace and observation input/output are untrusted stored content. Ironside may
 render bounded string payloads as Markdown for readability, but rendering must
 not create an execution or background-network surface.
@@ -17,9 +22,9 @@ not create an execution or background-network surface.
   default. A selected view is stored locally under the authenticated owner's
   `principalId`; it is not synchronized between browsers.
 
-Source is the decoded, whitespace-preserving value introduced by the trace
-viewer usability work. Raw JSON is the serialization of the original API value
-before display-only decoding. Neither view mutates stored data.
+Source is the decoded, whitespace-preserving value. Raw JSON is the
+serialization of the original API value before display-only decoding. Neither
+view mutates stored data.
 
 ## Detection and bounds
 
@@ -63,3 +68,18 @@ math execution, or embedded media.
 No raw HTML, MDX, syntax highlighting, diagrams, math, remote images, media
 embeds, relative app links, recursive arbitrary-JSON rendering, editing, API or
 database changes, or server-synchronized preferences are part of v1.
+
+## Verified
+
+`apps/web/test/markdown.test.ts` covers detection, the pre-parse bounds, the
+link allowlist, and AST replacement. `apps/web/test/markdown-body.test.ts`
+covers rendering, disabled task controls, dropped raw HTML and images, inert
+unsafe links, inert fenced code, and over-limit input.
+`apps/web/test/payload-viewer.test.ts` and
+`apps/web/test/payload-view-preference.test.ts` cover the view defaults, message
+payloads, and per-owner preference storage.
+
+## History
+
+- The Source view came from the trace viewer usability work; this spec added
+  Rendered Markdown alongside it.

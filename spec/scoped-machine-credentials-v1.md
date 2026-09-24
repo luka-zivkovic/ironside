@@ -1,6 +1,8 @@
 # Scoped machine credentials v1
 
-Status: implemented for #65. Owners use session-authenticated, project-explicit management routes; machines use project-bound credentials on stable key-implicit data-plane routes.
+Status: implemented. Owner: `apps/api/src/lib/machine-credentials.ts`, `apps/api/src/middleware/auth.ts` (`machineAuth`), `apps/api/src/routes/credentials.ts`, `apps/api/src/app.ts` (route capabilities), `apps/web/src/screens/connections.tsx`.
+
+Owners use session-authenticated, project-explicit management routes; machines use project-bound credentials on stable key-implicit data-plane routes.
 
 ## Authorization model
 
@@ -46,8 +48,8 @@ Expiry is enforced both in Postgres resolution and on Redis cache hits. A cache 
 ## Token class and storage
 
 All machine credentials use the `ironside_sc_` token class and live in
-`machine_credentials`. Ironside is pre-production and has no prior credential
-class or data-plane key table in its baseline.
+`machine_credentials`. The baseline schema has no other credential class or
+data-plane key table.
 
 ## Connections UX
 
@@ -62,6 +64,10 @@ Examples use `IRONSIDE_API_KEY` rather than embedding the disclosed token. Runti
 
 Media upload shares the same Redis per-project write budget as native, OTLP, LangFuse ingestion, and standalone score writes.
 
-## Verification
+## Verified
 
-`apps/api/test/machine-capabilities.test.ts` exercises positive and negative authorization for every machine route and both presets. Credential tests cover one-time disclosure, hash-only storage, frozen capabilities, actor/audit persistence, strict request fields, non-enumerating project isolation, cache-primed immediate revocation, and owner-only management. Low-level cache tests cover expiry after a cached resolution. Rate-limit tests prove media and ingest share one project budget. Web tests pin generated hosts, paths, header encoding, environment-variable guidance, and the absence of embedded tokens/project ids.
+`apps/api/test/machine-capabilities.test.ts` exercises positive and negative authorization for every machine route and both presets. Credential tests (`apps/api/test/credentials.test.ts`, `apps/api/test/machine-credentials.test.ts`, `apps/api/test/credential-revocation-order.test.ts`) cover one-time disclosure, hash-only storage, frozen capabilities, actor/audit persistence, strict request fields, non-enumerating project isolation, cache-primed immediate revocation, and owner-only management. Low-level cache tests in `apps/api/test/machine-credentials.test.ts` cover expiry after a cached resolution. Rate-limit tests (`apps/api/test/rate-limit.test.ts`) prove media and ingest share one project budget. Web tests (`apps/web/test/connection-snippets.test.ts`) pin generated hosts, paths, header encoding, environment-variable guidance, and the absence of embedded tokens/project ids.
+
+## History
+
+- Issue #65 replaced the transitional project keys with scoped `ironside_sc_` machine credentials.

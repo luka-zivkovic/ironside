@@ -1,6 +1,6 @@
 # Trace Envelope v1
 
-Status: draft (M0). Owner: `@ironside/shared` (`packages/shared/src/envelope.ts`).
+Status: implemented. Owner: `@ironside/shared` (`packages/shared/src/envelope.ts`, `packages/shared/src/domain.ts`).
 
 ## Purpose
 
@@ -11,18 +11,24 @@ Every ingest path — native JSON, OTLP, LangFuse-compat, importers — converge
 ```ts
 {
   id: string,               // ULID, generated at the edge (API) if absent
-  type: "trace-upsert" | "observation-upsert" | "score-upsert",
+  type: "trace-upsert" | "observation-upsert" | "score-upsert"
+      | "otlp-export" | "langfuse-ingestion",
   source: "native" | "otlp" | "langfuse" | "import-langfuse" | "import-langsmith",
   schemaVersion: 1,
-  idempotencyKey?: string,  // sent by the client, stored verbatim; absent otherwise
+  idempotencyKey?: string,  // sent by the client, stored verbatim; absent otherwise (one exception below)
   body: unknown             // source-shaped payload; worker mapper owns interpretation
 }
 ```
 
+`otlp-export` carries a raw OTLP `ExportTraceServiceRequest` and
+`langfuse-ingestion` a raw LangFuse ingestion batch; the worker's OTLP and
+LangFuse mappers explode each into many domain rows.
+
 `idempotencyKey` is a correlation value, not a deduplication key: nothing reads
 it after storage. Resending an event is safe because rows upsert by their own
-ids (see "Upsert semantics" below). Through 0.3.0 the API filled an absent key
-with a SHA-256 hash of the body; it no longer spends that work on every event.
+ids (see "Upsert semantics" below). The one event the API fills in itself is
+the score event of `POST /api/v1/evaluator/scores`, which carries the SHA-256
+fingerprint of the canonical request.
 
 ## IngestBatch (unit of storage + queueing)
 
@@ -36,18 +42,18 @@ with a SHA-256 hash of the body; it no longer spends that work on every event.
 ```
 
 - Object storage key: `raw/{projectId}/{yyyy}/{mm}/{dd}/{batchId}.json`
-- Queue message: `{ batchId, projectId, objectKey, eventCount }` — payloads never enter Redis (LangFuse v3 lesson).
+- Queue message: `{ batchId, projectId, objectKey, eventCount, intentCreatedAt? }` — payloads never enter Redis (LangFuse v3 lesson). `intentCreatedAt` is the API acceptance time used by ingest recovery (`spec/ingest-recovery-v1.md`).
 
 ## Domain model (worker output → ClickHouse)
 
-**Trace**: `id, projectId, timestamp, name?, userId?, sessionId?, environment?, release?, version?, tags: string[], metadata: Record<string,string>, input?, output?` (input/output JSON-serialized; large payloads offloaded to object storage by reference — threshold decided in M1).
+**Trace**: `id, projectId, timestamp, name?, userId?, sessionId?, environment?, release?, version?, tags: string[], metadata: Record<string,string>, input?, output?` (input/output JSON-serialized and stored inline; there is no size-based offload. Binary media is uploaded separately and referenced as `ironside://media/<id>`, per `spec/media-v1.md`).
 
 `environment` follows the single normalization/filter/discovery contract in
 `spec/environments-v1.md`; it is never a project or policy boundary.
 
 **Observation**: `id, traceId, projectId, parentObservationId?, type: "span"|"generation"|"event", name?, startTime, endTime?, level?: "debug"|"default"|"warning"|"error", statusMessage?, model?, modelParameters?: Record<string, string|number|boolean|null>, input?, output?, usageDetails?: Record<string, number>, costDetails?: Record<string, number>, completionStartTime?, metadata`.
 
-**Score**: `id, projectId, traceId, observationId?, name, dataType: "numeric"|"categorical"|"boolean", value?: number, stringValue?, source: "api"|"eval"|"annotation", comment?, metadata`.
+**Score**: `id, projectId, traceId, observationId?, name, dataType: "numeric"|"categorical"|"boolean", value?: number, stringValue?, source: "api"|"eval"|"annotation", comment?, timestamp?, metadata` (at least one of `value` and `stringValue`).
 
 Rules:
 - Upsert semantics: same id twice = update (ClickHouse ReplacingMergeTree handles dedup by event timestamp).
@@ -57,12 +63,18 @@ Rules:
 
 ## Trace completion contract (normative)
 
-Ironside uses a **quiet-period watermark** rather than a source-specific finalize event. A trace is settled when its latest successful `trace-upsert` or `observation-upsert` receipt timestamp is at least `N` seconds old. `N` defaults to 300 seconds (`DEFAULT_TRACE_QUIET_PERIOD_SECONDS`) and may be overridden per project with `traceQuietPeriodSeconds`.
+Ironside uses a **quiet-period watermark** rather than a source-specific finalize event. A trace is settled when the receipt timestamp of its latest successful trace or observation write, from any event type, is at least `N` seconds old. `N` defaults to 300 seconds (`DEFAULT_TRACE_QUIET_PERIOD_SECONDS`) and may be overridden per project with `traceQuietPeriodSeconds`.
 
 - `receivedAt`/the derived ClickHouse `event_ts` is the activity clock. It is server-generated and deterministic for a batch, so retrying the same batch does not move the watermark.
 - Score writes do **not** reopen a trace. Scores are downstream annotations; treating a judge's own verdict as source activity would create an evaluation feedback loop.
-- Any genuinely later trace or observation write reopens a previously settled trace. After another quiet period it becomes a new settled version, identified by its latest activity timestamp.
-- Automated exports, OTLP forwards, webhooks, and LangFuse-compatible fetches consume settled traces only. Webhooks are exactly-once per `(rule, trace, settled version)`, so a late write produces one new notification after re-settling.
+- Any genuinely later trace or observation write reopens a previously settled trace. After another quiet period it becomes a new settled version. A version is the trace's feed version (`traceVersion`), assigned when the worker publishes the write to the durable trace feed (`spec/evaluator-integration-v1.md`), not its latest activity timestamp; a batch written late with an older receive time therefore still produces a new version.
+- Automated exports, OTLP forwards, webhooks, and LangFuse-compatible fetches consume settled traces only; exports, OTLP forwards, and webhooks read them from the durable trace feed. Webhooks are exactly-once per `(rule, trace, version)` with that feed version (`spec/webhooks-v1.md`), so a late write produces one new notification after re-settling.
 - Native list/detail/aggregate routes intentionally remain live views and may include in-flight traces; operators need to see active work while debugging.
 
 This contract applies uniformly to native SDK/JSON, OTLP, LangFuse compatibility, and import sources. An explicit SDK `trace.end()` may be added later as a latency optimization, but correctness must never depend on a source being able to emit it.
+
+## History
+
+- Drafted in M0 as the single ingest envelope. The draft planned to offload large input/output payloads above a threshold to be set in M1; instead, media is uploaded separately (`spec/media-v1.md`).
+- Through 0.3.0 the API filled an absent `idempotencyKey` with a SHA-256 hash of the body; it no longer spends that work on every event.
+- Settled versions were first identified by the trace's latest activity timestamp; they are now the trace's feed version (`spec/webhooks-v1.md`).

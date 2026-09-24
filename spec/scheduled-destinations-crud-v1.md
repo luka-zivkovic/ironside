@@ -1,27 +1,68 @@
-# Scheduled Destinations CRUD v1 (M6-06)
+# Scheduled Destinations CRUD v1
 
-Status: implemented, verified live end-to-end. Owner: `apps/api/src/routes/{exports,forwards,webhooks}.ts`, `packages/db/src/{export-configs,otlp-forward-rules,webhooks}.ts` (update/delete/list), `packages/shared/src/management.ts` (wire schemas).
+Status: implemented. Owner: `apps/api/src/routes/{exports,forwards,webhooks}.ts`, `apps/api/src/lib/exact-optional.ts`, `packages/db/src/{export-configs,otlp-forward-rules,webhooks}.ts`, `packages/shared/src/management.ts` (wire schemas).
 
 ## Purpose
 
-M6-05 wired a scheduler to run `export_configs`/`otlp_forward_rules`/`webhook_rules` automatically, but nothing outside direct database access could create one. This batch closes that: `GET`/`POST`/`PATCH`/`DELETE /api/v1/exports`, `/api/v1/otlp-forwards`, `/api/v1/webhooks` — day-2 management, same house style and project-scoping contract as the existing `/api/v1/projects`/`/api/v1/keys` routes.
+Create, list, update and delete the three destinations the worker scheduler runs, scheduled exports (`spec/scheduled-export-v1.md`), OTLP forward rules (`spec/otlp-forwarding-v1.md`) and webhook rules (`spec/webhooks-v1.md`), through the API instead of direct database writes.
 
-## Design
+## Routes
 
-- **Mounted in the unrated-limited `v1` group** (`apps/api/src/app.ts`), alongside `projects`/`keys` — low-volume management traffic, not ingest.
-- **Project-scoped, not-found-either-way.** `updateExportConfig`/`deleteExportConfig` etc. (new `packages/db/src/*.ts` functions) filter by `id AND project_id` in one query — a caller from a different project gets the identical 404 whether the id doesn't exist at all or belongs to someone else, so there's no way to enumerate other projects' destination ids by observing a different error.
-- **Secrets are write-only.** `POST /exports` takes `destinationSecretAccessKey` (plaintext) and `POST /otlp-forwards` takes `destinationAuthHeader` (plaintext, optional); both are encrypted via `encryptSecret` (moved to `@ironside/shared` in M6-05) before the create call ever reaches Postgres, and neither field exists anywhere in any response shape — not "omitted this time," genuinely absent from `ExportConfigResponse`/`OtlpForwardRuleResponse`. `POST /webhooks` doesn't even accept a secret from the caller: the HMAC signing secret is generated server-side (`randomBytes(32)`, same pattern as an API key token) since there's no reason a caller should ever choose or see the value a `runWebhooks` request-signature check verifies against.
-- **`pollIntervalSeconds` is an optional override**, applied as an immediate follow-up `UPDATE` after `INSERT` rather than widening each `createX` function's own insert statement for one field only the API layer ever sets at create time — the DB migration's per-subsystem defaults (exports 1h, forwards 5m, webhooks 1m) already cover the common case.
-- **`exactOptionalPropertyTypes` friction, same class already established in `projects.ts`'s quota route.** Zod's `.optional()` infers `T | undefined`, but the domain types (and `tsconfig.base.json`'s `exactOptionalPropertyTypes: true`) require the key to be genuinely absent, not present-with-`undefined`. A new shared helper, `apps/api/src/lib/exact-optional.ts` (`toFilter`/`toEnabledPollIntervalUpdate`), rebuilds the Zod-parsed request body into a properly-optional object once, reused across all three route files instead of duplicating the same conditional-spread three times.
+| Resource | Collection | Item | List key | Id prefix |
+|---|---|---|---|---|
+| Export configs | `/api/v1/projects/:projectId/exports` | `/api/v1/projects/:projectId/exports/:id` | `exports` | `export_` |
+| OTLP forward rules | `/api/v1/projects/:projectId/otlp-forwards` | `/api/v1/projects/:projectId/otlp-forwards/:id` | `forwards` | `fwd_` |
+| Webhook rules | `/api/v1/projects/:projectId/webhooks` | `/api/v1/projects/:projectId/webhooks/:id` | `webhooks` | `webhook_` |
 
-## Verification
+- `GET` on the collection returns `200` with `{ "<list key>": [...] }`, oldest first. `POST` returns `201` with the created resource.
+- `PATCH` on an item returns `200` with the updated resource. `DELETE` returns `204`.
+- An invalid or unparseable body returns `400` `{ "error": "invalid request", "issues": [...] }`. An unknown id returns `404`.
 
-- `apps/api/test/scheduled-destinations.test.ts`: 10 integration tests against the real local stack — full create/list/patch/delete round-trip for each of the three subsystems, secret non-leakage (asserted both by key-absence and by `JSON.stringify` not containing the plaintext secret anywhere in the response), cross-project isolation (404, not 403 — no information leak about whether the id exists), invalid-input 400s, the `pollIntervalSeconds` override.
-- **Live end-to-end, not just tests**: started the real API and worker processes against the live local stack, created a webhook rule via `POST /api/v1/webhooks` with a loopback `destinationUrl`, and confirmed the running M6-05 scheduler picked it up on its own next tick, decrypted the server-generated signing secret, and correctly rejected the destination via the SSRF guard (`[scheduler:webhook] Error: destination URL resolves to a non-public address: 127.0.0.1`) — proving the full create-via-API → scheduler-picks-it-up → guard-enforced chain works together in a real running deployment, not only in isolated unit/integration tests.
-- Full suite: 318/318 passing (10 new), build + typecheck clean, run 3× to confirm no flakiness introduced.
+## Access and project scoping
 
-## Not yet done (follow-up, not blocking this batch's DoD)
+The routes are mounted in the owner-session project router (`apps/api/src/app.ts`). `ownerSessionAuth` requires an owner session (`401` without one); `trustedBrowserMutation` rejects a `POST`, `PATCH` or `DELETE` with `403` unless its `Origin` is an allowed web origin and `Sec-Fetch-Site` is not `cross-site`; `ownerProjectAuth` returns `404 project not found` unless the project belongs to the session's organization. Machine credentials cannot reach these routes, and they are not rate limited. See `spec/owner-auth-v1.md` and `spec/project-session-routing-v1.md`.
 
-- **No route to rotate a webhook's signing secret** or an OTLP forward's auth header after creation — currently requires delete + recreate. A dedicated rotate endpoint is a natural follow-up once this is used in anger.
-- **No route to update `destinationUrl`/`filter`/other non-scheduling fields** — `PATCH` only covers `enabled`/`pollIntervalSeconds`, the two fields actually needed for day-2 on/off + cadence management. Broader field updates are deferred rather than building a general partial-update endpoint speculatively.
-- **No `apps/web` UI** for any of these three — API-only for now, matching M6's overall scope (the differentiator is the export/forward/webhook capability itself, not yet a settings screen for it).
+Update and delete filter by `id` and `project_id` in one query, so an id that does not exist and an id that belongs to another project return the same `404`, and one project cannot discover another's destination ids by comparing errors. Deleting a project deletes its destinations (`on delete cascade`), and deleting a webhook rule deletes its delivery records.
+
+## Create requests
+
+Every create request takes `name` (1–200 characters), an optional `filter` and an optional `pollIntervalSeconds`.
+
+- `filter` is a `TraceFilter`: `from` and `to` (ISO 8601 datetimes with offset), `userId`, `sessionId`, `tags`, `metadataKey` and `metadataValue`, all optional; the default is `{}`. Environment is not a destination filter (`spec/environments-v1.md`).
+- `pollIntervalSeconds` is an integer from 1 to 2,592,000 (30 days); the cap keeps a typo from leaving a destination unscheduled for a near-eternity. When omitted, the table default applies: exports 3,600, forwards 300, webhooks 60. It is applied by an `UPDATE` right after the `INSERT`, which keeps the create functions' insert statements unchanged for a field only the API sets.
+- Exports also take `format` (`parquet` or `jsonl`, default `jsonl`), `destinationBucket`, `destinationPrefix` (default `""`), `destinationEndpoint`, `destinationRegion` (default `us-east-1`), `destinationAccessKeyId` and `destinationSecretAccessKey`.
+- OTLP forwards take `destinationUrl` (a URL) and an optional `destinationAuthHeader`.
+- Webhooks take `destinationUrl` (a URL).
+
+A new destination is enabled, due on the next scheduler tick (`next_run_at` defaults to `now()`), and starts at the beginning of the trace feed. The API validates a destination URL only as a URL; the worker applies the SSRF guard before each run (`apps/worker/src/lib/ssrf-guard.ts`).
+
+## Secrets are write-only
+
+- `destinationSecretAccessKey` and `destinationAuthHeader` are encrypted with `encryptSecret` (AES-256-GCM with a key derived from `IRONSIDE_ENCRYPTION_SECRET`, `packages/shared/src/encryption.ts`) before the row is inserted. No response schema has a field for either; a forward rule reports only `hasDestinationAuthHeader`.
+- A webhook's HMAC signing secret is never accepted from or returned to the caller. The API generates it (32 random bytes, hex-encoded) and stores it encrypted; a receiver only verifies signatures.
+- Without `IRONSIDE_ENCRYPTION_SECRET`, creating an export or a webhook, or a forward with an auth header, fails with `500`. The worker needs the same secret to decrypt (`spec/scheduler-v1.md`).
+
+## Updates
+
+`PATCH` takes only `enabled` (boolean) and `pollIntervalSeconds` (same bounds as on create). Both are optional; an explicit `null` is rejected with `400` rather than silently ignored. Neither changes `next_run_at`: a new interval applies from the next claim, and a re-enabled destination whose `next_run_at` has passed runs on the next scheduler tick.
+
+The destination, filter, format and secrets cannot be changed. Replacing any of them means deleting and recreating the destination, which starts it again at the beginning of the trace feed, so its first run sends every existing matching trace again.
+
+`toFilter` and `toEnabledPollIntervalUpdate` (`apps/api/src/lib/exact-optional.ts`) rebuild Zod-parsed bodies so an unset field is absent rather than present as `undefined`, as `exactOptionalPropertyTypes` requires; all three route files share them.
+
+## Responses
+
+- Export config: `id`, `projectId`, `name`, `format`, `filter`, `destinationBucket`, `destinationPrefix`, `destinationEndpoint`, `destinationRegion`, `destinationAccessKeyId`, `enabled`, `pollIntervalSeconds`, `nextRunAt`, `lastRunAt`, `lastRunStatus`, `lastRunError`, `lastRunRowCount`.
+- OTLP forward rule: `id`, `projectId`, `name`, `destinationUrl`, `hasDestinationAuthHeader`, `filter`, `enabled`, `pollIntervalSeconds`, `nextRunAt`, `lastRunAt`, `lastRunStatus`, `lastRunError`, `lastRunForwardedCount`.
+- Webhook rule: `id`, `projectId`, `name`, `destinationUrl`, `filter`, `enabled`, `pollIntervalSeconds`, `nextRunAt`, `lastRunAt`, `lastRunStatus`, `lastRunError`, `lastRunDeliveredCount`.
+
+Timestamps are ISO 8601 strings. `lastRunStatus` is `success`, `error` or `null`; the `lastRun*` fields are `null` until a run is recorded. Each feature's spec defines what its run fields report.
+
+## Verified
+
+`apps/api/test/scheduled-destinations.test.ts` runs the API against real Postgres with an owner session. It covers a create, list, patch and delete round trip for each resource; the export secret and forward auth header absent from responses, checked both by key and by searching the serialized body; the stored auth header decrypting to the submitted value; `hasDestinationAuthHeader: false` for a rule without one; no signing secret in webhook responses; `401` without an owner session; `400` for an invalid create, a non-URL `destinationUrl` and `enabled: null`; `404` for an unknown webhook id; another project's destination missing from the list and returning `404` on patch and delete; and the `pollIntervalSeconds` override.
+
+## History
+
+- M6-06 added these routes: the scheduler (M6-05) could already run destinations, but only direct database writes could create them. They were first mounted at `/api/v1/exports`, `/api/v1/otlp-forwards` and `/api/v1/webhooks` alongside the project and key routes; they now live under `/api/v1/projects/:projectId/` behind owner sessions.
+- Still open: a webhook signing secret or forward auth header cannot be rotated, and a destination's URL, filter or format cannot be changed, without deleting and recreating it. There is no web UI for these routes.

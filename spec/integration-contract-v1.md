@@ -1,6 +1,6 @@
 # Integration Contract v1
 
-Status: implemented (issue #45). Owners: `apps/api/src/routes/otlp.ts`, `packages/mappers/src/otlp.ts`, `packages/sdk/`.
+Status: implemented. Owner: `apps/api/src/routes/otlp.ts`, `packages/mappers/src/otlp.ts`, `packages/sdk/`.
 
 ## Decision
 
@@ -37,3 +37,7 @@ OTLP does not standardize computed monetary cost or eval/human-feedback scores. 
 ## Stability
 
 The upstream `gen_ai.*` semantic conventions are still marked Development. Ironside accepts the current `gen_ai.provider.name` attribute and the legacy `gen_ai.system` fallback, and it retains unknown attributes so a semconv change does not discard data. Typed mappings may grow compatibly as the upstream vocabulary stabilizes.
+
+## History
+
+- Issue #45 set the three direct-ingest surfaces and their roles.

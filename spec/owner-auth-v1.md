@@ -1,10 +1,10 @@
 # Owner authentication foundation v1
 
-Status: implemented for issue #63; the project-scoped session follow-up is implemented in #64, and #65 replaced transitional project keys with scoped machine credentials. See `spec/project-session-routing-v1.md` and `spec/scoped-machine-credentials-v1.md`.
+Status: implemented. Owner: `packages/db/src/owner-auth.ts`, `apps/api/src/routes/owner-auth.ts`, `apps/api/src/middleware/owner-session.ts`, `apps/api/src/lib/passwords.ts`, `apps/api/src/lib/owner-secrets.ts`, `apps/api/src/scripts/owner-setup.ts`, `apps/api/src/scripts/owner-recovery.ts`.
 
 ## Boundary
 
-Human control-plane identity and machine data-plane credentials are separate. `ironside_sc_*` credentials authenticate stable data-plane routes but cannot create or resume an owner session. Owner sessions authenticate the browser and project-explicit control plane described in #64.
+Human control-plane identity and machine data-plane credentials are separate. `ironside_sc_*` credentials authenticate stable data-plane routes but cannot create or resume an owner session (`spec/scoped-machine-credentials-v1.md`). Owner sessions authenticate the browser and the project-explicit control plane described in `spec/project-session-routing-v1.md`.
 
 The SPA has `/setup`, `/login`, and `/recover` routes. It never stores a machine credential.
 
@@ -33,6 +33,10 @@ The session cookie is host-only, HttpOnly, SameSite=Lax, Path=/, and Secure by d
 
 CORS sends credentials only for exact `WEB_ORIGINS`. Every state-changing owner-auth request also requires an allowed `Origin` and rejects `Sec-Fetch-Site: cross-site`. Setup, login, and recovery use shared Redis fixed-window counters by client address. Login deliberately has no username-wide hard-blocking bucket, because that would let a remote caller lock the deployment's sole owner out globally. Forwarded IP headers are ignored unless `AUTH_TRUST_PROXY=true`; the bundled nginx proxy overwrites forwarded-address headers rather than passing client-supplied values through.
 
-## Verification
+## Verified
 
-Automated tests cover fresh setup, concurrent double-submit, password hashing, cookie attributes, machine-key rejection, session refresh/logout, secure-cookie mode, auth rate limiting, recovery password replacement, session revocation, and absence of plaintext capabilities in Postgres.
+`apps/api/test/owner-auth.test.ts` covers fresh setup, concurrent double-submit, password hashing, cookie attributes, machine-key rejection, session refresh/logout, secure-cookie mode, auth rate limiting, recovery password replacement, session revocation, and absence of plaintext capabilities in Postgres.
+
+## History
+
+- Issue #63 added owner authentication. #64 followed with project-scoped session routing (`spec/project-session-routing-v1.md`), and #65 replaced the transitional project keys with scoped machine credentials (`spec/scoped-machine-credentials-v1.md`).

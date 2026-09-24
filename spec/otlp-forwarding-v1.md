@@ -1,36 +1,62 @@
 # OTLP Forwarding v1
 
-Status: implemented (M6-02); scheduler wiring (M6-05) and admin API routes (M6-06) since added. Owner: `packages/shared/src/otlp-export.ts`, `apps/worker/src/forwarders/`.
+Status: implemented. Owner: `apps/worker/src/forwarders/`, `packages/shared/src/otlp-export.ts`, `packages/db/src/otlp-forward-rules.ts`.
 
 ## Purpose
 
-The inverse of M3's OTLP ingest: forward stored traces (filtered) as OTLP/HTTP+JSON to an arbitrary destination — an otel-collector, Jaeger, or any other OTel-native/gen_ai-semconv-aware backend — so a customer's own observability tooling gets a live feed without them building an extractor.
+Forward stored traces, filtered per rule, as OTLP/HTTP+JSON to a customer-owned destination (an OpenTelemetry Collector, Jaeger, or any other OTLP-native backend), so a team's own observability tooling receives Ironside traces without building an extractor. It is the reverse of OTLP ingest (`spec/otlp-ingest-v1.md`) and reads the same durable trace feed as scheduled exports (`spec/scheduled-export-v1.md`) and webhooks (`spec/webhooks-v1.md`).
 
-## Design
+## Rules
 
-- **`toOtlpTraceId`/`toOtlpSpanId`** (`packages/shared/src/otlp-export.ts`): Ironside's own trace/observation ids (ULIDs, imported UUIDs) don't fit OTLP's exact byte-length requirement — verified directly against the OTel proto spec (`trace.proto`): `trace_id` MUST be exactly 16 raw bytes (32 hex chars), `span_id` exactly 8 raw bytes (16 hex chars); an all-zero or wrong-length id is explicitly invalid. Derives valid hex ids via a deterministic SHA-256-based hash, so the same source id always maps to the same OTLP id across repeated forwarding runs (a re-forwarded trace looks like the same trace downstream, not a new one every time).
-- **`mapTraceToOtlpExportRequest`** (`apps/worker/src/forwarders/otlp-mapper.ts`): converts a trace + its observation tree into an `ExportTraceServiceRequest` JSON body. Re-emits `gen_ai.request.model`/`gen_ai.usage.{input,output}_tokens` for observations carrying a model, so a downstream gen_ai-semconv-aware system sees the same attribute shape a real instrumentation SDK would produce. A trace with zero observations still emits one synthetic root span — an export with zero spans for an otherwise-real trace would look like data loss to a downstream consumer, not an intentional signal.
-- **`otlp_forward_rules` table**: per-project named rules (destination URL, optional auth header, `TraceFilter`-shaped filter). The auth header is AES-256-GCM encrypted at rest (`destination_auth_header_encrypted`), same pattern and same encryption helper as M6-01's `export_configs.destination_secret_access_key_encrypted` — a bearer token to a customer's otel-collector is the same credential risk class as an S3 secret key, so both tables encrypt at the application layer before Postgres ever sees the value.
-- **`forwardOtlpTraces`** (`apps/worker/src/forwarders/otlp-forwarder.ts`): reads settled trace versions published after the rule's position in the durable trace feed, with the same rules as scheduled exports (`spec/scheduled-export-v1.md`), and forwards each matching trace as its own OTLP POST in feed order. The rule's position (`feed_cursor_published_at`, `feed_cursor_trace_id`) advances past each trace the destination accepts.
-  - A timeout (30 s per request), network error, 5xx, or a 4xx that describes the destination rather than the trace (401, 403, 404, 405, 408, 429, ...) stops the run with the position before that trace, so an unreachable or misconfigured destination delays delivery instead of skipping traces; the next run resumes there.
-  - A 400, 413 or 422 is a permanent rejection of that trace (for example, 413 for an oversized one): the run skips it and continues, so one bad trace cannot block the rule for good.
-  - Every run records `last_run_at`, `last_run_status`, `last_run_forwarded_count`, and `last_run_error` (Postgres migration `0004`), which name the rejected or skipped traces; the forward-rule API returns them, and the scheduler reports a run with failures through `onError` and an `error` outcome metric.
-  - A trace that receives new activity is forwarded again as its new version. Delivery is at-least-once, and because OTLP ids are derived deterministically a resent trace is the same trace downstream. The position is stored only if it still holds the value the run started from, so a duplicate run on another replica cannot move it back. A run forwards at most 5,000 traces; a larger backlog continues on the next scheduler tick.
+`otlp_forward_rules` holds per-project named rules: `destination_url`, an optional auth header, a `TraceFilter`-shaped `filter`, `enabled`, and the scheduling columns `poll_interval_seconds` (default 300) and `next_run_at`. The auth header is AES-256-GCM encrypted at the application layer (`encryptSecret`, `packages/shared/src/encryption.ts`) and stored in `destination_auth_header_encrypted`; a bearer token for a collector is the same class of credential as an export's S3 secret key. Rules are managed through the API in `spec/scheduled-destinations-crud-v1.md` and run by the worker scheduler (`spec/scheduler-v1.md`), which decrypts the header before calling the forwarder.
 
-## Verified against a real, independent OTel-native system — not just a mock
+## What a run forwards
 
-`apps/worker/test/otlp-forwarder.test.ts` covers the logic against a mock HTTP server (auth headers, span nesting, per-trace failure isolation, tenant/filter isolation). Beyond that, the DoD ("forwarded traces visible in local otel-collector/Jaeger") was verified manually against a **real Jaeger all-in-one container**: seeded a trace with a root span and a nested `gen_ai`-attributed generation into ClickHouse, ran `forwardOtlpTraces` against Jaeger's real OTLP/HTTP receiver (`:4318/v1/traces`), then queried Jaeger's own API (`/api/traces`) and confirmed:
-- The `ironside` service registered (from the mapper's `resource.attributes["service.name"]`).
-- Both spans present with correct names.
-- The child span's `CHILD_OF` reference resolves to the exact root span's id (parent/child structure survives the hash-based id derivation correctly).
-- All three `gen_ai.*` attributes present with correct values and types (`gen_ai.request.model` as string, `gen_ai.usage.input_tokens`/`output_tokens` as int64).
+`forwardOtlpTraces` (`apps/worker/src/forwarders/otlp-forwarder.ts`) sends every matching settled trace version published after the rule's position, one OTLP export request per trace, in the feed's commit order.
 
-This is real proof against real, independent software — not an assumption that a correctly-shaped OTLP JSON body would obviously be accepted.
+- **Position:** each rule stores its position in the durable trace feed, `evaluator_trace_feed` (`feed_cursor_published_at`, `feed_cursor_trace_id`; Postgres migration `0003`). A new rule starts at the beginning of the feed, so its first run forwards every existing matching trace.
+- **Settlement:** the feed is read with the same rules as scheduled exports (`apps/worker/src/exporters/settled-trace-feed.ts`), using the project's quiet period. A run stops at a trace still inside its quiet period or still being written, and steps over traces retention removed.
+- **Filter:** the rule's filter (time range, user/session, tags, metadata) is applied to each trace; traces it excludes are stepped over.
+- **Versions:** a trace that receives new trace or observation activity is published again and forwarded again with its current observations. Scores do not move the feed and are never forwarded.
+- **Bounds:** a run forwards at most 5,000 traces and examines at most 100,000 feed entries, reading 100 per page. A larger backlog continues on the next scheduler tick (`next_run_at` is set to now). Each request times out after 30 seconds.
 
-## SSRF guard applied (2026-07-12)
+## Delivery and failures
 
-`forwardOtlpTraces` now calls the same `assertPublicHttpDestination` guard `runWebhooks` already used, closing the gap flagged during M6-03 review — `rule.destinationUrl` is customer-supplied and is now validated to resolve to a public address before any request is sent, resolving actual DNS answers (not just the hostname string) so a public-looking hostname that rebinds to a private address is still blocked. An `allowPrivateDestinations` escape hatch exists for tests, matching `runWebhooks`' identical option. Regression-tested (`apps/worker/test/otlp-forwarder.test.ts`): a rule targeting `http://127.0.0.1:9/v1/traces` is rejected before any HTTP request reaches the mock server.
+Each request is a `POST` to `destination_url` with `content-type: application/json` and, when the rule has one, the decrypted auth header as the `Authorization` value, so the stored value includes its scheme (for example `Bearer <token>`). Any 2xx response counts as accepted; the response body, including an OTLP `partialSuccess`, is not read.
 
-## Not yet done (follow-up, not blocking this DoD item)
+- **Stopping failure:** a timeout, network error, 5xx, or a 4xx that describes the destination rather than the trace (401, 403, 404, 405, 408, 429, ...) stops the run with the position before that trace. The next run retries it first, so an unreachable or misconfigured destination delays forwarding instead of skipping traces.
+- **Permanent rejection:** a 400, 413 or 422 (for example 413 for an oversized trace) skips that trace, and the run continues, so one bad trace cannot block the rule for good. A skipped trace is not retried unless it is published again.
+- **Position:** the position advances past each accepted, skipped or non-matching entry. It is written at the end of every run that passed the SSRF guard, including a run that threw partway, and only if it still holds the value the run started from, so a slow run claimed twice by different worker replicas cannot move it back.
+- **At least once:** a trace can be sent twice, for example by two overlapping runs or when recording the position fails after the destination accepted the trace. OTLP ids are derived deterministically, so a resent trace is the same trace downstream.
+- **Run record:** every run that passed the SSRF guard records `last_run_at`, `last_run_status`, `last_run_forwarded_count` and `last_run_error` (Postgres migration `0004`), returned by the forward-rule API as `lastRunAt`, `lastRunStatus`, `lastRunForwardedCount` and `lastRunError`. The status is `error` when any trace failed or was skipped, or the run threw. The error lists each such trace as `<traceId>: <error>`, with `(skipped)` after the id of a permanently rejected one, and is truncated to 2,000 characters. The scheduler also reports such a run through `onError` and an `error` outcome in `ironside_scheduler_runs_total` (`spec/metrics-v1.md`).
 
-~~No API routes / no scheduler~~ — **done since**: scheduler wiring in M6-05 (spec/scheduler-v1.md), admin CRUD routes in M6-06 (spec/scheduled-destinations-crud-v1.md). Still true: real-time forward-on-ingest (pushing a trace the instant it's stored, rather than the M6-05 poll cadence) would be a larger architectural change touching the ingest pipeline itself — deliberately not built.
+## OTLP mapping
+
+`mapTraceToOtlpExportRequest` (`apps/worker/src/forwarders/otlp-mapper.ts`) builds one `ExportTraceServiceRequest` JSON body per trace:
+
+- One resource with `service.name` `ironside` and one scope, `ironside-forwarder`.
+- One span per observation. A child observation's span carries its parent's span id as `parentSpanId`. The span name is the observation name, or its id when it has none. Times are Unix nanoseconds; an observation with no end time has no `endTimeUnixNano`.
+- Span attributes are the observation's metadata as string attributes, plus the attributes a gen_ai-semconv instrumentation SDK produces: `gen_ai.request.model` (string) when the observation has a model, and `gen_ai.usage.input_tokens` and `gen_ai.usage.output_tokens` (int), each when its usage has the matching `input_tokens` or `output_tokens` key.
+- Span status code is `2` (error) for an observation with level `error` and `1` (OK) otherwise, with the observation's status message when it has one.
+- A trace with no observations is sent as one synthetic root span named after the trace (its id when unnamed), starting at the trace timestamp. An export with zero spans for a real trace would look like data loss downstream.
+- Not sent: trace tags, metadata, user and session ids; observation type, input, output, cost and model parameters; scores.
+
+Ids: OTLP requires `trace_id` to be exactly 16 bytes (32 hex characters) and `span_id` exactly 8 bytes (16 hex characters), and Ironside ids (ULIDs, imported UUIDs) do not fit. `toOtlpTraceId` and `toOtlpSpanId` (`packages/shared/src/otlp-export.ts`) take the first 32 or 16 hex characters of SHA-256 over `trace:<id>` or `span:<id>`. The same Ironside id always maps to the same OTLP id, so a re-forwarded trace is the same trace downstream, not a new one. SHA-256 is used only as a well-distributed byte source; the collision risk is accepted as negligible.
+
+## SSRF guard
+
+`destination_url` is customer-supplied, so each run first calls `assertPublicHttpDestination` (`apps/worker/src/lib/ssrf-guard.ts`), the same guard webhooks use. It requires `http` or `https`, resolves the hostname, and rejects the destination if any resolved address is loopback, private (`10/8`, `172.16/12`, `192.168/16`), link-local (including the cloud metadata address `169.254.169.254`), `0/8`, IPv6 unique-local (`fc00::/7`), unspecified, or an IPv4-mapped IPv6 form of an IPv4 address in those ranges. It checks the resolved addresses, not only the hostname string.
+
+A rejected destination throws before any request is sent and before the run records anything, so the rule's last-run fields keep their previous values; the scheduler reports the error, and the rule is retried on its own interval. The check runs once per run: each request resolves the hostname again, and follows HTTP redirects without checking their targets. Tests opt out with `allowPrivateDestinations: true` to reach a local server; the scheduler never sets it.
+
+## Verified
+
+`apps/worker/test/otlp-forwarder.test.ts` publishes traces to the feed and runs `forwardOtlpTraces` against real Postgres and ClickHouse and a local HTTP server. It covers one request per trace with the auth header and nested spans, a 500 stopping the run and the next run resuming at the same trace, a 413 skipped and recorded while the next trace is forwarded, a 401, 403 or 404 stopping the run without skipping anything, a request timeout stopping the run, filter matching, and the SSRF guard rejecting a loopback destination with no request sent. `apps/worker/test/otlp-mapper.test.ts` covers id length and stability, parent/child links, the `gen_ai.*` attributes, error status, the synthetic root span, and nanosecond timestamps. `apps/worker/test/ssrf-guard.test.ts` covers the rejected address ranges, including IPv4-mapped IPv6.
+
+## History
+
+- M6-02 (PR #17) added OTLP forwarding as a callable function. The scheduler (M6-05, `spec/scheduler-v1.md`) and the forward-rule API (M6-06, `spec/scheduled-destinations-crud-v1.md`) came later.
+- The mapper output was checked once by hand against a Jaeger all-in-one container's OTLP/HTTP receiver (`:4318/v1/traces`): the `ironside` service, both span names, the child's parent reference, and the `gen_ai.*` attribute types (string model, int64 token counts) arrived as expected.
+- M6-04 added the SSRF guard to the forwarder; the M6-03 webhooks review had found it missing.
+- Migration `0003` moved forwarding onto the durable trace feed with a stored position per rule, and migration `0004` added the last-run columns so the API shows why a run stopped and which traces were skipped.
+- Still open: forwarding follows the scheduler's poll cadence (default every 5 minutes, after the quiet period), not the moment a trace settles; forwarding on ingest would change the ingest pipeline and is not built. The SSRF guard does not re-check addresses at request time or redirect targets. Only the `Authorization` header can be configured.
