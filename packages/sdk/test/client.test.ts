@@ -629,6 +629,74 @@ describe("ingest delivery retries", () => {
     expect(requests.map(traceNames)).toEqual([["rejected"], ["after-handler-threw"]]);
   });
 
+  it("keeps sending after an async onError handler rejects", async () => {
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    try {
+      const { fetchImpl, requests } = scriptedFetch([400]);
+      const client = init({
+        apiKey: "k",
+        host: "http://localhost:8788",
+        fetchImpl,
+        onError: async () => {
+          throw new Error("async handler bug");
+        }
+      });
+      clients.push(client);
+
+      client.trace({ name: "rejected" });
+      await client.flush();
+      client.trace({ name: "after-handler-rejected" });
+      await client.flush();
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(requests.map(traceNames)).toEqual([["rejected"], ["after-handler-rejected"]]);
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off("unhandledRejection", unhandled);
+    }
+  });
+
+  it("flush() waits for a batch an automatic flush already sent", async () => {
+    let deliver!: () => void;
+    const delivered = new Promise<void>((resolve) => (deliver = resolve));
+    let settled = false;
+    const fetchImpl: typeof fetch = vi.fn(async () => {
+      await delivered;
+      settled = true;
+      return new Response("{}", { status: 202 });
+    }) as unknown as typeof fetch;
+    const client = init({ apiKey: "k", host: "http://localhost:8788", fetchImpl, maxBatchSize: 1 });
+    clients.push(client);
+
+    client.trace({ name: "sent-by-size" });
+    const flushed = client.flush();
+    setTimeout(deliver, 20);
+    await flushed;
+    expect(settled).toBe(true);
+  });
+
+  it("uses safe values for a batch size or flush interval out of range", async () => {
+    vi.useFakeTimers();
+    const { fetchImpl, requests } = scriptedFetch([]);
+    const client = init({
+      apiKey: "k",
+      host: "http://localhost:8788",
+      fetchImpl,
+      maxBatchSize: 10_000,
+      flushIntervalMs: 0
+    });
+    clients.push(client);
+
+    for (let index = 0; index < 501; index += 1) client.trace({ name: `trace_${index}` });
+    // 0 falls back to the default interval instead of flushing every millisecond.
+    await vi.advanceTimersByTimeAsync(100);
+    // The batch size is capped at the API's 500 events per request.
+    expect(requests.map((request) => request.events.length)).toEqual([500]);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(requests.map((request) => request.events.length)).toEqual([500, 1]);
+  });
+
   it("treats non-finite option values safely instead of retrying forever or aborting at once", async () => {
     const { fetchImpl, requests } = scriptedFetch([500, 500, 500, 500, 500, 500, 500, 500]);
     const onError = vi.fn();

@@ -13,8 +13,8 @@ export interface IronsideClientOptions {
   apiKey: string;
   /** Ironside API host, e.g. "https://ironside.example.com" or "http://localhost:8788". */
   host: string;
-  maxBatchSize?: number;
-  flushIntervalMs?: number;
+  maxBatchSize?: BatcherOptions["maxBatchSize"];
+  flushIntervalMs?: BatcherOptions["flushIntervalMs"];
   fetchImpl?: BatcherOptions["fetchImpl"];
   onError?: BatcherOptions["onError"];
   maxRetries?: BatcherOptions["maxRetries"];

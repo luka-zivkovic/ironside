@@ -3,14 +3,14 @@ import type { IngestRequestEvent } from "./types.js";
 export interface BatcherOptions {
   apiKey: string;
   host: string;
-  /** Flush automatically once this many events are buffered. */
+  /** Flush automatically once this many events are buffered. Default 50; at most 500, the API's limit per request. */
   maxBatchSize?: number;
-  /** Flush automatically after this many ms, even if under maxBatchSize. */
+  /** Flush automatically after this many ms, even if under maxBatchSize. `Infinity` flushes only on size, flush() and close(). Default 5,000 ms. */
   flushIntervalMs?: number;
   /** Injectable for tests; defaults to global fetch. */
   fetchImpl?: typeof fetch;
-  /** Called with a failed batch's events + the error; default: console.error. Never throws back into the caller's hot path. */
-  onError?: (error: unknown, events: IngestRequestEvent[]) => void;
+  /** Called with a failed batch's events + the error; default: console.error. Never throws back into the caller's hot path, whether it throws or returns a rejected promise. */
+  onError?: (error: unknown, events: IngestRequestEvent[]) => void | Promise<void>;
   /** Retries after the first attempt for a batch that failed with a network error, 408, 429, or 5xx. 0 disables retries. Default 5. */
   maxRetries?: number;
   /** Base delay for exponential backoff between retries. A server `Retry-After` header takes precedence. Default 500 ms. */
@@ -24,6 +24,8 @@ export interface BatcherOptions {
 }
 
 const DEFAULT_MAX_BATCH_SIZE = 50;
+/** The API's limit on events per ingest request (MAX_EVENTS_PER_BATCH). */
+const MAX_BATCH_SIZE = 500;
 const DEFAULT_FLUSH_INTERVAL_MS = 5000;
 const DEFAULT_MAX_RETRIES = 5;
 const DEFAULT_RETRY_DELAY_MS = 500;
@@ -44,6 +46,12 @@ type SendOutcome =
 /** A finite number of at least `min`, or the fallback for undefined, NaN, and infinities. */
 function finiteAtLeast(value: number | undefined, min: number, fallback: number): number {
   return value !== undefined && Number.isFinite(value) ? Math.max(min, value) : fallback;
+}
+
+/** A timer interval in ms: `Infinity` means no timer; zero, negative, NaN or undefined take the fallback. */
+function intervalMs(value: number | undefined, fallback: number): number {
+  if (value === Infinity) return Infinity;
+  return value !== undefined && Number.isFinite(value) && value > 0 ? Math.min(value, MAX_TIMER_MS) : fallback;
 }
 
 /** A wait in ms: `Infinity` means no limit; NaN or undefined takes the fallback. */
@@ -84,7 +92,7 @@ export class EventBatcher {
   private readonly maxBatchSize: number;
   private readonly flushIntervalMs: number;
   private readonly fetchImpl: typeof fetch;
-  private readonly onError: (error: unknown, events: IngestRequestEvent[]) => void;
+  private readonly onError: (error: unknown, events: IngestRequestEvent[]) => void | Promise<void>;
   private readonly maxRetries: number;
   private readonly retryDelayMs: number;
   private readonly maxQueuedEvents: number;
@@ -105,8 +113,11 @@ export class EventBatcher {
   constructor(options: BatcherOptions) {
     this.apiKey = options.apiKey;
     this.host = options.host.replace(/\/$/, "");
-    this.maxBatchSize = options.maxBatchSize ?? DEFAULT_MAX_BATCH_SIZE;
-    this.flushIntervalMs = options.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
+    this.maxBatchSize = Math.min(
+      Math.floor(finiteAtLeast(options.maxBatchSize, 1, DEFAULT_MAX_BATCH_SIZE)),
+      MAX_BATCH_SIZE
+    );
+    this.flushIntervalMs = intervalMs(options.flushIntervalMs, DEFAULT_FLUSH_INTERVAL_MS);
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.onError =
       options.onError ??
@@ -117,9 +128,11 @@ export class EventBatcher {
     this.flushTimeoutMs = timeoutMs(options.flushTimeoutMs, DEFAULT_FLUSH_TIMEOUT_MS);
     this.shutdownTimeoutMs = timeoutMs(options.shutdownTimeoutMs, DEFAULT_SHUTDOWN_TIMEOUT_MS);
 
-    this.timer = setInterval(() => void this.flush(), this.flushIntervalMs);
-    // Don't let the flush timer keep the process alive on its own.
-    this.timer.unref?.();
+    if (this.flushIntervalMs !== Infinity) {
+      this.timer = setInterval(() => this.claimBuffer(), this.flushIntervalMs);
+      // Don't let the flush timer keep the process alive on its own.
+      this.timer.unref?.();
+    }
   }
 
   enqueue(event: IngestRequestEvent): void {
@@ -132,17 +145,19 @@ export class EventBatcher {
     }
     this.buffer.push(event);
     if (this.buffer.length >= this.maxBatchSize) {
-      void this.flush();
+      this.claimBuffer();
     }
   }
 
   /**
-   * Sends whatever is currently buffered and waits until it is delivered or
-   * `flushTimeoutMs` passes; events still undelivered then keep retrying in
-   * the background. Safe to call concurrently — flushes serialize via inFlight.
+   * Sends whatever is currently buffered and waits until it, and every batch
+   * already being sent, is delivered or `flushTimeoutMs` passes; events still
+   * undelivered then keep retrying in the background. An empty buffer still
+   * waits: an automatic flush may have just claimed the events being flushed.
+   * Safe to call concurrently — flushes serialize via inFlight.
    */
   async flush(): Promise<void> {
-    if (!this.claimBuffer()) return;
+    this.claimBuffer();
     await settleWithin(this.inFlight, this.flushTimeoutMs);
   }
 
@@ -157,10 +172,12 @@ export class EventBatcher {
     return true;
   }
 
-  /** Calls onError without letting a throwing handler break the send chain. */
+  /** Calls onError without letting a throwing or rejecting handler break the send chain. */
   private report(error: unknown, events: IngestRequestEvent[]): void {
     try {
-      this.onError(error, events);
+      const result: unknown = this.onError(error, events);
+      // An async handler's rejection would otherwise be unhandled, which stops the process.
+      if (result instanceof Promise) result.catch(() => {});
     } catch {
       // A trace SDK must never throw into the application, including from its own error hook.
     }
