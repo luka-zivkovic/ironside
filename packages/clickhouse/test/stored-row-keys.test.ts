@@ -32,9 +32,12 @@ describe("chunkByParamBytes", () => {
   });
 
   it("budgets each parameter separately, counting a repeated value once and an empty one not at all", () => {
-    const items = Array.from({ length: 600 }, (_, index) => ({ a: `${index}`.padStart(300, "x"), b: index % 2 === 0 ? "" : "same" }));
+    // Many observations of one trace: the shared 2,000-character trace id is sent once.
+    const shared = "t".repeat(2_000);
+    const items = Array.from({ length: 600 }, (_, index) => ({ a: `${index}`.padStart(300, "x"), b: index % 2 === 0 ? "" : shared }));
     const chunks = chunkByParamBytes(items, [(item) => item.a, (item) => item.b]);
     // Only the 300-character values fill a parameter: about 320 of them fit in 96 KiB.
+    // Counting the shared id at every repeat would need a chunk per 48 items.
     expect(chunks.length).toBe(2);
   });
 

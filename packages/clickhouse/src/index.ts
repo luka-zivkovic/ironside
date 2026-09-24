@@ -51,6 +51,7 @@ export {
   listObservationsForTrace,
   listTracesByIds,
   listStoredRowKeys,
+  getServerTimezone,
   listObservationsByIds,
   listObservationsForTraces,
   listScoresForTraces,

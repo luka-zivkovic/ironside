@@ -800,6 +800,13 @@ async function listObservationsByIdChunk(
   }));
 }
 
+/** The server's default timezone, which toDate uses for the sort key of columns declared without one. */
+export async function getServerTimezone(client: ClickHouseClient): Promise<string> {
+  const result = await client.query({ query: "select timezone() as timezone", format: "JSONEachRow" });
+  const [row] = await result.json<{ timezone: string }>();
+  return row?.timezone ?? "";
+}
+
 /** Where a stored record sits in its table's sort key, and the version it was written with. */
 export interface StoredRowKey {
   kind: "trace" | "observation" | "score";

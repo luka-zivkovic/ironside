@@ -27,7 +27,9 @@ export function encodedParamLength(value: string): number {
 export function chunkByParamBytes<T>(items: T[], params: ((item: T) => string)[]): T[][] {
   const chunks: T[][] = [];
   let chunk: T[] = [];
-  let sizes = params.map(() => 0);
+  // The brackets around each parameter's list, URL-encoded.
+  const brackets = encodeURIComponent("[]").length;
+  let sizes = params.map(() => brackets);
   let seen = params.map(() => new Set<string>());
   for (const item of items) {
     const values = params.map((param) => param(item));
@@ -37,7 +39,7 @@ export function chunkByParamBytes<T>(items: T[], params: ((item: T) => string)[]
     if (chunk.length > 0 && added.some((length, index) => sizes[index]! + length > MAX_PARAM_LENGTH)) {
       chunks.push(chunk);
       chunk = [];
-      sizes = params.map(() => 0);
+      sizes = params.map(() => brackets);
       seen = params.map(() => new Set<string>());
       values.forEach((value, index) => (added[index] = value === "" ? 0 : encodedParamLength(value)));
     }

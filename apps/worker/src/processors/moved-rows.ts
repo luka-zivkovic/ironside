@@ -1,4 +1,9 @@
-import { listStoredRowKeys, type ClickHouseClient, type StoredRowKey } from "@ironside/clickhouse";
+import {
+  getServerTimezone,
+  listStoredRowKeys,
+  type ClickHouseClient,
+  type StoredRowKey
+} from "@ironside/clickhouse";
 import type { Observation, Score, Trace } from "@ironside/shared";
 import { instant } from "./langfuse-merge.js";
 
@@ -23,7 +28,11 @@ import { instant } from "./langfuse-merge.js";
 // between leaves a duplicate, never a missing record; the retry, which finds
 // the same stored rows, removes it. Deletions never share a key with a row the
 // batch writes: days are compared only within the range of ClickHouse's Date
-// type, which the sort key uses (see sortKeyDay).
+// type, which the sort key uses (see sortKeyDay), and only on a server whose
+// timezone is UTC. Elsewhere toDate's day can differ from the UTC day (a
+// daylight-saving jump at midnight moves a time to the previous day), so
+// moved rows are not deleted there: a duplicate can remain, a record cannot
+// be lost.
 //
 // Two batches writing the same record on different days at the same moment
 // can both find nothing stored and both be written; the next write of that
@@ -61,9 +70,12 @@ export async function resolveMovedRows(
       observations: Observation[];
       rowEventTs: { traces: ReadonlyMap<string, string>; observations: ReadonlyMap<string, string> };
     };
+    /** The ClickHouse server's timezone; looked up once per client when omitted. */
+    serverTimezone?: string;
   }
 ): Promise<ResolvedRows> {
   const { projectId, merged } = input;
+  const compareDays = UTC_TIMEZONES.has(input.serverTimezone ?? (await serverTimezone(clickhouse)));
   const version = instant(input.receivedAt);
   const traces = lastPerRecord(input.traces, (trace) => recordKey("trace", "", trace.id));
   const observations = lastPerRecord(input.observations, (row) => recordKey("observation", row.traceId, row.id));
@@ -82,7 +94,7 @@ export async function resolveMovedRows(
 
   /** Stored rows under another day than `sortTime`, at or below `rowVersion`. */
   const otherDays = (rows: StoredRowKey[], sortTime: string, rowVersion: string): StoredRowKey[] => {
-    const day = sortKeyDay(sortTime);
+    const day = compareDays ? sortKeyDay(sortTime) : undefined;
     if (day === undefined) return [];
     return rows.filter((row) => {
       const storedDay = sortKeyDay(row.sort_time);
@@ -138,6 +150,21 @@ export async function resolveMovedRows(
   }
 
   return { traces: writtenTraces, observations: writtenObservations, scores: writtenScores, deletions, mergedDeletions };
+}
+
+const UTC_TIMEZONES = new Set(["UTC", "Etc/UTC", "UCT", "Etc/UCT", "Universal", "Etc/Universal", "Zulu", "Etc/Zulu"]);
+
+const serverTimezones = new WeakMap<ClickHouseClient, Promise<string>>();
+
+function serverTimezone(clickhouse: ClickHouseClient): Promise<string> {
+  let timezone = serverTimezones.get(clickhouse);
+  if (!timezone) {
+    timezone = getServerTimezone(clickhouse);
+    // A failed lookup is retried on the next batch rather than cached.
+    timezone.catch(() => serverTimezones.delete(clickhouse));
+    serverTimezones.set(clickhouse, timezone);
+  }
+  return timezone;
 }
 
 const DATE_MIN = Date.parse("1970-01-01T00:00:00.000Z");

@@ -40,6 +40,7 @@ import {
   recoverTerminalEvaluatorTraceRefs,
   settlePublishedEvaluatorTraceRefs
 } from "../src/processors/ingest.js";
+import { resolveMovedRows } from "../src/processors/moved-rows.js";
 
 // End-to-end pipeline test: build the same envelope apps/api would produce,
 // store it, enqueue it, then run the processor directly against the
@@ -1216,6 +1217,35 @@ describe("a record written again with a timestamp on another day", () => {
 
     expect(await liveRows("traces", traceId, "timestamp")).toEqual([noon(1).slice(0, 10)]);
     expect((await getTrace(clickhouse, projectId, traceId))?.name).toBe("new");
+  });
+
+  it("deletes no old-day row on a ClickHouse server outside UTC, where toDate's day can differ", async () => {
+    const traceId = `trace_${ulid()}`;
+    await run(nativeBatch(noon(2), [{ type: "trace-upsert", body: { id: traceId, timestamp: noon(2) } }]));
+    const moved = { id: traceId, projectId, timestamp: noon(1), tags: [], metadata: {} };
+    const merged = { traces: [], observations: [], rowEventTs: { traces: new Map(), observations: new Map() } };
+
+    const santiago = await resolveMovedRows(clickhouse, {
+      projectId,
+      receivedAt: noon(1),
+      traces: [moved],
+      observations: [],
+      scores: [],
+      merged,
+      serverTimezone: "America/Santiago"
+    });
+    expect(santiago.traces).toEqual([moved]);
+    expect(santiago.deletions.traces).toEqual([]);
+
+    const utc = await resolveMovedRows(clickhouse, {
+      projectId,
+      receivedAt: noon(1),
+      traces: [moved],
+      observations: [],
+      scores: [],
+      merged
+    });
+    expect(utc.deletions.traces).toEqual([{ projectId, id: traceId, timestamp: noon(2) }]);
   });
 
   it("removes duplicates written before this fix when the record is written again", async () => {
