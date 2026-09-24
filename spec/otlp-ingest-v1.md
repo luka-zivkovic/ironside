@@ -14,7 +14,7 @@ Accept OpenTelemetry traces over OTLP/HTTP and map them, including the `gen_ai.*
 - Encodings: `Content-Type: application/x-protobuf`, which most exporters send by default, or `application/json`. Any other content type returns 415.
 - Compression: `Content-Encoding: gzip` is accepted for both encodings; `identity` or no header means uncompressed. Any other value returns 415, including lists such as `gzip, identity`. A body declared gzip that is not valid gzip returns 400.
 - Size: the wire body is limited to 10 MiB (`MAX_REQUEST_BODY_BYTES`, 413). A gzip body is limited to the same 10 MiB after decompression (`gunzipSync` `maxOutputLength`, 413), because gzip reaches about 1000:1 on repetitive input and a small compressed body could otherwise expand to hundreds of megabytes in one allocation.
-- Validation: the decoded body must match `otlpExportTraceServiceRequestSchema`. A failure returns 400 with `{ error, issues }` holding the Zod issues, or with an error message when the protobuf does not decode. Per the OTLP spec, 400 is not retryable. Attribute values may nest at most 32 levels (`MAX_ATTRIBUTE_VALUE_DEPTH`); deeper values are rejected so recursive validation cannot overflow the stack.
+- Validation: the decoded body must match `otlpExportTraceServiceRequestSchema`. A failure returns 400 with `{ error, issues }` holding the Zod issues, or with an error message when the protobuf does not decode. Per the OTLP spec, 400 is not retryable. Attribute values may nest at most 32 levels (`MAX_ATTRIBUTE_VALUE_DEPTH`); deeper values are rejected so recursive validation cannot overflow the stack. `startTimeUnixNano` and `endTimeUnixNano` must be unsigned integer nanoseconds as decimal text (at most 20 digits), since the worker converts them to dates.
 - Success: 200 in the request's encoding. A protobuf request gets a serialized empty `ExportTraceServiceResponse` (zero bytes, `application/x-protobuf`); a JSON request gets `{}`. `partial_success` is never set: an export is accepted whole or rejected with 400. A failure in the worker surfaces later as a dead letter (`spec/dead-letters-v1.md`).
 - Error bodies are JSON whatever the request encoding. This deviates from the OTLP spec, which prefers a `google.rpc.Status` in the request's encoding; exporters only log error bodies, so a readable JSON error serves them better.
 
@@ -52,7 +52,7 @@ Typed `gen_ai.*` mappings. The upstream conventions are still Development stabil
 | Attribute | Domain field |
 | --- | --- |
 | `gen_ai.request.model`, else `gen_ai.response.model` | `model` |
-| `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` | `usageDetails.input_tokens`, `usageDetails.output_tokens` (`spec/usage-keys-v1.md`) |
+| `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` | `usageDetails.input_tokens`, `usageDetails.output_tokens` (`spec/usage-keys-v1.md`); a double is rounded, and a negative or non-finite value is dropped |
 | `gen_ai.request.temperature`, `.max_tokens`, `.top_p`, `.top_k`, `.frequency_penalty`, `.presence_penalty`, `.seed` | `modelParameters`, keyed without the `gen_ai.request.` prefix; numeric values only |
 | `gen_ai.provider.name`, else legacy `gen_ai.system` | `metadata["gen_ai.provider.name"]` |
 | `gen_ai.input.messages`, `gen_ai.output.messages` | `input`, `output` (see Message projection) |

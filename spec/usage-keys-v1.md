@@ -38,7 +38,7 @@ The canonical keys are `input_tokens`, `output_tokens`, and `total_tokens`. Any 
 Values must end up as nonnegative integers, because the ClickHouse column is `Map(LowCardinality(String), UInt64)` and one invalid value fails the insert of the whole batch, which can hold rows from several sources, rather than a single event.
 
 - The native mapper validates `usageDetails` against the domain schema. A fractional or negative value fails only that event, which is recorded as a dead letter (`spec/dead-letters-v1.md`).
-- The LangFuse-compatible mapper and both importers round fractional values to the nearest integer and drop negative and non-finite values.
+- The OTLP mapper, the LangFuse-compatible mapper and both importers round fractional values to the nearest integer and drop negative and non-finite values.
 
 ## Readers
 
