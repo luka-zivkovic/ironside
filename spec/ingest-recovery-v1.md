@@ -58,8 +58,9 @@ manual recovery.
 - Pending-intent write failure: the request fails; the raw object can remain as
   an unacknowledged orphan and is subject to the separate raw-retention policy.
 - Redis enqueue failure: the request fails, but the durable pending intent
-  remains and the reconciler can still process it. Clients should continue to
-  use stable event idempotency keys when retrying failed requests.
+  remains and the reconciler can still process it. A client retrying a failed
+  request should resend the same trace, observation and score ids: rows upsert
+  by id, so the retry converges instead of duplicating.
 - Redis loss after a success response: the pending intent remains and is
   automatically re-enqueued.
 - Worker/materialization failure: BullMQ retry behavior is unchanged and the

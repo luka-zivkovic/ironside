@@ -14,10 +14,15 @@ Every ingest path — native JSON, OTLP, LangFuse-compat, importers — converge
   type: "trace-upsert" | "observation-upsert" | "score-upsert",
   source: "native" | "otlp" | "langfuse" | "import-langfuse" | "import-langsmith",
   schemaVersion: 1,
-  idempotencyKey: string,   // client-provided or SHA-256 content hash of body
+  idempotencyKey?: string,  // sent by the client, stored verbatim; absent otherwise
   body: unknown             // source-shaped payload; worker mapper owns interpretation
 }
 ```
+
+`idempotencyKey` is a correlation value, not a deduplication key: nothing reads
+it after storage. Resending an event is safe because rows upsert by their own
+ids (see "Upsert semantics" below). Through 0.3.0 the API filled an absent key
+with a SHA-256 hash of the body; it no longer spends that work on every event.
 
 ## IngestBatch (unit of storage + queueing)
 

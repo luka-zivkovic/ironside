@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import type { IngestBatch, IngestEvent, QueueMessage } from "@ironside/shared";
 import {
   INGEST_SCHEMA_VERSION,
@@ -17,10 +16,6 @@ import type { AuthEnv } from "../middleware/auth.js";
 export interface LangfuseDeps {
   storage: ObjectStorage;
   queue: Queue<QueueMessage>;
-}
-
-function contentHash(value: unknown): string {
-  return createHash("sha256").update(JSON.stringify(value) ?? "null").digest("hex");
 }
 
 /**
@@ -62,7 +57,6 @@ export function langfuseRoutes(deps: LangfuseDeps): Hono<AuthEnv> {
       type: "langfuse-ingestion",
       source: "langfuse",
       schemaVersion: INGEST_SCHEMA_VERSION,
-      idempotencyKey: contentHash(parsed.data),
       body: parsed.data
     };
 
@@ -140,7 +134,6 @@ export function langfuseRoutes(deps: LangfuseDeps): Hono<AuthEnv> {
       type: "score-upsert",
       source: "native",
       schemaVersion: INGEST_SCHEMA_VERSION,
-      idempotencyKey: contentHash(body),
       body
     };
 

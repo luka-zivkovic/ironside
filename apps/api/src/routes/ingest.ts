@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import type { ObjectStorage } from "@ironside/storage";
 import type { QueueMessage, IngestBatch, IngestEvent } from "@ironside/shared";
 import {
@@ -14,10 +13,6 @@ import type { AuthEnv } from "../middleware/auth.js";
 export interface IngestDeps {
   storage: ObjectStorage;
   queue: Queue<QueueMessage>;
-}
-
-function contentHash(value: unknown): string {
-  return createHash("sha256").update(JSON.stringify(value) ?? "null").digest("hex");
 }
 
 /**
@@ -46,7 +41,7 @@ export function ingestRoutes(deps: IngestDeps): Hono<AuthEnv> {
       type: event.type,
       source: "native",
       schemaVersion: INGEST_SCHEMA_VERSION,
-      idempotencyKey: event.idempotencyKey ?? contentHash(event.body),
+      ...(event.idempotencyKey !== undefined && { idempotencyKey: event.idempotencyKey }),
       body: event.body
     }));
 
