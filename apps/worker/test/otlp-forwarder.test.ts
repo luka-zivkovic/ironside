@@ -234,6 +234,39 @@ describe("forwardOtlpTraces", () => {
     expect(nothingNew).toMatchObject({ matched: 0, forwarded: 0 });
   });
 
+  it("stops, without skipping anything, when the destination refuses the credentials or the path", async () => {
+    const marker = `otlp_fwd_auth_${ulid()}`;
+    const traceIds = [`trace_${marker}_1`, `trace_${marker}_2`];
+    for (const id of traceIds) {
+      await insertPublishedTrace({ pool, clickhouse }, {
+        trace: { id, projectId, timestamp: new Date().toISOString(), tags: [marker], metadata: {} }
+      });
+    }
+    for (const status of [401, 403, 404]) {
+      const stored = await createDisabledRule({
+        id: `rule_${ulid()}`,
+        name: `destination answering ${status}`,
+        destinationUrl: serverUrl,
+        filter: { tags: [marker] }
+      });
+      const refuse: typeof fetch = (async () => new Response("{}", { status })) as unknown as typeof fetch;
+
+      const result = await forwardOtlpTraces({
+        pool,
+        clickhouse,
+        rule: stored,
+        fetchImpl: refuse,
+        traceQuietPeriodSeconds: 0,
+        allowPrivateDestinations: true
+      });
+
+      expect(result).toMatchObject({ matched: 1, forwarded: 0 });
+      expect(result.failed).toEqual([{ traceId: traceIds[0], error: `destination responded HTTP ${status}`, skipped: false }]);
+      // The position stops short of the first matching trace, so nothing is lost once the rule is fixed.
+      expect((await getOtlpForwardRule(pool, projectId, stored.id))?.feedCursor?.traceId).not.toBe(traceIds[0]);
+    }
+  });
+
   it("skips a trace the destination permanently rejects, keeps forwarding, and records the rejection", async () => {
     const marker = `otlp_fwd_reject_${ulid()}`;
     const traceIds = [`trace_${marker}_1`, `trace_${marker}_2`];

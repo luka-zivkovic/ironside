@@ -35,26 +35,34 @@ export interface ForwardOtlpResult {
   matched: number;
   forwarded: number;
   /**
-   * Traces the destination did not accept. A permanent rejection (4xx other
-   * than 408/429) is `skipped`: the run steps over that trace and continues.
+   * Traces the destination did not accept. A rejection of the trace itself
+   * (400, 413, 422) is `skipped`: the run steps over that trace and continues.
    * Any other failure stops the run before the trace, which is retried next run.
    */
   failed: { traceId: string; error: string; skipped: boolean }[];
 }
 
-/** A 4xx other than 408/429 will fail the same way on every retry. */
+/**
+ * Statuses that reject this trace's content, so a retry fails the same way.
+ * Other 4xx statuses (401, 403, 404, 405, ...) describe the destination or
+ * its configuration: skipping on those would drop every trace until the rule
+ * is fixed, so they stop the run like a 5xx.
+ */
+const TRACE_REJECTION_STATUSES = new Set([400, 413, 422]);
+
 function isPermanentRejection(status: number): boolean {
-  return status >= 400 && status < 500 && status !== 408 && status !== 429;
+  return TRACE_REJECTION_STATUSES.has(status);
 }
 
 /**
  * Forwards settled trace versions published after the rule's feed position
  * to its destination, one OTLP/HTTP+JSON export request per trace, in feed
  * order (spec/otlp-forwarding-v1.md). The position advances past each trace
- * the destination accepts. A timeout, network error, 408, 429, or 5xx stops
- * the run with the position before that trace, so an unreachable destination
- * delays delivery instead of skipping traces. A permanent rejection (any
- * other 4xx) skips that one trace so it cannot block the rule for good. Every
+ * the destination accepts. A timeout, network error, or any status other than
+ * a rejection of the trace itself stops the run with the position before that
+ * trace, so an unreachable or misconfigured destination delays delivery
+ * instead of skipping traces. A rejection of the trace (400, 413, 422) skips
+ * that one trace so it cannot block the rule for good. Every
  * run records its status on the rule. Delivery is at-least-once, and because
  * OTLP ids are derived deterministically a resent trace is the same trace
  * downstream.
