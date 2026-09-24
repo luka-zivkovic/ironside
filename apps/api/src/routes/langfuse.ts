@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { IngestBatch, IngestEvent, QueueMessage } from "@ironside/shared";
 import {
   INGEST_SCHEMA_VERSION,
@@ -105,7 +106,18 @@ export function langfuseRoutes(deps: LangfuseDeps): Hono<AuthEnv> {
     const projectId = c.get("projectId");
     const batchId = ulid();
     const receivedAt = new Date();
-    const scoreId = score.id ?? ulid();
+    // Without a body id, an Idempotency-Key names the score, so a client that
+    // resends the same request replaces it instead of adding a copy. Without
+    // either, every request is a new score: two identical scores can be real.
+    const idempotencyKey = c.req.header("idempotency-key")?.trim();
+    if (idempotencyKey !== undefined && (idempotencyKey === "" || idempotencyKey.length > 255)) {
+      return c.json({ error: "Idempotency-Key must be 1 to 255 characters" }, 400);
+    }
+    const scoreId =
+      score.id ??
+      (idempotencyKey !== undefined
+        ? `idem_${createHash("sha256").update(idempotencyKey).digest("hex").slice(0, 32)}`
+        : ulid());
 
     const isNumeric = typeof score.value === "number";
     // LangFuse's BOOLEAN scores carry a numeric 0/1 value; honor a declared

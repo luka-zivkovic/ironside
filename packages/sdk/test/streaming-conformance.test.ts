@@ -12,9 +12,9 @@ import type { IngestRequestEvent } from "../src/types.js";
 // iterables; these run the SAME flows through the REAL provider SDKs
 // (openai@6, @anthropic-ai/sdk@0.111) parsing real SSE off a local HTTP
 // server. What this proves that the unit tests can't: the in-place
-// [Symbol.asyncIterator] patch works on the SDKs' actual Stream classes
-// (not just plain generators), and the chunk/event shapes we accumulate
-// are the shapes those SDKs actually yield.
+// instrumentation works on the SDKs' actual Stream classes (not just plain
+// generators), through for-await, tee() and toReadableStream(), and the
+// chunk/event shapes we accumulate are the shapes those SDKs actually yield.
 
 function sse(...payloads: Array<string | object>): string {
   return payloads
@@ -75,13 +75,14 @@ function mockIngest() {
     return new Response("{}", { status: 202 });
   }) as unknown as typeof fetch;
   const ironside = init({ apiKey: "k", host: "http://localhost:8788", fetchImpl, flushIntervalMs: 60_000 });
-  const ended = () =>
+  const endings = () =>
     requests
       .flatMap((r) => r.events)
       .filter((e) => e.type === "observation-upsert")
       .map((e) => e.body as Record<string, unknown>)
-      .find((b) => b.endTime !== undefined);
-  return { ironside, ended };
+      .filter((b) => b.endTime !== undefined);
+  const ended = () => endings()[0];
+  return { ironside, ended, endings };
 }
 
 describe("real-SDK streaming conformance", () => {
@@ -133,6 +134,50 @@ describe("real-SDK streaming conformance", () => {
     expect(textA).toBe("streamed");
     expect(textB).toBe("streamed");
     await ironside.flush();
+  });
+
+  it("openai@6 Stream: a tee'd stream is recorded once, with the text both branches read", async () => {
+    const { ironside, ended, endings } = mockIngest();
+    const client = wrapOpenAI(new OpenAI({ apiKey: "test-key", baseURL: `${baseUrl}/v1` }), ironside);
+    const stream = await client.chat.completions.create({
+      model: "gpt-4o",
+      stream: true,
+      stream_options: { include_usage: true },
+      messages: [{ role: "user", content: "hi" }]
+    });
+    const [a, b] = stream.tee();
+    for await (const chunk of a) void chunk;
+    for await (const chunk of b) void chunk;
+
+    await ironside.flush();
+    expect(endings()).toHaveLength(1);
+    expect(ended()).toMatchObject({
+      output: { role: "assistant", content: "streamed" },
+      usageDetails: { input_tokens: 5, output_tokens: 2 }
+    });
+  });
+
+  it("@anthropic-ai/sdk Stream: tee() and toReadableStream() are recorded, each once", async () => {
+    const client = () => new Anthropic({ apiKey: "test-key", baseURL: baseUrl });
+    const request = { model: "claude-sonnet-5", max_tokens: 64, stream: true as const, messages: [{ role: "user" as const, content: "hi" }] };
+
+    const teed = mockIngest();
+    const [a, b] = (await wrapAnthropic(client(), teed.ironside).messages.create(request)).tee();
+    for await (const event of a) void event;
+    for await (const event of b) void event;
+    await teed.ironside.flush();
+    expect(teed.endings()).toHaveLength(1);
+    expect(teed.ended()?.output).toMatchObject({ content: [{ type: "text", text: "streamed" }] });
+
+    const readable = mockIngest();
+    const body = (await wrapAnthropic(client(), readable.ironside).messages.create(request)).toReadableStream();
+    const reader = body.getReader();
+    while (!(await reader.read()).done) {
+      // drain
+    }
+    await readable.ironside.flush();
+    expect(readable.endings()).toHaveLength(1);
+    expect(readable.ended()?.output).toMatchObject({ content: [{ type: "text", text: "streamed" }] });
   });
 
   it("@anthropic-ai/sdk Stream: for-await through the wrapped client reassembles the message with full usage", async () => {

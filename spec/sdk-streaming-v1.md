@@ -8,7 +8,7 @@ Status: implemented. Owner: `packages/sdk/src/wrappers/streaming.ts`, `packages/
 
 ## Instrumentation
 
-`create()` returns the provider SDK's own `Stream` object with its `[Symbol.asyncIterator]` patched in place (`instrumentAsyncIterable`). Both SDKs' `Stream` classes have API beyond iteration, such as `.tee()`, `.controller` and `.toReadableStream()`, which a wrapper generator would break.
+`create()` returns the provider SDK's own `Stream` object, instrumented in place (`instrumentAsyncIterable`). Both SDKs' `Stream` classes have API beyond iteration, such as `.tee()`, `.controller` and `.toReadableStream()`, which a wrapper generator would break. Both keep their iterator factory as an instance `iterator` method, which `[Symbol.asyncIterator]()` and `tee()` call and `toReadableStream()` reaches through `[Symbol.asyncIterator]`, so the wrapper instruments `iterator`: every way of reading the stream is recorded, and a tee'd stream once, since `tee()` reads the one underlying iterator for both branches. Any other async iterable gets `[Symbol.asyncIterator]` patched instead.
 
 - The wrapper never reads the stream itself. It accumulates chunks as the caller iterates, so buffering and backpressure are unchanged.
 - The generation starts when `create()` is called, with the same name, model, input and sampling parameters as a non-streaming call (`spec/direct-ingest-primacy-v1.md`). It ends exactly once, on the first of:
@@ -50,17 +50,17 @@ The message is reassembled from the `RawMessageStreamEvent` protocol:
 
 ## Known limits
 
-- `.tee()`: both SDKs' `tee()` reads the stream's underlying iterator directly instead of `[Symbol.asyncIterator]`, so chunks read through the branches are not accumulated and the generation never ends. The branches themselves work normally.
+- `.tee()`: the generation ends when the underlying iterator does. If both branches stop early, it never reaches its end, and the generation stays open like an unconsumed stream.
 - `.toReadableStream()` in both SDKs iterates through `[Symbol.asyncIterator]`, so a stream consumed that way is recorded like a `for await` loop.
 - `stream_options.include_usage` is never injected (see OpenAI).
 
 ## Verified
 
-`packages/sdk/test/streaming.test.ts` covers OpenAI text and usage accumulation, fragmented tool-call assembly, `n > 1` streams recording every choice, early break (partial output, `level: "default"`), a mid-stream error (`level: "error"` and rethrow), and an unaffected non-streaming call; Anthropic reassembly of text and tool-use blocks with usage from `message_start` and `message_delta`, a break in the middle of a tool call, thinking and signature deltas, and a mid-stream error; and `instrumentAsyncIterable` finishing exactly once and handling a non-iterable value. `packages/sdk/test/streaming-conformance.test.ts` runs the real `openai` 6 and `@anthropic-ai/sdk` 0.111 clients (dev dependencies) against SSE from a local HTTP server through the wrapped clients, proving the in-place patch works on their `Stream` classes and the recorded shapes match what they yield; its `.tee()` test checks that both branches still yield the full stream, not what is recorded. `packages/sdk/test/wrappers.test.ts` checks that a streaming call returns the same stream object.
+`packages/sdk/test/streaming.test.ts` covers OpenAI text and usage accumulation, fragmented tool-call assembly, `n > 1` streams recording every choice, early break (partial output, `level: "default"`), a mid-stream error (`level: "error"` and rethrow), and an unaffected non-streaming call; Anthropic reassembly of text and tool-use blocks with usage from `message_start` and `message_delta`, a break in the middle of a tool call, thinking and signature deltas, and a mid-stream error; and `instrumentAsyncIterable` finishing exactly once and handling a non-iterable value. `packages/sdk/test/streaming-conformance.test.ts` runs the real `openai` 6 and `@anthropic-ai/sdk` 0.111 clients (dev dependencies) against SSE from a local HTTP server through the wrapped clients, proving the in-place patch works on their `Stream` classes and the recorded shapes match what they yield; its `.tee()` tests check that both branches still yield the full stream and that a tee'd stream is recorded once, for both SDKs, with an Anthropic stream read through `toReadableStream()` recorded once as well. `packages/sdk/test/wrappers.test.ts` checks that a streaming call returns the same stream object.
 
 ## History
 
 - M9-07 added streaming support. Before it, the wrappers detected `stream: true`, skipped recording, and logged a one-time warning; the M4-05 audit listed this as the largest gap in the primary SDK path (`spec/direct-ingest-primacy-v1.md`).
 - Review of PR #39 found two data-loss bugs, both fixed with regression tests: OpenAI `n > 1` streams were truncated to `choices[0]`, and Anthropic `thinking_delta`/`signature_delta` content was dropped for extended-thinking models.
 - This spec earlier stated that `.tee()` branches feed one accumulator twice and that `.toReadableStream()` bypasses the patched iterator. Against `openai` 6.46.0 and `@anthropic-ai/sdk` 0.111.0 the reverse holds, as described under Known limits.
-- Still open: a stream consumed only through `.tee()` branches is never recorded as finished.
+- A stream consumed only through `.tee()` branches used to be left unrecorded, because the wrapper patched `[Symbol.asyncIterator]`, which `tee()` does not call. The wrapper now instruments the streams' `iterator` method.
