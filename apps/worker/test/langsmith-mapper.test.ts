@@ -85,7 +85,7 @@ describe("mapLangsmithObservation", () => {
     expect(obs.costDetails).toEqual({ total: 0.01 });
   });
 
-  it("maps token counts to usageDetails keyed input/output/total, rounding fractional values", () => {
+  it("maps token counts to usageDetails keyed input_tokens/output_tokens/total_tokens, rounding fractional values", () => {
     const obs = mapLangsmithObservation(
       "proj_x",
       "trace_1",

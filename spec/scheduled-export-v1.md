@@ -1,6 +1,6 @@
 # Scheduled Export v1
 
-Status: implemented. Owner: `packages/db/src/export-configs.ts`, `apps/worker/src/exporters/`, `apps/api/src/lib/encryption.ts`.
+Status: implemented. Owner: `packages/db/src/export-configs.ts`, `apps/worker/src/exporters/`, `packages/shared/src/encryption.ts`.
 
 ## Purpose
 
@@ -28,7 +28,7 @@ Object names are `<prefix>/<name>` with a run name of `export-<timestamp>`.
 
 ## Configuration
 
-The `export_configs` table holds per-project named destinations: bucket/endpoint/region/access key, an optional `TraceFilter`-shaped filter, and the output `format` (`parquet` | `jsonl`). The destination secret key is AES-256-GCM encrypted at the application layer (`apps/api/src/lib/encryption.ts`) before it reaches Postgres. CRUD routes are in `spec/scheduled-destinations-crud-v1.md`; scheduling is in `spec/scheduler-v1.md`. Each run records `last_run_status`, `last_run_row_count` (traces exported, including traces whose scores alone were re-sent), and `last_run_error`.
+The `export_configs` table holds per-project named destinations: bucket/endpoint/region/access key, an optional `TraceFilter`-shaped filter, and the output `format` (`parquet` | `jsonl`). The destination secret key is AES-256-GCM encrypted at the application layer (`packages/shared/src/encryption.ts`) before it reaches Postgres. CRUD routes are in `spec/scheduled-destinations-crud-v1.md`; scheduling is in `spec/scheduler-v1.md`. Each run records `last_run_status`, `last_run_row_count` (traces exported, including traces whose scores alone were re-sent), and `last_run_error`.
 
 ## Verified end to end
 

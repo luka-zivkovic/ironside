@@ -27,8 +27,8 @@ export interface MediaDeps {
 // re-uploading blobs.
 //
 // Size is bounded by the app-level bodyLimit (10MB) — same ceiling as any
-// ingest body. Retention: media is NOT yet covered by the retention sweep
-// (tracked in ROADMAP; the raw event log has the same gap).
+// ingest body. Retention: media is not deleted by any retention pass;
+// lifecycle planning reports it as inventory only (spec/media-v1.md).
 
 export const MEDIA_REF_PREFIX = "ironside://media/";
 

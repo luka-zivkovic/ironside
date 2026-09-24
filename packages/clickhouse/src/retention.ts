@@ -57,7 +57,7 @@ const PARTITION_DROP_GRACE_PERIOD_MS = 24 * 60 * 60 * 1000;
  * calendar-month (`toYYYYMM`), NOT per-project — a single partition
  * holds every project's rows for that month. This is why
  * partition-drop-based retention can only implement a GLOBAL floor, not
- * a per-project one; see spec/retention-v1.md for the per-project
+ * a per-project one; see spec/rate-limiting-quotas-retention-v1.md for the per-project
  * mechanism (row-level DELETE) used for projects wanting SHORTER
  * retention than the global floor.
  *

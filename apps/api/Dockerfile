@@ -1,9 +1,8 @@
 # syntax=docker/dockerfile:1
 
 # Builds the whole monorepo once (every package @ironside/api depends on
-# via project references), then keeps only the built output + production
-# node_modules in the final image — the full source tree and devDeps
-# never ship.
+# via project references), then installs production dependencies only in
+# the final image; devDependencies never ship.
 
 FROM node:24-slim AS build
 WORKDIR /repo

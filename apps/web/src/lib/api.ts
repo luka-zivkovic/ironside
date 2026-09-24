@@ -256,8 +256,8 @@ export async function revokeMachineCredential(projectId: string, id: string): Pr
 
 // Media assets (M9-09): trace input/output JSON carries compact refs
 // ("ironside://media/<id>") instead of blob bytes; the viewer resolves
-// them here. Returns the blob so callers can build an object URL — an
-// <img src> can't carry the Authorization header.
+// them here. Returns the blob so callers can build an object URL, which
+// also keeps a failed fetch visible to the caller instead of a broken image.
 export const MEDIA_REF_PATTERN = /ironside:\/\/media\/([0-9A-HJKMNP-TV-Z]{26})/g;
 
 export async function fetchMediaBlob(projectId: string, id: string): Promise<Blob> {

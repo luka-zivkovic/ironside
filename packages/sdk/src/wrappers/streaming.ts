@@ -14,11 +14,11 @@
 // but never ends — visible in the UI as a dangling in-progress
 // generation, which is the honest representation of what happened.
 //
-// KNOWN LIMIT — .tee(): each branch iterates through the patched
-// asyncIterator, so chunks from both branches feed one accumulator
-// (double-counted text). finalize still fires exactly once. tee'd +
-// wrapped is rare enough that correct-single-stream beats a per-iterator
-// accumulator design that couldn't merge usage sanely anyway.
+// KNOWN LIMIT — .tee(): the OpenAI and Anthropic streams' tee() reads their
+// internal iterator() directly, not [Symbol.asyncIterator], so neither
+// branch passes through this patch: nothing is recorded and the generation
+// never ends. .toReadableStream() goes through [Symbol.asyncIterator] and is
+// recorded normally.
 
 /**
  * Patches `stream`'s async iterator in place so every yielded chunk feeds
