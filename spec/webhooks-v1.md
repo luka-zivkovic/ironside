@@ -1,43 +1,73 @@
 # Webhooks v1
 
-Status: implemented (M6-03); scheduler wiring (M6-05) and admin API routes (M6-06) since added. Owner: `packages/db/src/webhooks.ts`, `apps/worker/src/webhooks/`.
+Status: implemented. Owner: `packages/db/src/webhooks.ts`, `apps/worker/src/webhooks/webhook-runner.ts`.
 
 ## Purpose
 
-Fire an HTTP POST at a customer-owned destination when a settled trace matches a saved filter rule — the push counterpart to M6-01's scheduled pull export and M6-02's OTLP forward. Same `TraceFilter`/`exportTraces` building block as both of those, third and final consumer of it for M6. Since issue #44, delivery is exactly once per settled trace version: late trace/observation activity reopens the trace and produces one new notification after the quiet period.
+Send an HTTP POST to a customer-owned destination when a settled trace matches a saved filter rule. It is the push counterpart to scheduled exports (`spec/scheduled-export-v1.md`) and OTLP forwarding (`spec/otlp-forwarding-v1.md`), and reads the same durable trace feed.
 
-## "Fires exactly once" — what that actually means
+## What a run delivers
 
-The roadmap DoD text is "fires exactly once per matching trace." Read literally as "exactly one delivery *attempt* ever," this would make a single transient failure (destination briefly down, a dropped connection) permanently block that trace from ever being delivered — clearly not the intent. The correct reading, consistent with standard webhook semantics (Stripe, GitHub): **exactly one *successful* delivery**, with failed attempts remaining retryable until they succeed.
+Each run delivers one webhook for every **matching settled trace version published since the rule's position**, in the feed's commit order.
 
-## Design
+- **Position:** each rule stores its position in the durable trace feed, `evaluator_trace_feed` (`feed_cursor_published_at`, `feed_cursor_trace_id`; Postgres migration `0006`). A rule starts at the beginning of the feed, so its first run notifies about every existing matching trace. The feed, and why it is read instead of activity time, are described in `spec/scheduled-export-v1.md`.
+- **Settlement:** the feed is read with the same rules as scheduled exports (`apps/worker/src/exporters/settled-trace-feed.ts`): a run stops at a trace still inside its quiet period or still being written, and steps over traces retention removed.
+- **Versions:** a trace that receives new trace or observation activity is published again and gets a new webhook after another quiet period, including a late batch whose receive time is older than the trace's latest activity. Scores never reopen a trace, so they never trigger a webhook.
+- **Filter:** the rule's `TraceFilter` (time range, user/session, tags, metadata) is applied to each trace; traces it excludes are stepped over.
+- **Bounds:** a run sends at most 1,000 webhooks and examines at most 100,000 feed entries; a larger backlog continues on the next scheduler tick. Each request times out after 30 seconds.
 
-- **`webhook_rules` table**: per-project named rules (destination URL, HMAC signing secret, `TraceFilter`-shaped filter, enabled flag). `signing_secret_encrypted` is AES-256-GCM encrypted at rest via the same helper as M6-01's export credentials and M6-02's forward-rule auth header — a webhook signing secret is the same credential risk class as either.
-- **`webhook_deliveries` table**: one row per `(webhook_rule_id, trace_id, trace_version)` tuple, with a matching unique constraint. `trace_version` is the settled trace's latest ingest-activity timestamp and is always present. `status` is `pending | delivered | failed`.
-- **`claimWebhookDelivery`** (`packages/db/src/webhooks.ts`): the sole correctness mechanism for exactly-once. A single atomic upsert claims the exact settled version before the request:
-  ```sql
-  insert into webhook_deliveries
-    (id, webhook_rule_id, trace_id, trace_version, status, attempted_at)
-  values ($1, $2, $3, $4, 'pending', now())
-  on conflict (webhook_rule_id, trace_id, trace_version) do update
-    set status = 'pending', attempted_at = now()
-    where webhook_deliveries.status = 'failed'
-       or (webhook_deliveries.status = 'pending'
-           and webhook_deliveries.attempted_at < now() - interval '10 minutes')
-  returning id
-  ```
-  Delivered tuples cannot be claimed again; failed or stale-pending tuples are retryable and preserve their original delivery id.
-- **`runWebhooks`** (`apps/worker/src/webhooks/webhook-runner.ts`): fetches currently-matching settled traces via `exportTraces` (shared with M6-01/M6-02), claims each settled version *before* making the HTTP call, and includes that version in the payload. A later trace/observation write creates one new deliverable version after another quiet period.
-- **Payload signing**: `X-Ironside-Signature: sha256=<hex>` header, HMAC-SHA256 computed over the exact raw JSON string sent as the request body (not a re-serialized object, which is not guaranteed byte-identical) — same pattern as Stripe/GitHub webhook signing, so receivers can verify authenticity with a standard recipe.
-- **Payload shape**: `{ event: "trace.matched", traceId, projectId, timestamp, name, traceVersion }` — the minimum needed to identify the settled version and optionally fetch the trace back via the query API. `traceVersion` is additive in issue #44; strict receivers must allow it after upgrading.
-- **SSRF guard** (`apps/worker/src/lib/ssrf-guard.ts`, `assertPublicHttpDestination`): `rule.destinationUrl` is customer-supplied, so before sending anything `runWebhooks` resolves the hostname and rejects loopback/link-local/private/reserved addresses (including DNS-rebinding cases, since the check runs against the actually-resolved IP, not the hostname string) — otherwise the worker is a general SSRF proxy into whatever network it runs on. Checked once per run (the destination is fixed for the whole rule), not per-trace. Tests opt out via `allowPrivateDestinations: true` to talk to a local mock server; production code paths never set it. IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) are handled by extracting the embedded IPv4 and re-running the IPv4 range check, not by hardcoded per-range prefix strings — an initial version only matched a few hardcoded `::ffff:` prefixes and missed most private ranges (caught by automated security review); it also had to account for Node's `URL` parser canonicalizing a dotted-quad mapped address into pure hex-group form (`::ffff:172.20.1.1` → `::ffff:ac14:101`) before the embedded octets could be extracted.
+## Exactly once
 
-## Verified against real infrastructure — not just mocks
+Each `(rule, trace, version)` is delivered successfully exactly once. A failed attempt stays retryable; "exactly once" never means one attempt.
 
-`packages/db/test/webhooks.test.ts` runs against a real local Postgres: first claim succeeds; an already-delivered settled version returns `null`; a genuinely later version is independently claimable; failed claims reuse the original delivery id; and 10 parallel claims for the same tuple produce exactly one winner.
+`webhook_deliveries` holds one row per tuple under a unique constraint, with `status` `pending | delivered | failed`. Before sending, `claimWebhookDelivery` claims the tuple in one atomic upsert:
 
-`apps/worker/test/webhook-runner.test.ts` runs against a real local Postgres + ClickHouse + a real local HTTP server (not a mocked `fetch`): a matching settled version is delivered with a correctly signed body; rerunning the same version is skipped; late activity produces one new delivery after re-settling; an HTTP 500 is retryable; and private destinations are rejected by default. `apps/worker/test/ssrf-guard.test.ts` covers the SSRF guard directly.
+```sql
+insert into webhook_deliveries
+  (id, webhook_rule_id, trace_id, trace_version, status, attempted_at)
+values ($1, $2, $3, $4, 'pending', now())
+on conflict (webhook_rule_id, trace_id, trace_version) do update
+  set status = 'pending', attempted_at = now()
+  where webhook_deliveries.status = 'failed'
+     or (webhook_deliveries.status = 'pending'
+         and webhook_deliveries.attempted_at < now() - interval '10 minutes')
+returning id
+```
 
-## Not yet done (follow-up, not blocking this DoD item)
+A delivered tuple cannot be claimed again, so a run that starts from an old position (a slow run claimed twice by different worker replicas) skips what was already sent. A pending attempt older than 10 minutes belonged to a worker that stopped mid-send and is claimed again; that one case can send twice. A failure to record a confirmed delivery propagates as an error rather than marking the row failed, which would let the next run send it again.
 
-~~No API routes / no scheduler~~ — **done since**: scheduler wiring in M6-05 (spec/scheduler-v1.md), admin CRUD routes in M6-06 (spec/scheduled-destinations-crud-v1.md). Still true: a real-time push-on-ingest trigger (firing the instant a trace is stored rather than on the M6-05 poll cadence) is the same larger architectural change flagged in `spec/otlp-forwarding-v1.md`, and applies equally here.
+`trace_version` is the trace's feed version: distinct and increasing for every publication of the trace, and the same token the evaluator API and exports use.
+
+## Failures
+
+A request that fails (a network error, a timeout, or any non-2xx response) marks its delivery failed and stops the run before that trace. The next run retries it first, so an unreachable or misconfigured destination delays webhooks instead of skipping traces, and delivery stays in feed order. A run also stops, without an error, at a version another run is still sending.
+
+The position advances past every delivered, already-delivered, or non-matching entry, and is stored only if it still holds the value the run started from. Every run records `last_run_status`, `last_run_error` (the delivery it stopped at) and `last_run_delivered_count` on the rule, returned by the webhook rule API as `lastRunStatus`, `lastRunError` and `lastRunDeliveredCount`.
+
+## Payload and signing
+
+```json
+{ "event": "trace.matched", "traceId": "…", "projectId": "…", "timestamp": "…", "name": "…", "traceVersion": "…" }
+```
+
+`timestamp` is the trace's own timestamp and `traceVersion` its feed version. The body is signed with HMAC-SHA256 over the exact raw JSON string sent, in `X-Ironside-Signature: sha256=<hex>` — the Stripe and GitHub pattern, so receivers can verify it with a standard recipe. The signing secret is generated server-side and stored AES-256-GCM encrypted (`signing_secret_encrypted`).
+
+## SSRF guard
+
+`destinationUrl` is customer-supplied, so each run first resolves it and rejects loopback, link-local, private and reserved addresses (`apps/worker/src/lib/ssrf-guard.ts`, `assertPublicHttpDestination`), checking the resolved IP so DNS rebinding is covered. IPv4-mapped IPv6 addresses are checked by extracting the embedded IPv4 address, including the hex-group form Node's `URL` parser produces (`::ffff:172.20.1.1` becomes `::ffff:ac14:101`). A rejected destination fails the run and is recorded on the rule. Tests opt out with `allowPrivateDestinations: true` to reach a local server; production code never sets it.
+
+## Upgrading from 0.3.0
+
+Before migration `0006`, a run scanned every matching settled trace on every run and keyed deliveries by the trace's latest activity time. Migration `0006` sets `legacy_delivery_cutoff` on every existing rule. For feed entries published at or before that instant, a run first looks for a delivery under the trace's activity time and skips the trace if it was delivered, so upgrading does not resend earlier webhooks. Rules created afterwards have no cutoff. Old and new workers must not run side by side: during such an overlap a trace can be delivered once by each.
+
+Receivers see `traceVersion` change meaning from the activity time to the feed version. Both are timestamps; a receiver that stores the latest `traceVersion` per trace and compares them keeps working, because feed versions only increase.
+
+## Verified
+
+`apps/worker/test/webhook-runner.test.ts` publishes traces to the feed and runs `runWebhooks` against real Postgres, ClickHouse and a local HTTP server. It covers the signed payload and the recorded run, no resend from a later run or from a stale position, a new webhook for each republication (including a late batch), a failed delivery stopping the run and being retried first in feed order, stopping at an in-flight delivery, skipping deliveries made before the upgrade, a filter matching nothing, a bookkeeping failure after a confirmed delivery, and the SSRF guard. `packages/db/test/webhooks.test.ts` covers the claim itself, including 10 parallel claims producing one winner. `packages/db/test/migrate-upgrade.test.ts` checks the cutoff is set only on rules that existed before the upgrade.
+
+## History
+
+- M6-03 added webhooks, scanning matching traces with `exportTraces` on every run. Issue #44 made delivery exactly once per settled version, keyed by activity time.
+- Migration `0006` moved webhooks onto the trace feed: runs read only new publications instead of every matching trace, deliveries are keyed by feed version, a failed delivery stops the run instead of being retried out of order, and each run's outcome is recorded on the rule. `exportTraces` was removed.
+- Still open: webhooks fire on the scheduler's poll cadence, not the instant a trace settles (the same trade-off as `spec/otlp-forwarding-v1.md`).

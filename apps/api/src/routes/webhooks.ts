@@ -39,7 +39,11 @@ function toResponse(rule: WebhookRule): WebhookRuleResponse {
     filter: rule.filter,
     enabled: rule.enabled,
     pollIntervalSeconds: rule.pollIntervalSeconds,
-    nextRunAt: rule.nextRunAt.toISOString()
+    nextRunAt: rule.nextRunAt.toISOString(),
+    lastRunAt: rule.lastRunAt ? rule.lastRunAt.toISOString() : null,
+    lastRunStatus: rule.lastRunStatus,
+    lastRunError: rule.lastRunError,
+    lastRunDeliveredCount: rule.lastRunDeliveredCount
   };
 }
 

@@ -54,7 +54,6 @@ export {
   listScoresForTraces,
   listScoresForTrace,
   getAggregates,
-  exportTraces,
   type TraceFilter,
   type ListTracesFilter,
   type ListTracePageFilter,
@@ -70,8 +69,7 @@ export {
   type TraceRawAnchorRow,
   type ObservationRow,
   type ScoreRow,
-  type AggregatesRow,
-  type ExportTraceRow
+  type AggregatesRow
 } from "./queries.js";
 export {
   listPartitions,

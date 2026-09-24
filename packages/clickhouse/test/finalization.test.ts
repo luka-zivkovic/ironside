@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createClickHouseClient } from "../src/client.js";
-import { exportTraces, getTrace, listTracePage } from "../src/queries.js";
+import { getTrace, listSettledTraceVersions, listTracePage } from "../src/queries.js";
 import { markProjectDataDeletedOlderThan } from "../src/retention.js";
 import { runMigrations } from "../src/migrate.js";
 import { insertObservations, insertScores, insertTraces } from "../src/rows.js";
@@ -39,13 +39,13 @@ describe("quiet-period trace finalization", () => {
       { eventTs: initialActivity }
     );
 
-    const initiallySettled = await exportTraces(clickhouse, {
+    const initiallySettled = await listSettledTraceVersions(clickhouse, {
       projectId,
-      tags: [marker],
-      settledBefore: firstWatermark
+      settledBefore: firstWatermark,
+      limit: 10
     });
     expect(initiallySettled.map((row) => row.id)).toEqual([traceId]);
-    expect(new Date(initiallySettled[0]!.last_activity_at).getTime()).toBe(
+    expect(new Date(initiallySettled[0]!.trace_version).getTime()).toBe(
       new Date(initialActivity).getTime()
     );
     expect(await getTrace(clickhouse, projectId, traceId, firstWatermark)).not.toBeNull();
@@ -70,10 +70,10 @@ describe("quiet-period trace finalization", () => {
     // A late child write reopens the trace even though the trace row itself
     // did not change. Both bulk and point reads honor the same watermark.
     expect(
-      await exportTraces(clickhouse, {
+      await listSettledTraceVersions(clickhouse, {
         projectId,
-        tags: [marker],
-        settledBefore: firstWatermark
+        settledBefore: firstWatermark,
+        limit: 10
       })
     ).toEqual([]);
     expect(await getTrace(clickhouse, projectId, traceId, firstWatermark)).toBeNull();
@@ -87,13 +87,13 @@ describe("quiet-period trace finalization", () => {
     expect(reopenedPage.totalItems).toBe(0);
 
     const secondWatermark = new Date(base + 5 * 60_000).toISOString();
-    const settledAgain = await exportTraces(clickhouse, {
+    const settledAgain = await listSettledTraceVersions(clickhouse, {
       projectId,
-      tags: [marker],
-      settledBefore: secondWatermark
+      settledBefore: secondWatermark,
+      limit: 10
     });
     expect(settledAgain.map((row) => row.id)).toEqual([traceId]);
-    expect(new Date(settledAgain[0]!.last_activity_at).getTime()).toBe(
+    expect(new Date(settledAgain[0]!.trace_version).getTime()).toBe(
       new Date(observationActivity).getTime()
     );
 
@@ -115,13 +115,13 @@ describe("quiet-period trace finalization", () => {
       { eventTs: scoreActivity }
     );
 
-    const afterScore = await exportTraces(clickhouse, {
+    const afterScore = await listSettledTraceVersions(clickhouse, {
       projectId,
-      tags: [marker],
-      settledBefore: secondWatermark
+      settledBefore: secondWatermark,
+      limit: 10
     });
     expect(afterScore.map((row) => row.id)).toEqual([traceId]);
-    expect(new Date(afterScore[0]!.last_activity_at).getTime()).toBe(
+    expect(new Date(afterScore[0]!.trace_version).getTime()).toBe(
       new Date(observationActivity).getTime()
     );
 
@@ -134,10 +134,10 @@ describe("quiet-period trace finalization", () => {
       projectId,
       new Date(base - 5 * 60_000)
     );
-    const afterRetention = await exportTraces(clickhouse, {
+    const afterRetention = await listSettledTraceVersions(clickhouse, {
       projectId,
-      tags: [marker],
-      settledBefore: new Date(base + 60 * 60_000).toISOString()
+      settledBefore: new Date(base + 60 * 60_000).toISOString(),
+      limit: 10
     });
     expect(afterRetention).toEqual([]);
     expect(

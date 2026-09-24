@@ -155,14 +155,26 @@ export function startScheduler(options: SchedulerOptions): Scheduler {
     const due = await claimDueWebhookRules(options.pool, claimBatchSize);
     for (const rule of due) {
       try {
-        await runWebhooks({
+        const result = await runWebhooks({
           pool: options.pool,
           clickhouse: options.clickhouse,
           rule,
           signingSecret: decryptSecret(rule.signingSecretEncrypted),
           traceQuietPeriodSeconds: await traceQuietPeriodSeconds(rule.projectId)
         });
-        onRunOutcome("webhook", "success");
+        if (result.failed.length > 0) {
+          // The rule's last_run_error has the detail; surface it in logs and metrics too.
+          onError(
+            "webhook",
+            new Error(
+              `rule ${rule.id}: delivery stopped at ` +
+                result.failed.map((failure) => `${failure.traceId}: ${failure.error}`).join("; ")
+            )
+          );
+          onRunOutcome("webhook", "error");
+        } else {
+          onRunOutcome("webhook", "success");
+        }
       } catch (error) {
         onError("webhook", error);
         onRunOutcome("webhook", "error");

@@ -114,10 +114,7 @@ function tracesWhereObservations(having: string): string {
 }
 
 /** Shared by listTraces and getAggregates — same filter surface, different projection. */
-function buildTraceConditions(
-  filter: TraceFilter,
-  options: { includeSettledCondition?: boolean } = {}
-): {
+function buildTraceConditions(filter: TraceFilter): {
   conditions: string[];
   params: Record<string, unknown>;
 } {
@@ -181,7 +178,7 @@ function buildTraceConditions(
     params.minCost = filter.minCost;
   }
 
-  if (filter.settledBefore && options.includeSettledCondition !== false) {
+  if (filter.settledBefore) {
     conditions.push(`id in (
       select trace_id
       from (${traceActivityQuery()})
@@ -367,70 +364,6 @@ export async function listTraceMetrics(
   });
   const rows = await result.json<TraceMetricsRow>();
   return new Map(rows.map((row) => [row.trace_id, row]));
-}
-
-export interface ExportTraceRow {
-  id: string;
-  timestamp: string;
-  name: string | null;
-  user_id: string | null;
-  session_id: string | null;
-  tags: string[];
-  metadata: Record<string, string>;
-  input: string | null;
-  output: string | null;
-  /** Stable version for one settled snapshot; advances on any later trace activity. */
-  last_activity_at: string;
-}
-
-/**
- * Fetches ALL traces matching a filter (no pagination) for a bulk export.
- * Buffered via .json() rather than streamed — acceptable at current scale;
- * a very large export should switch to ResultSet.stream() (see
- * @clickhouse/client's Row streaming API) before this becomes a memory
- * concern. FINAL is required here: retention uses the engine's tombstone
- * column, so reading physical rows directly could export a deleted trace
- * and treat its deletion marker as a new settled version.
- */
-export async function exportTraces(
-  client: ClickHouseClient,
-  filter: TraceFilter
-): Promise<ExportTraceRow[]> {
-  // The activity join both gates incomplete traces and returns the settled
-  // snapshot version used by webhook exactly-once delivery. Keep the normal
-  // trace predicates inside a subquery so their existing unqualified column
-  // names remain unambiguous after the join.
-  const { conditions, params } = buildTraceConditions(filter, {
-    includeSettledCondition: false
-  });
-  if (filter.settledBefore) {
-    params.settledBefore = toClickHouseDateTime(filter.settledBefore);
-  }
-
-  const result = await client.query({
-    query: `
-      select t.id, t.timestamp, t.name, t.user_id, t.session_id, t.tags,
-             t.metadata, t.input, t.output,
-             activity.last_activity_at as last_activity_at
-      from (
-        select id, timestamp, name, user_id, session_id, tags, metadata, input, output
-        from traces final
-        where ${conditions.join(" and ")}
-      ) as t
-      inner join (${traceActivityQuery()}) as activity on activity.trace_id = t.id
-      ${filter.settledBefore ? "where activity.last_activity_at <= {settledBefore:DateTime64(6)}" : ""}
-      order by t.timestamp asc, t.id asc
-    `,
-    query_params: params,
-    format: "JSONEachRow"
-  });
-
-  const rows = await result.json<ExportTraceRow>();
-  return rows.map((row) => ({
-    ...row,
-    timestamp: fromClickHouseDateTime(row.timestamp),
-    last_activity_at: fromClickHouseDateTime(row.last_activity_at)
-  }));
 }
 
 export interface TraceDetailRow {

@@ -1,5 +1,10 @@
 import type { Pool } from "pg";
-import type { ExportFilter } from "./export-configs.js";
+import {
+  FEED_CURSOR_COLUMNS,
+  feedCursorFromRow,
+  type DestinationFeedCursor,
+  type ExportFilter
+} from "./export-configs.js";
 
 export interface WebhookRule {
   id: string;
@@ -12,6 +17,20 @@ export interface WebhookRule {
   enabled: boolean;
   pollIntervalSeconds: number;
   nextRunAt: Date;
+  /** Null until the first run records a position; the next run starts at the beginning of the feed. */
+  feedCursor: DestinationFeedCursor | null;
+  /**
+   * Set on rules that existed before webhooks read the trace feed, in the
+   * feed cursor's microsecond ISO format. Feed entries published at or before
+   * it may have been delivered under the trace's activity time instead of its
+   * feed version (migration 0006).
+   */
+  legacyDeliveryCutoff: string | null;
+  lastRunAt: Date | null;
+  lastRunStatus: "success" | "error" | null;
+  /** Why the last run stopped. */
+  lastRunError: string | null;
+  lastRunDeliveredCount: number | null;
 }
 
 interface WebhookRuleRow {
@@ -24,7 +43,18 @@ interface WebhookRuleRow {
   enabled: boolean;
   poll_interval_seconds: number;
   next_run_at: Date;
+  feed_cursor_trace_id: string | null;
+  feed_cursor_published_at_text?: string | null;
+  legacy_delivery_cutoff_text?: string | null;
+  last_run_at: Date | null;
+  last_run_status: "success" | "error" | null;
+  last_run_error: string | null;
+  last_run_delivered_count: string | null;
 }
+
+const RULE_COLUMNS = `*, ${FEED_CURSOR_COLUMNS},
+  to_char(legacy_delivery_cutoff at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+    as legacy_delivery_cutoff_text`;
 
 function ruleFromRow(row: WebhookRuleRow): WebhookRule {
   return {
@@ -36,7 +66,14 @@ function ruleFromRow(row: WebhookRuleRow): WebhookRule {
     filter: row.filter,
     enabled: row.enabled,
     pollIntervalSeconds: row.poll_interval_seconds,
-    nextRunAt: row.next_run_at
+    nextRunAt: row.next_run_at,
+    feedCursor: feedCursorFromRow(row),
+    legacyDeliveryCutoff: row.legacy_delivery_cutoff_text ?? null,
+    lastRunAt: row.last_run_at,
+    lastRunStatus: row.last_run_status,
+    lastRunError: row.last_run_error,
+    lastRunDeliveredCount:
+      row.last_run_delivered_count === null ? null : Number(row.last_run_delivered_count)
   };
 }
 
@@ -57,7 +94,7 @@ export async function createWebhookRule(
   const result = await pool.query<WebhookRuleRow>(
     `insert into webhook_rules (id, project_id, name, destination_url, signing_secret_encrypted, filter)
      values ($1, $2, $3, $4, $5, $6)
-     returning *`,
+     returning ${RULE_COLUMNS}`,
     [
       input.id,
       input.projectId,
@@ -78,7 +115,7 @@ export async function getWebhookRule(
   id: string
 ): Promise<WebhookRule | null> {
   const result = await pool.query<WebhookRuleRow>(
-    "select * from webhook_rules where project_id = $1 and id = $2",
+    `select ${RULE_COLUMNS} from webhook_rules where project_id = $1 and id = $2`,
     [projectId, id]
   );
   const row = result.rows[0];
@@ -87,7 +124,7 @@ export async function getWebhookRule(
 
 export async function listWebhookRules(pool: Pool, projectId: string): Promise<WebhookRule[]> {
   const result = await pool.query<WebhookRuleRow>(
-    "select * from webhook_rules where project_id = $1 order by created_at asc",
+    `select ${RULE_COLUMNS} from webhook_rules where project_id = $1 order by created_at asc`,
     [projectId]
   );
   return result.rows.map(ruleFromRow);
@@ -95,7 +132,7 @@ export async function listWebhookRules(pool: Pool, projectId: string): Promise<W
 
 export async function listEnabledWebhookRules(pool: Pool): Promise<WebhookRule[]> {
   const result = await pool.query<WebhookRuleRow>(
-    "select * from webhook_rules where enabled = true order by id asc"
+    `select ${RULE_COLUMNS} from webhook_rules where enabled = true order by id asc`
   );
   return result.rows.map(ruleFromRow);
 }
@@ -118,7 +155,7 @@ export async function updateWebhookRule(
          poll_interval_seconds = coalesce($4, poll_interval_seconds),
          updated_at = now()
      where id = $1 and project_id = $2
-     returning *`,
+     returning ${RULE_COLUMNS}`,
     [id, projectId, input.enabled ?? null, input.pollIntervalSeconds ?? null]
   );
   const row = result.rows[0];
@@ -152,11 +189,55 @@ export async function claimDueWebhookRules(pool: Pool, limit: number): Promise<W
        limit $1
        for update skip locked
      )
-     returning *`,
+     returning ${RULE_COLUMNS}`,
     [limit]
   );
   return result.rows.map(ruleFromRow);
 }
+
+/**
+ * Records a webhook run: its outcome and how far it got through the trace
+ * feed. The position is stored only if it still holds the value the run
+ * started from, so a slow run claimed twice by different worker replicas
+ * cannot move it back. `runAgainSoon` makes the next scheduler tick continue
+ * a backlog the run stopped short of.
+ */
+export async function recordWebhookRun(
+  pool: Pool,
+  id: string,
+  run: {
+    status: "success" | "error";
+    error?: string;
+    delivered: number;
+    feedCursor: { from: DestinationFeedCursor | null; to: DestinationFeedCursor | null };
+    runAgainSoon?: boolean;
+  }
+): Promise<void> {
+  await pool.query(
+    `update webhook_rules
+     set last_run_at = now(), last_run_status = $2, last_run_error = $3,
+         last_run_delivered_count = $4,
+         feed_cursor_published_at = case when ${UNCHANGED} then $7::timestamptz else feed_cursor_published_at end,
+         feed_cursor_trace_id = case when ${UNCHANGED} then $8::text else feed_cursor_trace_id end,
+         next_run_at = case when $9 then now() else next_run_at end,
+         updated_at = now()
+     where id = $1`,
+    [
+      id,
+      run.status,
+      run.error ?? null,
+      run.delivered,
+      run.feedCursor.from?.publishedAt ?? null,
+      run.feedCursor.from?.traceId ?? null,
+      run.feedCursor.to?.publishedAt ?? null,
+      run.feedCursor.to?.traceId ?? null,
+      run.runAgainSoon ?? false
+    ]
+  );
+}
+
+const UNCHANGED = `feed_cursor_published_at is not distinct from $5::timestamptz
+  and feed_cursor_trace_id is not distinct from $6::text`;
 
 export type WebhookDeliveryStatus = "pending" | "delivered" | "failed";
 
@@ -229,4 +310,41 @@ export async function markWebhookFailed(
     "update webhook_deliveries set status = 'failed', last_error = $2 where id = $1",
     [deliveryId, error]
   );
+}
+
+/** The status of one (rule, trace, version) delivery, or null when none was attempted. */
+export async function getWebhookDeliveryStatus(
+  pool: Pool,
+  webhookRuleId: string,
+  traceId: string,
+  traceVersion: string
+): Promise<WebhookDeliveryStatus | null> {
+  const result = await pool.query<{ status: WebhookDeliveryStatus }>(
+    `select status from webhook_deliveries
+     where webhook_rule_id = $1 and trace_id = $2 and trace_version = $3::timestamptz`,
+    [webhookRuleId, traceId, traceVersion]
+  );
+  return result.rows[0]?.status ?? null;
+}
+
+/** Trace ids among `versions` whose delivery at exactly that version succeeded. */
+export async function listDeliveredWebhookTraceIds(
+  pool: Pool,
+  webhookRuleId: string,
+  versions: { traceId: string; traceVersion: string }[]
+): Promise<Set<string>> {
+  if (versions.length === 0) return new Set();
+  const result = await pool.query<{ trace_id: string }>(
+    `select delivery.trace_id
+     from webhook_deliveries as delivery
+     join unnest($2::text[], $3::timestamptz[]) as version(trace_id, trace_version)
+       on delivery.trace_id = version.trace_id and delivery.trace_version = version.trace_version
+     where delivery.webhook_rule_id = $1 and delivery.status = 'delivered'`,
+    [
+      webhookRuleId,
+      versions.map((version) => version.traceId),
+      versions.map((version) => version.traceVersion)
+    ]
+  );
+  return new Set(result.rows.map((row) => row.trace_id));
 }

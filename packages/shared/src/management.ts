@@ -314,7 +314,12 @@ export const webhookRuleSchema = z.object({
   filter: traceFilterSchema,
   enabled: z.boolean(),
   pollIntervalSeconds: z.number().int().positive(),
-  nextRunAt: z.string()
+  nextRunAt: z.string(),
+  lastRunAt: z.string().nullable(),
+  lastRunStatus: z.enum(["success", "error"]).nullable(),
+  /** Why the last run stopped: the delivery that failed, which the next run retries first. */
+  lastRunError: z.string().nullable(),
+  lastRunDeliveredCount: z.number().int().nonnegative().nullable()
 });
 export type WebhookRuleResponse = z.infer<typeof webhookRuleSchema>;
 

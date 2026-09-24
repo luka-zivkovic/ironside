@@ -72,6 +72,34 @@ describe("Postgres upgrades", () => {
     );
   });
 
+  it("marks webhook rules from before the trace feed so their earlier deliveries are not resent", async () => {
+    const pool = await scratchDatabase();
+    await runMigrations(pool, { migrationsDir: v030MigrationsDir() });
+    await pool.query("insert into organizations (id, name) values ('org_1', 'upgrade-org')");
+    await pool.query(
+      "insert into projects (id, organization_id, name) values ('proj_1', 'org_1', 'upgrade-project')"
+    );
+    const insertRule = (id: string) =>
+      pool.query(
+        `insert into webhook_rules (id, project_id, name, destination_url, signing_secret_encrypted)
+         values ($1, 'proj_1', $1, 'https://example.com/hook', 'ciphertext')`,
+        [id]
+      );
+    await insertRule("webhook_before");
+
+    await runMigrations(pool);
+    await insertRule("webhook_after");
+
+    const rules = await pool.query<{ id: string; marked: boolean; feed_cursor_trace_id: string | null }>(
+      `select id, legacy_delivery_cutoff is not null as marked, feed_cursor_trace_id
+       from webhook_rules order by id`
+    );
+    expect(rules.rows).toEqual([
+      { id: "webhook_after", marked: false, feed_cursor_trace_id: null },
+      { id: "webhook_before", marked: true, feed_cursor_trace_id: null }
+    ]);
+  });
+
   it("applies an upgrade exactly once when api and worker start at the same time", async () => {
     const pool = await scratchDatabase();
     await runMigrations(pool, { migrationsDir: v030MigrationsDir() });
