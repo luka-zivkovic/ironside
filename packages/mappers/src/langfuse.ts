@@ -7,8 +7,8 @@ import {
   type LangfuseIngestionRequest,
   type LangfuseIngestionResponse
 } from "@ironside/shared";
-import { normalizeEnvironment } from "@ironside/shared";
-import { ulid } from "ulid";
+import { createHash } from "node:crypto";
+import { identifierSchema, normalizeEnvironment } from "@ironside/shared";
 import { canonicalizeUsageKeys } from "./usage-keys.js";
 
 // Maps a LangFuse /api/public/ingestion batch to Ironside's domain model.
@@ -175,6 +175,18 @@ function classify(type: LangfuseBatchEvent["type"]): Classification {
   }
 }
 
+/**
+ * The id of a record sent without one: its event's id. The stored batch keeps
+ * it across worker retries and the SDK keeps it when it resends a request, so
+ * a retry writes the same record again instead of a copy. A record without an
+ * id is its own group, so it has exactly one event. An event id that is not a
+ * valid identifier is hashed into one.
+ */
+function idFromEvent(event: LangfuseBatchEvent): string {
+  const parsed = identifierSchema.safeParse(event.id);
+  return parsed.success ? parsed.data : `lf_${createHash("sha256").update(event.id).digest("hex").slice(0, 32)}`;
+}
+
 /** Reads body.id without full schema validation, just to group events by target entity. */
 function getBodyId(event: LangfuseBatchEvent): string | undefined {
   if (event.body && typeof event.body === "object" && "id" in event.body) {
@@ -237,7 +249,7 @@ function mapMergedTrace(
   const environment = normalizeEnvironment(body.environment);
 
   const trace: Trace = {
-    id: body.id ?? ulid(),
+    id: body.id ?? idFromEvent(events[0]!),
     projectId,
     timestamp: body.timestamp ?? latestTimestamp ?? new Date().toISOString(),
     tags: body.tags ?? [],
@@ -276,7 +288,7 @@ function mapMergedObservation(
   const latestTimestamp = events.map((e) => e.timestamp).filter(Boolean).at(-1);
 
   const observation: Observation = {
-    id: body.id ?? ulid(),
+    id: body.id ?? idFromEvent(events[0]!),
     traceId: body.traceId,
     projectId,
     type,
@@ -324,7 +336,7 @@ function mapScore(projectId: string, event: LangfuseBatchEvent): MergedResult<Sc
 
   const isNumeric = typeof body.value === "number";
   const score: Score = {
-    id: body.id ?? ulid(),
+    id: body.id ?? idFromEvent(event),
     projectId,
     traceId: body.traceId,
     name: body.name,

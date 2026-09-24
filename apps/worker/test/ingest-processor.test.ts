@@ -1248,6 +1248,32 @@ describe("a record written again with a timestamp on another day", () => {
     expect(utc.deletions.traces).toEqual([{ projectId, id: traceId, timestamp: noon(2) }]);
   });
 
+  it("writes a LangFuse score sent without an id once, also when its batch is retried", async () => {
+    const traceId = `trace_${ulid()}`;
+    const eventId = `evt_${ulid()}`;
+    const batch: IngestBatch = {
+      ...nativeBatch(noon(1), []),
+      events: [
+        {
+          id: ulid(),
+          type: "langfuse-ingestion",
+          source: "langfuse",
+          schemaVersion: INGEST_SCHEMA_VERSION,
+          idempotencyKey: ulid(),
+          body: { batch: [{ id: eventId, timestamp: noon(1), type: "score-create", body: { traceId, name: "verdict", value: 1 } }] }
+        }
+      ]
+    };
+    await run(batch);
+    await run(batch);
+    const scores = await clickhouse.query({
+      query: "select id from scores final where project_id = {projectId:String} and trace_id = {traceId:String}",
+      query_params: { projectId, traceId },
+      format: "JSONEachRow"
+    });
+    expect(await scores.json()).toEqual([{ id: eventId }]);
+  });
+
   it("removes duplicates written before this fix when the record is written again", async () => {
     const traceId = `trace_${ulid()}`;
     const trace = (day: number) => ({ id: traceId, projectId, timestamp: noon(day), tags: [], metadata: {} });

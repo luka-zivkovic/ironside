@@ -473,3 +473,32 @@ describe("mapLangfuseIngestionRequest — fields each row actually received", ()
     expect(rows.providedFields.observations.get("obs_1")?.has("type")).toBe(false);
   });
 });
+
+describe("mapLangfuseIngestionRequest — records sent without an id", () => {
+  const withoutIds = () =>
+    request([
+      batchEvent({ id: "evt_trace", body: { name: "checkout" } }),
+      batchEvent({ id: "evt_span", type: "span-create", body: { traceId: "trace_1", name: "step" } }),
+      batchEvent({ id: "evt_score", type: "score-create", body: { traceId: "trace_1", name: "helpful", value: 1 } })
+    ]);
+
+  it("takes each record's event id, so mapping the same request again writes the same records", () => {
+    const first = mapLangfuseIngestionRequest("proj_x", withoutIds()).rows;
+    const again = mapLangfuseIngestionRequest("proj_x", withoutIds()).rows;
+
+    expect(first.traces.map((row) => row.id)).toEqual(["evt_trace"]);
+    expect(first.observations.map((row) => row.id)).toEqual(["evt_span"]);
+    expect(first.scores.map((row) => row.id)).toEqual(["evt_score"]);
+    expect(again).toEqual(first);
+  });
+
+  it("hashes an event id that is not a valid identifier into a stable one", () => {
+    const map = () =>
+      mapLangfuseIngestionRequest(
+        "proj_x",
+        request([batchEvent({ id: "", type: "score-create", body: { traceId: "trace_1", name: "helpful", value: 1 } })])
+      ).rows.scores[0]?.id;
+    expect(map()).toMatch(/^lf_[0-9a-f]{32}$/);
+    expect(map()).toBe(map());
+  });
+});
