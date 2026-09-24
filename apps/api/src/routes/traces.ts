@@ -1,8 +1,15 @@
-import { getAggregates, getTrace, listObservationsForTrace, listTraces } from "@ironside/clickhouse";
-import type { ClickHouseClient } from "@ironside/clickhouse";
+import {
+  getAggregates,
+  getTrace,
+  listObservationsForTrace,
+  listTraceMetrics,
+  listTraces
+} from "@ironside/clickhouse";
+import type { ClickHouseClient, TraceFilter } from "@ironside/clickhouse";
 import {
   aggregatesQuerySchema,
   listTracesQuerySchema,
+  type AggregatesQuery,
   type AggregatesResponse,
   type ListTracesResponse,
   type TraceTreeResponse
@@ -14,6 +21,26 @@ import { buildObservationTree, safeJsonParse } from "@ironside/mappers";
 
 export interface TracesDeps {
   clickhouse: ClickHouseClient;
+}
+
+/** The filter both the list and its aggregates apply, so the summary always describes the listed traces. */
+function traceFilter(projectId: string, query: AggregatesQuery): TraceFilter {
+  return {
+    projectId,
+    ...(query.from !== undefined && { from: query.from }),
+    ...(query.to !== undefined && { to: query.to }),
+    ...(query.userId !== undefined && { userId: query.userId }),
+    ...(query.sessionId !== undefined && { sessionId: query.sessionId }),
+    ...(query.environment !== undefined && { environment: query.environment }),
+    ...(query.tags !== undefined && { tags: query.tags }),
+    ...(query.metadataKey !== undefined && { metadataKey: query.metadataKey }),
+    ...(query.metadataValue !== undefined && { metadataValue: query.metadataValue }),
+    ...(query.search && { search: query.search }),
+    ...(query.level !== undefined && { level: query.level }),
+    ...(query.model && { model: query.model }),
+    ...(query.minDurationMs !== undefined && { minDurationMs: query.minDurationMs }),
+    ...(query.minCost !== undefined && { minCost: query.minCost })
+  };
 }
 
 export function tracesRoutes(deps: TracesDeps): Hono<AuthEnv> {
@@ -34,36 +61,42 @@ export function tracesRoutes(deps: TracesDeps): Hono<AuthEnv> {
       return c.json({ error: "invalid cursor" }, 400);
     }
 
+    const projectId = c.get("projectId");
     const rows = await listTraces(deps.clickhouse, {
-      projectId: c.get("projectId"),
+      ...traceFilter(projectId, query),
       // Fetch one extra row to know whether a next page exists.
       limit: query.limit + 1,
-      ...(query.from !== undefined && { from: query.from }),
-      ...(query.to !== undefined && { to: query.to }),
-      ...(query.userId !== undefined && { userId: query.userId }),
-      ...(query.sessionId !== undefined && { sessionId: query.sessionId }),
-      ...(query.environment !== undefined && { environment: query.environment }),
-      ...(query.tags !== undefined && { tags: query.tags }),
-      ...(query.metadataKey !== undefined && { metadataKey: query.metadataKey }),
-      ...(query.metadataValue !== undefined && { metadataValue: query.metadataValue }),
       ...(cursor && { cursor })
     });
 
     const hasMore = rows.length > query.limit;
     const page = hasMore ? rows.slice(0, query.limit) : rows;
     const last = page.at(-1);
+    const metrics = await listTraceMetrics(
+      deps.clickhouse,
+      projectId,
+      page.map((row) => row.id)
+    );
 
     const response: ListTracesResponse = {
-      traces: page.map((row) => ({
-        id: row.id,
-        timestamp: row.timestamp,
-        name: row.name,
-        userId: row.user_id,
-        sessionId: row.session_id,
-        environment: row.environment,
-        tags: row.tags,
-        metadata: row.metadata
-      })),
+      traces: page.map((row) => {
+        const figures = metrics.get(row.id);
+        return {
+          id: row.id,
+          timestamp: row.timestamp,
+          name: row.name,
+          userId: row.user_id,
+          sessionId: row.session_id,
+          environment: row.environment,
+          tags: row.tags,
+          metadata: row.metadata,
+          durationMs: figures?.duration_ms ?? null,
+          totalCost: figures?.total_cost ?? null,
+          totalTokens: figures?.total_tokens ?? null,
+          errorCount: figures?.error_count ?? 0,
+          models: figures?.models ?? []
+        };
+      }),
       nextCursor:
         hasMore && last ? encodeCursor({ timestamp: last.timestamp, id: last.id }) : null
     };
@@ -83,17 +116,7 @@ export function tracesRoutes(deps: TracesDeps): Hono<AuthEnv> {
     }
     const query = parsed.data;
 
-    const result = await getAggregates(deps.clickhouse, {
-      projectId: c.get("projectId"),
-      ...(query.from !== undefined && { from: query.from }),
-      ...(query.to !== undefined && { to: query.to }),
-      ...(query.userId !== undefined && { userId: query.userId }),
-      ...(query.sessionId !== undefined && { sessionId: query.sessionId }),
-      ...(query.environment !== undefined && { environment: query.environment }),
-      ...(query.tags !== undefined && { tags: query.tags }),
-      ...(query.metadataKey !== undefined && { metadataKey: query.metadataKey }),
-      ...(query.metadataValue !== undefined && { metadataValue: query.metadataValue })
-    });
+    const result = await getAggregates(deps.clickhouse, traceFilter(c.get("projectId"), query));
 
     const response: AggregatesResponse = {
       traceCount: result.trace_count,

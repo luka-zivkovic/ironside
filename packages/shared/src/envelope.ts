@@ -37,7 +37,11 @@ export const ingestEventSchema = z.object({
   type: ingestEventTypeSchema,
   source: ingestSourceSchema,
   schemaVersion: z.literal(INGEST_SCHEMA_VERSION),
-  /** Client-provided key or SHA-256 content hash of `body`. */
+  /**
+   * The key the client sent with the event, or the event id when it sent
+   * none; stored for correlation. Ironside does not deduplicate on it: rows
+   * upsert by their own ids, so a resent event converges on the same row.
+   */
   idempotencyKey: z.string().min(1),
   /** Source-shaped payload; the worker mapper owns interpretation. */
   body: z.unknown()

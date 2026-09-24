@@ -28,3 +28,15 @@ describe("IRONSIDE_RUBRIST_URL", () => {
     }
   });
 });
+
+describe("DEFAULT_RATE_LIMIT_PER_MINUTE", () => {
+  it("defaults to 300 and rejects a value that is not a positive integer at startup", () => {
+    expect(loadConfig({}).defaultRateLimitPerMinute).toBe(300);
+    expect(loadConfig({ DEFAULT_RATE_LIMIT_PER_MINUTE: "1200" }).defaultRateLimitPerMinute).toBe(1200);
+    for (const value of ["", "lots", "0", "-5", "2.5"]) {
+      expect(() => loadConfig({ DEFAULT_RATE_LIMIT_PER_MINUTE: value }), value).toThrow(
+        /DEFAULT_RATE_LIMIT_PER_MINUTE must be a positive integer/
+      );
+    }
+  });
+});

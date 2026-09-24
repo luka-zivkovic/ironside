@@ -65,6 +65,10 @@ describe("runMigrations (postgres)", () => {
       {
         id: "0005_langfuse_field_provenance",
         checksum: "98ad7a712c91f83c8167c80d509140a9f2b7e04a1d6d263b2b61ab6c82fbe771"
+      },
+      {
+        id: "0006_webhook_feed_cursors",
+        checksum: "3be4a408cf2aa74fc17932d9ac549942f18433228f59e1f1b3635a3ccb9b6861"
       }
     ]);
     expect((await pool.query("select to_regclass('api_keys') as table_name")).rows).toEqual([

@@ -62,8 +62,9 @@ function isPermanentRejection(status: number): boolean {
  * a rejection of the trace itself stops the run with the position before that
  * trace, so an unreachable or misconfigured destination delays delivery
  * instead of skipping traces. A rejection of the trace (400, 413, 422) skips
- * that one trace so it cannot block the rule for good. Every
- * run records its status on the rule. Delivery is at-least-once, and because
+ * that one trace so it cannot block the rule for good. A redirect is not
+ * followed and counts as a failure. Every run records its status on the
+ * rule. Delivery is at-least-once, and because
  * OTLP ids are derived deterministically a resent trace is the same trace
  * downstream.
  *
@@ -76,15 +77,16 @@ export async function forwardOtlpTraces(options: ForwardOtlpOptions): Promise<Fo
   const fetchImpl = options.fetchImpl ?? fetch;
   const settledBefore = traceSettledBefore(options.traceQuietPeriodSeconds);
 
-  if (!options.allowPrivateDestinations) {
-    await assertPublicHttpDestination(rule.destinationUrl);
-  }
-
   let cursor = rule.feedCursor;
   let backlog = false;
   let runError: unknown;
   const result: ForwardOtlpResult = { matched: 0, forwarded: 0, failed: [] };
   try {
+    // Inside the try, so a rejected destination is recorded on the rule.
+    if (!options.allowPrivateDestinations) {
+      await assertPublicHttpDestination(rule.destinationUrl);
+    }
+
     let examined = 0;
     read: for (;;) {
       const page = await readSettledTraceFeed(
@@ -166,6 +168,8 @@ async function sendTrace(
         ...(options.destinationAuthHeader && { authorization: options.destinationAuthHeader })
       },
       body: JSON.stringify(mapTraceToOtlpExportRequest(trace)),
+      // The SSRF guard checked this URL only; a redirect could lead anywhere.
+      redirect: "manual",
       signal: AbortSignal.timeout(options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS)
     });
     await response.body?.cancel().catch(() => {});

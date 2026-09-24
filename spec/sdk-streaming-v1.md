@@ -1,49 +1,66 @@
-# SDK Streaming Support v1 (M9-07)
+# SDK Streaming v1
 
-Status: implemented. Owner: `packages/sdk/src/wrappers/streaming.ts`, `openai.ts`, `anthropic.ts`.
+Status: implemented. Owner: `packages/sdk/src/wrappers/streaming.ts`, `packages/sdk/src/wrappers/openai.ts`, `packages/sdk/src/wrappers/anthropic.ts`.
 
-## Problem
+## Purpose
 
-Real chat apps stream by default. Before this, `wrapOpenAI`/`wrapAnthropic` detected `stream: true` and skipped recording entirely (one-time warning) — the biggest first-user gap in the primary SDK path (flagged in spec/direct-ingest-primacy-v1.md).
+`wrapOpenAI` and `wrapAnthropic` record streamed calls (`create({ ..., stream: true })`) as generations, with output, tool calls and usage, without changing the stream the caller receives. The wrapped `create` returns a plain `Promise`, so the SDK's `APIPromise` helpers (`.withResponse()`, `.asResponse()`) are not available through a wrapper. Chat applications usually stream, so a wrapper that only recorded non-streaming calls would miss most real traffic.
 
-## Design
+## Instrumentation
 
-**The stream's `[Symbol.asyncIterator]` is patched in place and the same object is returned.** Both provider SDKs return a `Stream` class with API surface beyond iteration (`.tee()`, `.controller`, `.toReadableStream()`); returning a wrapper generator would silently break all of it. In-place patching preserves object identity — proven by a conformance test that calls `.tee()` on a wrapped real `openai@6` Stream and consumes both branches.
+`create()` returns the provider SDK's own `Stream` object with its `[Symbol.asyncIterator]` patched in place (`instrumentAsyncIterable`). Both SDKs' `Stream` classes have API beyond iteration, such as `.tee()`, `.controller` and `.toReadableStream()`, which a wrapper generator would break.
 
-Accumulation happens as the **caller** iterates (the wrapper never consumes the stream itself — no buffering, no backpressure change). Three exits funnel into exactly one `generation.end()`:
+- The wrapper never reads the stream itself. It accumulates chunks as the caller iterates, so buffering and backpressure are unchanged.
+- The generation starts when `create()` is called, with the same name, model, input and sampling parameters as a non-streaming call (`spec/direct-ingest-primacy-v1.md`). It ends exactly once, on the first of:
+  - completion: the accumulated output and usage;
+  - early exit (`break`, which calls the iterator's `return()`): the partial output accumulated so far, with `level: "default"`. The wrapper then forwards `return()` to the SDK's iterator so its connection cleanup still runs;
+  - error (`next()` rejects, or `throw()` is called): `level: "error"` with the error message as `statusMessage`, and the error is rethrown to the caller.
+- If `create()` itself throws, the generation ends as an error and the error is rethrown, as for a non-streaming call.
+- A stream the caller never iterates records its start and never ends. It appears as an in-progress generation, which is accurate: nothing was received.
+- If the returned value is not async-iterable (an unexpected SDK shape), it is returned untouched and the generation ends at once, so the wrapper does not leave it open.
+- A streamed generation that does not end in an error carries `metadata.streamed: "true"`. An error end records only the level and message.
 
-- **done** → end with accumulated output/usage
-- **early `break`** (iterator `return()`) → end with the partial output accumulated so far — the honest record of what the caller actually received
-- **mid-stream error** (`next()` rejection or `throw()`) → end with `level: "error"` and the message, then rethrow to the caller
+## OpenAI
 
-A stream the caller **never iterates** records its start event but never ends — visible as a dangling in-progress generation, which is the true representation (nothing was ever received).
+`ChatCompletionChunk` streams are accumulated per `choice.index`, because a request with `n > 1` interleaves every choice's deltas in one sequence.
 
-### OpenAI (`ChatCompletionChunk`)
+- Text: `delta.content` is concatenated per choice. `content` is null when a choice received no content delta.
+- Tool calls: `delta.tool_calls` fragments are merged by their `index` slot; `id`, `type` and `function.name` are taken when present, and `function.arguments` fragments are concatenated.
+- Usage: read from the chunk that carries `usage` (the final chunk, with empty `choices`), which OpenAI sends only when the caller sets `stream_options: { include_usage: true }`. The wrapper does not add that option: changing the request could break OpenAI-compatible backends that reject unknown fields. Without it, output is recorded and `usageDetails` is absent. `prompt_tokens` and `completion_tokens` are stored as `input_tokens` and `output_tokens`.
+- Output: with one choice (or none), the assistant message `{ role: "assistant", content: string | null, tool_calls?: [...] }`. With several, `{ choices: [{ index, message, finish_reason? }] }`, mirroring the non-streaming shape.
+- Metadata: `streamed`, `response_model` (the model reported on the chunks), and for a single choice its `finish_reason`.
 
-- Choices are accumulated **per `choice.index`** — an `n>1` request streams every choice's deltas interleaved, so reading only `choices[0]` would silently truncate the response (review finding, fixed + regression-tested). Single choice (the common case) records the assistant message directly as output; `n>1` records `{choices: [{index, message, finish_reason}]}` mirroring the non-streaming shape.
-- Text: `delta.content` concatenated per choice.
-- Tool calls: `delta.tool_calls` fragments merged by `index` slot (`function.arguments` string fragments concatenated) — agents stream tool calls constantly; dropping them would gut the feature.
-- Usage: from the final empty-`choices` chunk — **only present when the caller set `stream_options: {include_usage: true}`**. The wrapper deliberately does NOT inject that option: a tracing wrapper mutating the wire request can break OpenAI-compatible backends that reject unknown fields. Without it, output is recorded but `usageDetails` is absent.
-- Recorded output shape: `{ role: "assistant", content: string|null, tool_calls?: [...] }`; the response-model snapshot and `finish_reason` go to metadata (`response_model`, `finish_reason`), and every streamed generation carries `metadata.streamed: "true"`.
+## Anthropic
 
-### Anthropic (`RawMessageStreamEvent` protocol)
+The message is reassembled from the `RawMessageStreamEvent` protocol:
 
-Reassembles the Message from the event protocol: `message_start` (model, `usage.input_tokens`), `content_block_start`/`content_block_delta` (text blocks via `text_delta`; `tool_use` blocks via `input_json_delta` `partial_json` fragments, parsed at the end), `message_delta` (cumulative `usage.output_tokens`, `stop_reason`). Extended-thinking blocks are fully supported: `thinking_delta` text accumulates and the final `signature_delta` is captured — the signature is required to round-trip a thinking block in later turns, so dropping it would make the recorded output unusable as replay input (review finding, fixed + regression-tested). `redacted_thinking` blocks arrive complete at `content_block_start` and are kept via the unknown-block fallback. Unlike OpenAI, **streamed Anthropic calls always record full usage** — the protocol carries it unconditionally. An early break mid-tool-call keeps the raw fragment as `{__partial_json: "..."}` rather than throwing in the finalizer or dropping it. Unknown future block types are kept as-is (their deltas aren't understood, but the block's existence is data).
+- `message_start`: the response model and `usage.input_tokens` (and `usage.output_tokens` when present).
+- `content_block_start` opens a block at its index. `text`, `tool_use` (with `id` and `name`) and `thinking` blocks are accumulated. Any other block type, such as `redacted_thinking`, which arrives complete, is kept as sent.
+- `content_block_delta`: `text_delta` appends text, `input_json_delta` appends `partial_json` to a tool-use block, `thinking_delta` appends thinking text, and `signature_delta` sets the thinking block's signature. The signature is required to send a thinking block back in a later turn, so the recorded output can be replayed.
+- `message_delta`: the cumulative `usage.output_tokens` (and `usage.input_tokens` when present) and `stop_reason`.
+- Output: `{ role: "assistant", model?, content: [...blocks], stop_reason? }`. A tool-use block's `input` is parsed from its accumulated JSON (`{}` when empty). JSON that does not parse, as after a break in the middle of a tool call, is kept as `{ __partial_json: "<fragment>" }` instead of throwing in the finalizer.
+- Usage: `input_tokens` and `output_tokens` are always recorded, because the protocol carries them whether or not the caller asks. Anthropic's cache token counts are not recorded.
+- Metadata: `streamed`.
 
-Not covered: Anthropic's `messages.stream()` helper (separate request path — only `create()` is patched) and OpenAI's Responses API (`client.responses.create`, same status as the non-streaming wrapper). `recordGenerateTextResult` (Vercel AI SDK) is unchanged — it records a completed result and has no interception point; a `streamText` recorder would be a new API, out of M9 scope.
+## Not covered
 
-## Known limits (deliberate)
+- Anthropic's `messages.stream()` helper builds its own request path; only `messages.create()` is patched.
+- OpenAI's Responses API (`client.responses.create`) is not wrapped, streaming or not.
+- `recordGenerateTextResult` (Vercel AI SDK) records a completed result. It has no interception point, so there is no streaming recorder for `streamText`.
 
-- **`.tee()` + wrapped**: both branches iterate through the patched iterator, so one accumulator sees chunks twice (double-counted text). `finalize` still fires exactly once. Correct-single-stream beats a per-iterator accumulator that couldn't merge usage sanely.
-- **`toReadableStream()`/direct reader consumption** bypasses the async iterator → the generation dangles unfinished (same as never iterating).
-- No `stream_options.include_usage` auto-injection (above).
+## Known limits
 
-## Review findings (PR #39)
+- `.tee()`: both SDKs' `tee()` reads the stream's underlying iterator directly instead of `[Symbol.asyncIterator]`, so chunks read through the branches are not accumulated and the generation never ends. The branches themselves work normally.
+- `.toReadableStream()` in both SDKs iterates through `[Symbol.asyncIterator]`, so a stream consumed that way is recorded like a `for await` loop.
+- `stream_options.include_usage` is never injected (see OpenAI).
 
-Two must-fix data-loss findings, both fixed with regression tests: (1) OpenAI `n>1` streams truncated to `choices[0]`; (2) Anthropic `thinking_delta`/`signature_delta` silently dropped for extended-thinking models. Reviewer also verified: `finishOnce`-before-`inner.return()` doesn't break the SDKs' connection-abort cleanup (openai's generator `finally` still fires); the `!consumed` fallback doesn't lose input (`end()` re-emits `startOptions.input`); sparse tool-call arrays densify safely; the `never[]` constraint isn't vacuous (structurally wrong clients still fail to type-check). A second sequential full iteration of an already-consumed stream double-feeds the accumulator without re-finalizing — unreachable through the real SDKs (both throw "Cannot iterate over a consumed stream"), noted here for completeness.
+## Verified
 
-## Verification
+`packages/sdk/test/streaming.test.ts` covers OpenAI text and usage accumulation, fragmented tool-call assembly, `n > 1` streams recording every choice, early break (partial output, `level: "default"`), a mid-stream error (`level: "error"` and rethrow), and an unaffected non-streaming call; Anthropic reassembly of text and tool-use blocks with usage from `message_start` and `message_delta`, a break in the middle of a tool call, thinking and signature deltas, and a mid-stream error; and `instrumentAsyncIterable` finishing exactly once and handling a non-iterable value. `packages/sdk/test/streaming-conformance.test.ts` runs the real `openai` 6 and `@anthropic-ai/sdk` 0.111 clients (dev dependencies) against SSE from a local HTTP server through the wrapped clients, proving the in-place patch works on their `Stream` classes and the recorded shapes match what they yield; its `.tee()` test checks that both branches still yield the full stream, not what is recorded. `packages/sdk/test/wrappers.test.ts` checks that a streaming call returns the same stream object.
 
-- `packages/sdk/test/streaming.test.ts` — unit: text+usage accumulation, fragmented tool-call assembly, early break (partial output, `level: default`), mid-stream error (`level: error` + rethrow), non-streaming regression, finalize-exactly-once, non-iterable fallback.
-- `packages/sdk/test/streaming-conformance.test.ts` — the REAL `openai@6` and `@anthropic-ai/sdk@0.111` clients (devDeps) parse real SSE from a local HTTP server through the wrapped clients: proves the in-place patch works on the SDKs' actual Stream classes and the accumulated shapes are what those SDKs actually yield; includes the `.tee()`-still-works proof.
-- Full suite green.
+## History
+
+- M9-07 added streaming support. Before it, the wrappers detected `stream: true`, skipped recording, and logged a one-time warning; the M4-05 audit listed this as the largest gap in the primary SDK path (`spec/direct-ingest-primacy-v1.md`).
+- Review of PR #39 found two data-loss bugs, both fixed with regression tests: OpenAI `n > 1` streams were truncated to `choices[0]`, and Anthropic `thinking_delta`/`signature_delta` content was dropped for extended-thinking models.
+- This spec earlier stated that `.tee()` branches feed one accumulator twice and that `.toReadableStream()` bypasses the patched iterator. Against `openai` 6.46.0 and `@anthropic-ai/sdk` 0.111.0 the reverse holds, as described under Known limits.
+- Still open: a stream consumed only through `.tee()` branches is never recorded as finished.

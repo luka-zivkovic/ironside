@@ -1,51 +1,67 @@
-# LangFuse-Shaped Fetch API + Score Ingest (M8-01)
+# LangFuse-Shaped Fetch API v1
 
-Status: implemented, verified end-to-end against a real local rubrist instance. Owner: `apps/api/src/routes/langfuse-fetch.ts` (reads), `apps/api/src/routes/langfuse.ts` (`POST /public/scores`), `packages/clickhouse/src/queries.ts` (`listTracePage`, `listScoresForTrace`).
+Status: implemented. Owner: `apps/api/src/routes/langfuse-fetch.ts` (reads), `apps/api/src/routes/langfuse.ts` (`POST /api/public/scores`), `packages/clickhouse/src/queries.ts` (`listTracePage`, `getTrace`, `listObservationsForTrace`, `listScoresForTrace`).
 
 ## Purpose
 
-M8: rubrist (github.com/luka-zivkovic/rubrist) consumes traces from LangFuse-shaped APIs and posts judge verdicts back as scores. Serving those exact endpoints makes Ironside a drop-in trace source for rubrist — **zero rubrist code changes**, just an integration record pointing `endpointUrl` at the Ironside host.
+Serve LangFuse's public trace-read endpoints and its score-create endpoint, so a tool that reads traces from LangFuse and writes scores back, such as Rubrist, can use Ironside by changing only its host and key. Ironside's own LangFuse importer can read from these endpoints too. New evaluator integrations should prefer the native protocol in `spec/evaluator-integration-v1.md`.
 
-## Endpoints
+## Authentication
 
-### `GET /api/public/traces`
+- The project comes from the machine credential; no route accepts a project id.
+- The credential is sent as `Authorization: Bearer <credential>` or, as LangFuse clients do, `Authorization: Basic base64(publicKey:secretKey)` with the Ironside credential in the secret-key slot. The public-key slot is ignored.
+- `GET /api/public/traces` and `GET /api/public/traces/{id}` require `traces:read` (the Integration preset) and are not rate limited, like the native read routes.
+- `POST /api/public/scores` requires `scores:write` and shares the ingest rate limit.
+- A missing or invalid credential returns 401; a credential without the capability returns 403.
 
-LangFuse's list endpoint. Auth: an Integration credential with `traces:read`, using the same dual Bearer/Basic scheme as the compat ingest route (LangFuse clients send `Basic base64(publicKey:secretKey)`; the secret slot carries the real machine credential, the public slot is ignored).
+## `GET /api/public/traces`
 
-- Query: `page` (1-based, default 1), `limit` (default 50, max 100), `userId`, `sessionId`, `fromTimestamp`/`toTimestamp` (ISO), `orderBy` (`timestamp.asc`/`timestamp.desc`, default desc — LangFuse's default; Ironside's own importer requests asc).
-- Response: `{ data: Trace[], meta: { page, limit, totalItems, totalPages } }` — LangFuse's envelope, including the `meta` block Ironside's own importer paginates by.
-- Only settled traces are listed, using the project-effective quiet period from `spec/trace-envelope-v1.md`. This prevents rubrist from judging a half-written trace; a score posted back by rubrist does not reopen it.
-- **Page/offset pagination is unstable under concurrent inserts** — inherent to LangFuse's page-number contract, not fixable here; Ironside's native `/api/v1/traces` keeps keyset cursors for exactly this reason. Documented on `listTracePage`.
+LangFuse's list endpoint.
 
-### `GET /api/public/traces/{id}`
+- Query parameters:
+  - `page`: 1-based, at most 1,000,000,000, default 1. The cap keeps the offset far inside safe integer range.
+  - `limit`: 1 to 100, default 50.
+  - `userId`, `sessionId`, `environment`: exact-match filters.
+  - `fromTimestamp`, `toTimestamp`: ISO 8601 with an offset; inclusive bounds on the trace timestamp.
+  - `orderBy`: `timestamp.asc` or `timestamp.desc`, default `timestamp.desc` as in LangFuse. Rows sort by timestamp, then id. Ironside's own importer requests `timestamp.asc`.
+- An invalid parameter returns 400 `{ error: "invalid query", issues }`.
+- The response is LangFuse's envelope, `{ data: Trace[], meta: { page, limit, totalItems, totalPages } }`, with `totalPages = ceil(totalItems / limit)`. List items carry trace fields and payloads, not observations or scores.
+- Only settled traces are listed, using the project's effective quiet period (`spec/trace-envelope-v1.md`), so a consumer never judges a half-written trace. A score posted back does not reopen the trace.
+- Page/offset pagination is unstable under concurrent inserts: a page boundary can move between two requests. That comes with LangFuse's page-number contract; the native `/traces` routes use keyset cursors instead.
 
-LangFuse's detail endpoint: the trace plus `observations[]` and `scores[]` (flat lists, not a tree — LangFuse's shape). In-flight/reopened traces return 404 until settled again, matching the list endpoint's eligibility contract. Observation `type`/`level` and score `dataType`/`source` are emitted UPPERCASE (`GENERATION`/`DEFAULT`/`NUMERIC`/`API`), matching LangFuse's real wire format as verified against a live instance during M5 — Ironside's own importer normalizes these back down, closing the loop.
+## `GET /api/public/traces/{id}`
 
-### `POST /api/public/scores`
+LangFuse's detail endpoint: the trace fields plus `observations[]` and `scores[]` as flat lists (not a tree), each oldest first. A trace that is not settled (still being written, or reopened by a later write) returns 404 `{ error: "trace not found" }` until it settles again, as does an unknown id or another project's trace.
 
-LangFuse's score-create endpoint — rubrist's verdict sync-back target. Body: `{ id?, traceId, name, value (number|string), comment?, dataType?, metadata? }`. Translates to a native `score-upsert` ingest event and reuses the existing envelope → storage → queue → worker path unchanged; no worker changes. Numeric value → `numeric` (or `boolean` when `dataType: "BOOLEAN"` is declared), string value → `categorical`/`stringValue`. Non-string metadata values are stringified (same convention as every mapper). Returns `200 {id}`; replays with the same id are harmless ReplacingMergeTree upserts, so no 409-on-duplicate is needed (rubrist treats any 2xx as success and its idempotency ids converge).
+## Response fields
 
-## Null-omission contract (found live, not in review)
+- Observation `type` and `level`, and score `dataType` and `source`, are uppercase (`GENERATION`, `DEFAULT`, `NUMERIC`, `API`), as on LangFuse's wire. Ironside's importer lowercases them again.
+- A trace item always has `id`, `timestamp`, `tags` and `metadata`; `name`, `userId`, `sessionId`, `environment`, `release`, `version`, `input` and `output` appear only when set.
+- An observation item always has `id`, `traceId`, `type`, `startTime`, `level`, `modelParameters`, `usageDetails`, `costDetails` and `metadata`; `parentObservationId`, `name`, `endTime`, `completionStartTime`, `statusMessage`, `model`, `input` and `output` appear only when set.
+- A score item always has `id`, `traceId`, `name`, `dataType`, `source`, `timestamp` and `metadata`; `observationId`, `value`, `stringValue` and `comment` appear only when set.
+- An unset optional field omits the key instead of sending `null`. Rubrist's LangFuse schema types optional fields as optional but not nullable, so an explicit `null` fails its validation and errors the whole poll; Ironside's importer accepts either form.
+- An input or output recorded as JSON `null` (stored as the text `"null"`, distinct from SQL NULL) is returned as `null`; one never recorded is omitted.
 
-Optional trace/observation/score fields that are unset **omit the key** rather than emitting an explicit `null`. Found empirically on the very first live rubrist connection test: rubrist's LangFuse trace schema types optional fields as `z.string().optional()` — absent passes, an explicit `null` fails the union and errors the whole poll. Omission is the compatible intersection (rubrist requires absent-or-present; Ironside's own importer schema is `.nullable().optional()` and accepts either). An explicitly-recorded `null` input/output (stored as JSON text `"null"`, distinct from SQL NULL) still round-trips as a real `null`.
+## `POST /api/public/scores`
 
-## Read-side full-data fix (same batch)
+LangFuse's score-create endpoint, which Rubrist uses to write verdicts back.
 
-The native trace-tree read path (`GET /api/v1/traces/:id`) never selected `model_parameters` or `completion_start_time` — ingested and stored since M0, invisible on every read. Fixed across `ObservationRow`/`listObservationsForTrace`, `ObservationNode` (+ `modelParameters`, `completionStartTime`), `buildObservationTree`, and the trace-level fields `environment`/`release`/`version` on `TraceDetailRow`/`getTrace`/`traceTreeResponseSchema`. Consistent with the M4-05 direct-ingest primacy directive: data captured must be data readable.
+- Body: `id?`, `traceId`, `observationId?`, `name` (non-empty), `value` (a number or a non-empty string; required), `comment?`, `dataType?`, `metadata?`. Identifiers follow the native identifier rules. Other fields are ignored. An invalid body returns 400 `{ error: "invalid score payload", issues }`.
+- A numeric `value` becomes a `numeric` score, or `boolean` when `dataType` is `BOOLEAN` (any case). A string `value` becomes a `categorical` score with `stringValue`, even when `dataType` says `BOOLEAN`. `source` is always `api`. Metadata values that are not strings are JSON-stringified. The score's `timestamp` is the receive time, and a missing `id` is generated.
+- The route wraps the score as one native `score-upsert` event in an ingest batch and persists and queues it like native ingest; the worker writes it like any native score. It returns 200 `{ id }` once the batch is queued.
+- There is no 409 for a repeated id; Rubrist treats any 2xx as success. A replay with the same id replaces the earlier row when both land on the same UTC day. Because the timestamp is the receive time and ClickHouse's score key includes its date, a replay on a later UTC day stores a second row with the same id.
 
-## End-to-end DoD verification (2026-07-12, real local coeval)
+## Out of scope
 
-Ran a real coeval instance (local Postgres, mock judge — no LLM keys) against a live Ironside stack:
+LangFuse read endpoints beyond these (sessions, observation listing, daily metrics and so on) are not served; no current consumer needs them.
 
-1. Seeded 2 demo traces into Ironside via native ingest.
-2. Created the owner + default project/skill in coeval, connected a LangFuse integration with `endpointUrl: http://localhost:8788` and the Ironside key in the secret slot.
-3. Coeval's connection test (its real `listTraces({limit:1})` code path) passed — after the null-omission fix above, which its first run caught.
-4. Manual import trigger → **2/2 traces imported as cases**, both auto-judged (MockJudgeProvider), `syncBackCoverage: 1`.
-5. Both verdicts landed in Ironside ClickHouse as `coeval_verdict` score rows — value `0.92`, `pass` comment, full metadata (verdict/skillVersionId/modelBinding-stringified/judgeRunId/provider), the feedback-sync-job UUID as the score id.
-6. Round-trip: the scores are readable back via `GET /api/public/traces/demo_trace_1` in LangFuse shape.
-7. Idempotency: re-triggering the import created no duplicate cases (coeval dedups on `source_trace_id`; still 2/2).
+## Verified
 
-## Not in scope
+`apps/api/test/langfuse-fetch.test.ts` covers, for the list: 401 without a key, `{ data, meta }` newest first by default with full payloads, `orderBy=timestamp.asc`, page/limit with the right `totalPages`, the `userId` and `fromTimestamp` filters, project isolation, 400 for an invalid `orderBy`, a newly active trace hidden until the quiet period has passed, and omission of unset fields. For the detail: the trace with its observations and scores in LangFuse casing, and 404 for an unknown id and for another project's trace. For scores: a Rubrist-shaped verdict enqueued as a valid `score-upsert`, a string value becoming `categorical`, `BOOLEAN` honored for a numeric value and ignored for a string, a generated id, and 400 when `value` is missing.
 
-- rubrist's LangFuse importer reads only trace-level `input`/`output`/`metadata` — it never populates `TraceStep[]` from LangFuse-shaped sources (its own mapper's limitation, present against real LangFuse too). Ironside's detail endpoint serves full observation trees; if rubrist's mapper ever learns to read them, the data is already there.
-- LangFuse fetch endpoints beyond what rubrist + Ironside's own importer consume (sessions API, observations listing, daily metrics, etc.) — not needed by any current consumer.
+## History
+
+- M8-01 added the read endpoints and `POST /api/public/scores` so Rubrist could use Ironside as a LangFuse-shaped trace source with no Rubrist code changes. The first live connection test failed on explicit `null` fields, which led to the omission rule above.
+- The M8-01 end-to-end check ran a real local Rubrist instance (recorded at the time as coeval) with a mock judge against a live Ironside stack: its connection test passed, an import turned two seeded traces into cases, both verdicts arrived as score rows with full metadata and were readable through the detail endpoint, and a second import created no duplicate cases. At the time, Rubrist's LangFuse mapper read only trace-level input, output and metadata, not the observation trees this endpoint serves.
+- The same work made the native trace detail read (`GET /traces/:id`) return fields that were stored but never selected: observation `modelParameters` and `completionStartTime`, and trace `environment`, `release` and `version`.
+- Still open: a `POST /api/public/scores` replay that arrives on a later UTC day than the original stores a second score row, because the route has no receipt ledger like `POST /api/v1/evaluator/scores`.

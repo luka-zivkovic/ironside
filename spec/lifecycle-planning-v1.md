@@ -1,13 +1,17 @@
 # Lifecycle planning v1
 
-Status: implemented, read-only.
+Status: implemented, read-only. Owner:
+`apps/worker/src/retention/lifecycle-plan.ts`,
+`apps/worker/src/scripts/lifecycle-plan.ts`,
+`packages/clickhouse/src/lifecycle.ts`.
 
 ## Purpose
 
 Ironside stores one trace across several physical systems. A retention promise
 cannot be inferred from ClickHouse alone, and a generic bucket-age rule can
-delete evidence that is still referenced. This contract adds an operator-run,
-bounded inventory before any new destructive lifecycle executor exists.
+delete evidence that is still referenced. This contract defines an
+operator-run, bounded, read-only inventory of the data past each project's
+retention cutoff and what still protects it.
 
 Run the compiled planner in the self-hosted stack:
 
@@ -32,8 +36,9 @@ Redis, or object storage; `mode` is `dry-run` and
   expiry.
 - Append-only raw coverage/retention rows are neither scanned nor classified.
   Counting the entire unpartitioned evidence tables would make a planning
-  command itself an avoidable scalability risk. Honest `retention_expired`
-  read semantics now exist, but preparation is a separate exact-key command.
+  command itself an avoidable scalability risk. `retention_expired` read
+  semantics and exact-key intent preparation are defined separately in
+  `spec/raw-retention-intents-v1.md`.
 - Exact ClickHouse counts use a recent-date prefilter plus conservative
   30-second, 2-thread, 512 MiB, and 50-million-row query limits. A limit or
   availability failure is reported as an incomplete count with `null` values,
@@ -87,14 +92,32 @@ The manifest includes:
 - explicit exclusions and blocked reasons.
 
 Counts are a planning snapshot. Concurrent ingest may add work immediately
-after it is generated, so a future executor must repeat all safety checks at
-delete time rather than execute this manifest as a deletion list.
+after it is generated, so the manifest is never a deletion list; any executor
+must repeat all safety checks at delete time.
 
-## Follow-up preparation batch
+## Raw retention and media
 
-`spec/raw-retention-intents-v1.md` adds sticky `retention_expired` read
-semantics and a separately supplied, exact-project, capped intent-preparation
-command. It does not execute this manifest and cannot delete. The destructive
-executor remains a later, separately reviewed batch. Media GC remains deferred
+`spec/raw-retention-intents-v1.md` defines raw-object deletion: sticky
+`retention_expired` read semantics, an exact-project, capped intent preparer, a
+bounded executor that repeats every safety check at delete time, and an
+automatic worker sweep that is on by default. None of them executes this
+manifest; the sweep discovers its own candidates. Media GC remains deferred
 until references are authoritative, including a deliberate legacy-data
 migration policy.
+
+## Verified
+
+`apps/worker/test/lifecycle-plan.test.ts` covers complete pre-cutoff days,
+pending-protected raw batches, truncated pending and raw scans, independence
+from object-store ordering, the project cap with a shared raw budget,
+fail-closed ClickHouse counts, and invalid bounds.
+`packages/clickhouse/test/lifecycle.test.ts` and
+`packages/clickhouse/test/lifecycle-limits.test.ts` cover per-project cutoffs
+and the query limits.
+
+## History
+
+- The planner (Batch 2A) shipped as a read-only inventory before any
+  destructive lifecycle executor existed. Raw retention preparation, the
+  executor, and the automatic sweep followed in
+  `spec/raw-retention-intents-v1.md`.

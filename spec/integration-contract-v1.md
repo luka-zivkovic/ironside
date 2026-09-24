@@ -1,6 +1,6 @@
 # Integration Contract v1
 
-Status: implemented (issue #45). Owners: `apps/api/src/routes/otlp.ts`, `packages/mappers/src/otlp.ts`, `packages/sdk/`.
+Status: implemented. Owner: `apps/api/src/routes/otlp.ts`, `packages/mappers/src/otlp.ts`, `packages/sdk/`.
 
 ## Decision
 
@@ -32,8 +32,12 @@ The endpoint also accepts OTLP/HTTP JSON and gzip. Authentication is the same pr
 
 OpenTelemetry GenAI semantic conventions represent models, operations, inputs/outputs, token usage, provider details, and request parameters. Ironside maps those fields and preserves every remaining attribute in observation metadata.
 
-OTLP does not standardize computed monetary cost or eval/human-feedback scores. Ironside does not invent proprietary `gen_ai.*` attributes for them. Cost is derived server-side from token usage and the model name for every source, including OTLP (`spec/cost-pricing-v1.md`); applications that need an exact provider-billed figure or scores should use the `ironside` package or native JSON, either as their primary integration or alongside OTLP. Custom OTLP cost attributes are retained as metadata but are not promoted into `costDetails`.
+OTLP does not standardize computed monetary cost or eval/human-feedback scores. Ironside does not invent proprietary `gen_ai.*` attributes for them. Cost is derived server-side from token usage and the model name for native, OTLP and LangFuse-compatible ingest (`spec/cost-pricing-v1.md`); applications that need an exact provider-billed figure or scores should use the `ironside` package or native JSON, either as their primary integration or alongside OTLP. Custom OTLP cost attributes are retained as metadata but are not promoted into `costDetails`.
 
 ## Stability
 
 The upstream `gen_ai.*` semantic conventions are still marked Development. Ironside accepts the current `gen_ai.provider.name` attribute and the legacy `gen_ai.system` fallback, and it retains unknown attributes so a semconv change does not discard data. Typed mappings may grow compatibly as the upstream vocabulary stabilizes.
+
+## History
+
+- Issue #45 set the three direct-ingest surfaces and their roles.

@@ -53,6 +53,17 @@ export function formatUsd(value: number): string {
   return `$${value.toFixed(value < 1 ? 4 : 2)}`;
 }
 
+/**
+ * One trace's cost. A single request usually costs less than a cent, so this
+ * keeps four decimals where formatUsd would show "<$0.01".
+ */
+export function formatTraceCost(value: number): string {
+  if (value === 0) return "$0.00";
+  if (value < 0.0001) return "<$0.0001";
+  if (value < 1) return `$${value.toFixed(4)}`;
+  return formatUsd(value);
+}
+
 export function formatLatency(ms: number | null): string {
   if (ms === null) return "—";
   if (ms < 1000) return `${Math.round(ms)}ms`;

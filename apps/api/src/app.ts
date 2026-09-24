@@ -106,7 +106,8 @@ export function createApp(deps: AppDeps): Hono<AuthEnv> {
     cors({
       origin: deps.webOrigins,
       allowHeaders: ["Content-Type", "Authorization"],
-      allowMethods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+      // Every method a browser route uses; model prices are replaced with PUT.
+      allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
       credentials: true,
       maxAge: 600
     })

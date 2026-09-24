@@ -5,8 +5,12 @@ import { runMigrations } from "../src/migrate.js";
 import {
   claimWebhookDelivery,
   createWebhookRule,
+  getWebhookDeliveryStatus,
+  getWebhookRule,
+  markWebhookCovered,
   markWebhookDelivered,
-  markWebhookFailed
+  markWebhookFailed,
+  recordWebhookRun
 } from "../src/webhooks.js";
 
 const pool = new Pool({
@@ -177,5 +181,90 @@ describe("claimWebhookDelivery — exactly-once per settled version", () => {
     expect(first).toBeTruthy();
     expect(second).toBeTruthy();
     expect(first).not.toBe(second);
+  });
+});
+
+describe("markWebhookCovered", () => {
+  it("leaves a key that a claim cannot take, and that reads back as covered", async () => {
+    const traceId = `trace_${ulid()}`;
+    const claimed = (await claimWebhookDelivery(pool, `d_${ulid()}`, ruleId, traceId, TRACE_VERSION))!;
+    await markWebhookCovered(pool, claimed);
+
+    expect(await getWebhookDeliveryStatus(pool, ruleId, traceId, TRACE_VERSION)).toBe("covered");
+    // The 0.3.0 claim is the same statement: it takes over only failed or stale pending rows.
+    expect(await claimWebhookDelivery(pool, `d_${ulid()}`, ruleId, traceId, TRACE_VERSION)).toBeNull();
+    await pool.query(
+      "update webhook_deliveries set attempted_at = now() - interval '1 hour' where id = $1",
+      [claimed]
+    );
+    expect(await claimWebhookDelivery(pool, `d_${ulid()}`, ruleId, traceId, TRACE_VERSION)).toBeNull();
+    expect(await getWebhookDeliveryStatus(pool, ruleId, `trace_${ulid()}`, TRACE_VERSION)).toBeNull();
+  });
+});
+
+describe("recordWebhookRun", () => {
+  it("stores the run and moves the feed position only from the value the run started at", async () => {
+    const rule = await createWebhookRule(pool, {
+      id: `webhook_${ulid()}`,
+      projectId,
+      name: "cursor rule",
+      destinationUrl: "http://localhost:9999/hook",
+      signingSecretEncrypted: "unused-in-this-test",
+      filter: {}
+    });
+    expect(rule.feedCursor).toBeNull();
+    expect(rule.lastRunAt).toBeNull();
+    const first = { publishedAt: "2026-09-24T10:00:00.000001Z", traceId: "trace_a" };
+    const second = { publishedAt: "2026-09-24T10:00:00.000002Z", traceId: "trace_b" };
+
+    await recordWebhookRun(pool, rule.id, {
+      status: "success",
+      delivered: 2,
+      feedCursor: { from: null, to: first },
+      runAgainSoon: true
+    });
+    const afterFirst = (await getWebhookRule(pool, projectId, rule.id))!;
+    expect(afterFirst).toMatchObject({
+      feedCursor: first,
+      lastRunStatus: "success",
+      lastRunError: null,
+      lastRunDeliveredCount: 2
+    });
+    expect(afterFirst.nextRunAt.getTime()).toBeLessThanOrEqual(Date.now());
+
+    // A run that started from the old position (claimed twice) records its outcome but not its position.
+    await recordWebhookRun(pool, rule.id, {
+      status: "error",
+      error: "trace_b: destination responded HTTP 500",
+      delivered: 0,
+      feedCursor: { from: null, to: second }
+    });
+    expect((await getWebhookRule(pool, projectId, rule.id))!).toMatchObject({
+      feedCursor: first,
+      lastRunStatus: "error",
+      lastRunError: "trace_b: destination responded HTTP 500",
+      lastRunDeliveredCount: 0
+    });
+
+    await recordWebhookRun(pool, rule.id, {
+      status: "success",
+      delivered: 1,
+      feedCursor: { from: first, to: second }
+    });
+    expect((await getWebhookRule(pool, projectId, rule.id))!.feedCursor).toEqual(second);
+  });
+
+  it("gives a new rule its creation time as its scanner handoff", async () => {
+    const before = Date.now();
+    const rule = await createWebhookRule(pool, {
+      id: `webhook_${ulid()}`,
+      projectId,
+      name: "handoff rule",
+      destinationUrl: "http://localhost:9999/hook",
+      signingSecretEncrypted: "unused-in-this-test",
+      filter: {}
+    });
+    expect(rule.scannerHandoffAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/);
+    expect(Date.parse(rule.scannerHandoffAt)).toBeGreaterThanOrEqual(before - 5_000);
   });
 });

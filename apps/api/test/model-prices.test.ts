@@ -59,6 +59,19 @@ function authed(path: string, init?: RequestInit) {
 }
 
 describe("/api/v1/projects/:id/model-prices", () => {
+  it("allows the PUT that replaces prices from a web app on another origin", async () => {
+    const res = await app.request(`/api/v1/projects/${projectId}/model-prices`, {
+      method: "OPTIONS",
+      headers: {
+        origin: "http://localhost:5174",
+        "access-control-request-method": "PUT",
+        "access-control-request-headers": "content-type"
+      }
+    });
+    expect(res.headers.get("access-control-allow-origin")).toBe("http://localhost:5174");
+    expect(res.headers.get("access-control-allow-methods")?.split(",")).toContain("PUT");
+  });
+
   it("starts empty and reports the vendored table", async () => {
     const res = await authed(`/api/v1/projects/${projectId}/model-prices`);
     expect(res.status).toBe(200);

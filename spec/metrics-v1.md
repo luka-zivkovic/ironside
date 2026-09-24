@@ -1,44 +1,79 @@
-# Prometheus Metrics v1 (M9-02)
+# Prometheus Metrics v1
 
-Status: implemented, verified live. Owner: `apps/api/src/metrics.ts`, `apps/worker/src/metrics.ts`, `apps/worker/src/scheduler.ts` (`onRunOutcome` hook).
+Status: implemented. Owner: `apps/api/src/metrics.ts`, `apps/api/src/app.ts` (`GET /metrics`), `apps/worker/src/metrics.ts`, `apps/worker/src/index.ts` (wiring), `apps/worker/src/scheduler.ts` (`onRunOutcome`).
 
 ## Purpose
 
-First batch of M9 Phase 1 ("trustworthy to operate"): before this, the only operational visibility was `/health` and console logs — a self-hoster couldn't see ingest rates, queue backlog, or whether scheduled work was succeeding without shelling into Redis/reading logs. Both processes now export Prometheus metrics.
+Let an operator see request rates and latency, queue backlog, ingest failures and whether scheduled work succeeds, without shelling into Redis or reading logs. The API and the worker each export Prometheus metrics.
 
-## Design
+## API endpoint
 
-- **API: `GET /metrics` on the main port, disabled-by-default.** Without `METRICS_TOKEN` configured the endpoint returns 404 (indistinguishable from no-such-route); with it, requires exactly `Authorization: Bearer <token>`. Deliberately NOT project machine credentials — metrics are instance-wide, and one project shouldn't see cross-tenant request rates. Instance metrics are never exposed unauthenticated on a public port.
-- **Worker: a dedicated `:9464/metrics` listener** (`METRICS_PORT`, OTel-Prometheus-convention default) — the worker has no other HTTP surface, and per-process metrics listeners are the standard queue-consumer pattern. The port is NOT published in `docker-compose.yml`; scraping externally is an explicit opt-in (map the port + set `METRICS_TOKEN`). The listener is `unref()`'d so it never keeps the process alive on its own, same rule as the scheduler's timers.
-- **Bounded label cardinality, no per-project labels.** Request metrics label by the *matched route pattern* (`c.req.routePath`, e.g. `/api/v1/traces/:id`) — never the raw URL, so unbounded ids can't explode the label space. Project ids are deliberately excluded everywhere: unbounded cardinality is a Prometheus anti-pattern, and per-project usage questions are ClickHouse's job.
-- **The API middleware registers FIRST**, before `bodyLimit`/CORS — a 413 rejection or a preflight answered before the route layer still gets counted; registered later, anything short-circuiting ahead of it would be invisible.
-- **Queue depth is sampled at scrape time** (prom-client async `collect()` calling `queue.getWaitingCount()` etc.), not on a timer — always current, zero background work between scrapes. This required the worker to hold a `Queue` (producer-side) handle alongside its `Worker` consumer, since the consumer class doesn't expose counts.
-- **Scheduler outcomes via a new `onRunOutcome(subsystem, outcome)` hook** — additive and optional (existing tests/callers unaffected), fired once per scheduled run across all five subsystems (export/otlp-forward/webhook/import/retention) alongside the existing `onError`.
+`GET /metrics` is served on the API's main port.
+
+- Without `METRICS_TOKEN` the endpoint is disabled and returns `404` `{"error":"not found"}`. With it, a request whose `Authorization` header is not exactly `Bearer <token>` gets `401` `{"error":"unauthorized"}`; otherwise the response is the Prometheus text format.
+- Instance metrics are never served unauthenticated on the public port. The token is not a project machine credential, because metrics are instance-wide and one project must not see other tenants' request rates.
+
+## Worker listener
+
+The worker has no other HTTP surface, so it starts its own listener on `METRICS_PORT` (default `9464`), the usual pattern for queue consumers.
+
+- It serves only `GET /metrics`; any other method or path gets `404`. With `METRICS_TOKEN` set, a request without exactly `Authorization: Bearer <token>` gets `401`; without it, the listener is unauthenticated. A collection failure returns `500`.
+- A failure to bind the port (for example `EADDRINUSE`) is logged, and the worker keeps consuming ingest and running the scheduler without metrics; the listener is the process's least important surface. The listener is `unref()`'d, so it never keeps the process alive on its own.
+- `docker-compose.yml` does not publish the port; scraping from outside the Compose network is an explicit opt-in (map the port and set `METRICS_TOKEN`). The self-host bundle (`deploy/self-host/compose.yaml`) requires a token and the Coolify template (`deploy/coolify.yaml`) generates one. Both, and the worker image (`apps/worker/Dockerfile`), use the worker's `/metrics` as its container health check.
+
+## Labels and cardinality
+
+- No metric has a project label. Project ids are unbounded, which is a Prometheus anti-pattern, and would reveal tenants to anyone who can scrape. Per-project usage questions are answered from ClickHouse.
+- API request metrics label `route` with the matched route pattern (`c.req.routePath`, for example `/health`), never the raw URL, so unbounded ids cannot enter the label space. A request that no route matched, or that was answered before routing (a `bodyLimit` 413, a CORS preflight), reports the metrics middleware's own `/*` pattern and is labeled `unmatched`.
+- The API metrics middleware is registered before every other middleware and route (`bodyLimit`, CORS, authentication), so requests those reject are still counted.
 
 ## Metric inventory
 
-| Metric | Process | Notes |
+| Metric | Process | Labels | Meaning |
+|---|---|---|---|
+| `ironside_http_requests_total` | api | `route`, `method`, `status` | Requests handled |
+| `ironside_http_request_duration_seconds` | api | `route`, `method` | Request duration histogram. Buckets run from 5 ms to 5 s: ingest acknowledgements normally take 5–50 ms, and the upper buckets make a degradation visible |
+| `ironside_worker_batches_processed_total` | worker | — | Ingest jobs completed (BullMQ `completed` events) |
+| `ironside_worker_batches_failed_total` | worker | — | Ingest job failures (BullMQ `failed` events); failed jobs are retried up to the queue's attempt limit |
+| `ironside_ingest_batches_recovered_total` | worker | — | Pending ingest batches re-enqueued by ingest recovery (`spec/ingest-recovery-v1.md`) |
+| `ironside_ingest_events_dead_lettered_total` | worker | — | Ingest events the worker could not map (`spec/dead-letters-v1.md`) |
+| `ironside_ingest_queue_waiting`, `ironside_ingest_queue_active`, `ironside_ingest_queue_failed` | worker | — | Ingest queue depth by job state |
+| `ironside_scheduler_runs_total` | worker | `subsystem`, `outcome` | Scheduled runs; `outcome` is `success` or `error` |
+| `ironside_environment_registry_overflow_total` | worker | `source` (`live`, `rebuild`) | Valid new environment values left out of bounded discovery (`spec/environments-v1.md`) |
+| `process_*`, `nodejs_*` | both | — | prom-client `collectDefaultMetrics` |
+
+The queue gauges are sampled at scrape time: prom-client's async `collect()` calls `getWaitingCount()`, `getActiveCount()` and `getFailedCount()` on a producer-side BullMQ `Queue` handle the worker holds beside its consumer, since the `Worker` class does not expose counts. They are always current, and nothing runs between scrapes.
+
+`ironside_scheduler_runs_total` counts one run per value of `subsystem`:
+
+| `subsystem` | One run is | Counted as `error` when |
 |---|---|---|
-| `ironside_http_requests_total{route,method,status}` | api | matched pattern, not raw URL |
-| `ironside_http_request_duration_seconds{route,method}` | api | histogram; buckets tuned to the measured 5–50ms ACK band |
-| `ironside_worker_batches_processed_total` / `_failed_total` | worker | from the BullMQ worker's completed/failed events |
-| `ironside_ingest_queue_waiting` / `_active` / `_failed` | worker | gauges sampled live at scrape time |
-| `ironside_scheduler_runs_total{subsystem,outcome}` | worker | five subsystems × success/error |
-| `process_*` / `nodejs_*` defaults | both | prom-client `collectDefaultMetrics` |
+| `export` | a claimed export config | the run or its setup throws, or the claim query fails |
+| `otlp-forward` | a claimed forward rule | the run throws, any trace failed or was skipped, or the claim query fails |
+| `webhook` | a claimed webhook rule | the run throws, a delivery failed, or the claim query fails |
+| `import` | a claimed import source | the run or its setup throws, or the imports tick itself fails |
+| `environment-registry` | a claimed rebuild chunk | the chunk throws, or the claim query fails |
+| `retention` | a `runRetention` pass | the pass throws |
+| `ingest-recovery` | an ingest recovery pass | the pass throws |
+| `raw-retention` | a raw retention sweep, only while raw retention is enabled | the sweep throws or reports any project or object error |
 
-## Verification
+A failure recovering one abandoned evaluator import goes only to the scheduler's `onError`; a failed recovery query counts as an `import` error. See `spec/scheduler-v1.md` for where each run records its outcome.
 
-- `apps/api/test/metrics.test.ts` (4 tests): 404 when unconfigured, 401 on missing/wrong token, Prometheus text with route-pattern labels and the raw trace id provably absent from the output, and pre-route rejections (auth 401s) counted — proving the middleware-first registration.
-- `apps/worker/test/metrics.test.ts` (3 tests): counters + live queue gauges served over the real HTTP listener against the real Redis-backed queue, token gating, non-`GET /metrics` requests 404.
-- **Live**: started compiled api+worker with `METRICS_TOKEN` set; API `/metrics` 401'd without the token and served with it (the 401 itself visible in the counters — middleware-first proven live); worker `:9464/metrics` showed real activity (136 batches drained at startup, `scheduler_runs_total{subsystem="retention",outcome="success"} 1`); a 150-request ingest burst appeared as `{route="/api/v1/ingest",status="202"} 139+` (driver pacing under target, as usual).
-- Full suite green; `docker compose config` validates the new env passthrough.
+## Configuration
 
-## Two review findings, fixed and regression-tested
+| Variable | Process | Default | Effect |
+|---|---|---|---|
+| `METRICS_TOKEN` | api, worker | unset | API: enables `GET /metrics` and sets its bearer token. Worker: sets the listener's bearer token; unset leaves it unauthenticated |
+| `METRICS_PORT` | worker | `9464` | Port of the worker's metrics listener |
 
-1. **The `?? "unmatched"` fallback was dead code.** For a 404 (or a bodyLimit 413 / CORS preflight short-circuited before the route layer), Hono's `routePath` reports the metrics middleware's own `"*"` registration as `"/*"` — never `undefined` — so the fallback could never fire and unmatched traffic would have been labeled with the misleading `"/*"`. Fixed by explicitly mapping `"/*"` → `"unmatched"`; regression-tested (reverted the fix, confirmed the test fails with `route="/*"` present).
-2. **A metrics-port bind failure crashed the whole worker.** `server.listen(port)` with no `'error'` handler turns EADDRINUSE into an uncaughtException, killing the ingest consumer and scheduler over the process's LEAST important surface. Fixed with an error handler that logs and continues without metrics; tested by binding two listeners to the same port and asserting the process survives and the first listener still serves.
+## Verified
 
-## Not yet done (deliberate)
+`apps/api/test/metrics.test.ts` covers `404` without a token, `401` for a missing or wrong token, Prometheus text with route-pattern labels and default process metrics and without the raw trace id of a request, unmatched requests labeled `unmatched` and never `/*`, and an ingest request rejected with `401` by authentication still being counted. `apps/worker/test/metrics.test.ts` serves the counters, including recovered batches, scheduler runs and environment overflow, and the live queue gauges from a real Redis-backed queue over the HTTP listener. It also covers token gating, a second listener failing to bind a taken port without crashing the process while the first keeps serving, and `404` for anything other than `GET /metrics`.
 
-- No alerting rules/Grafana dashboard shipped — `docs/self-hosting.md`'s Monitoring section names the two signals that matter (sustained `queue_waiting` > 0 → add workers; rising `queue_failed` → investigate); packaging dashboards is post-MVP.
-- No per-project usage metrics — by design (cardinality + tenant isolation); ClickHouse aggregates cover that.
+## History
+
+- M9-02 added the API endpoint, the worker listener, and the request, batch, queue-depth and scheduler-run metrics.
+- The route label first fell back with `?? "unmatched"`, which never fired: Hono reports the middleware's own `/*` pattern for an unmatched request, so such requests were labeled `/*`. The middleware now maps `/*` to `unmatched`.
+- A bind failure on the worker's metrics port used to crash the worker, because the listener had no `error` handler. It now logs and continues.
+- Later features added `ironside_ingest_events_dead_lettered_total` (M9-03), `ironside_ingest_batches_recovered_total` (ingest recovery), `ironside_environment_registry_overflow_total` (observed environments), and the `environment-registry`, `ingest-recovery` and `raw-retention` scheduler subsystems.
+- Still open: no alerting rules or dashboards are shipped. The Monitoring section of `docs/self-hosting.md` names the signals to watch: a sustained non-zero `ironside_ingest_queue_waiting` means add workers, and a rising `ironside_ingest_queue_failed` needs investigation.

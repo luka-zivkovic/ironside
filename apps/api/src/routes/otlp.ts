@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 import type { IngestBatch, IngestEvent, QueueMessage } from "@ironside/shared";
 import {
@@ -22,10 +21,6 @@ export interface OtlpDeps {
   queue: Queue<QueueMessage>;
 }
 
-function contentHash(value: unknown): string {
-  return createHash("sha256").update(JSON.stringify(value) ?? "null").digest("hex");
-}
-
 /**
  * POST /v1/otel/traces — OTLP/HTTP trace ingest, both wire encodings
  * (application/x-protobuf and application/json). Same fast-ACK design as
@@ -37,8 +32,7 @@ function contentHash(value: unknown): string {
  * A protobuf body is decoded into the OTLP/JSON object shape first
  * (src/otlp-proto.ts), so validation, the stored raw envelope, and the
  * worker are one shared path — the raw log stays JSON regardless of wire
- * encoding, and the same export hashes to the same idempotency key either
- * way. gzip content-encoding is accepted for both (the OTel Collector's
+ * encoding. gzip content-encoding is accepted for both (the OTel Collector's
  * otlphttp exporter compresses by default).
  *
  * Per the OTLP/HTTP spec, a success response uses the request's
@@ -113,12 +107,13 @@ export function otlpRoutes(deps: OtlpDeps): Hono<AuthEnv> {
     const batchId = ulid();
     const receivedAt = new Date();
 
+    const eventId = ulid();
     const event: IngestEvent = {
-      id: ulid(),
+      id: eventId,
       type: "otlp-export",
       source: "otlp",
       schemaVersion: INGEST_SCHEMA_VERSION,
-      idempotencyKey: contentHash(parsed.data),
+      idempotencyKey: eventId,
       body: parsed.data
     };
 

@@ -47,7 +47,8 @@ below are complete.
 
 - Replay jobs that re-enqueue selected immutable raw batches through the
   normal processing pipeline.
-- Streaming-aware provider wrappers and broader SDK coverage.
+- Broader SDK coverage, including streams split with `.tee()`, which the
+  streaming wrappers do not record yet.
 - End-user feedback capture for ratings, comments, and other trace-linked
   scores.
 - Additional export formats and operational controls in the web interface.

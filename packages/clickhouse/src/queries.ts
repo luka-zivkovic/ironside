@@ -12,6 +12,20 @@ export interface TraceFilter {
   metadataKey?: string;
   metadataValue?: string;
   /**
+   * Case-insensitive substring of the trace's name, input or output, or of
+   * any of its observations' names, inputs or outputs; or an exact trace id.
+   * Inputs and outputs are matched as their stored JSON text.
+   */
+  search?: string;
+  /** Traces with at least one observation at this level. */
+  level?: string;
+  /** Traces with at least one observation of this model. */
+  model?: string;
+  /** Traces whose duration (see TRACE_DURATION_MS) is at least this long. */
+  minDurationMs?: number;
+  /** Traces whose total cost (see OBSERVATION_COST) is at least this, in USD. */
+  minCost?: number;
+  /**
    * Only include traces whose latest ingest activity is at or before this
    * instant. Activity includes trace and observation writes. Scores are
    * downstream annotations and deliberately do not reopen a trace. This is
@@ -53,11 +67,56 @@ function traceActivityQuery(traceIdParam?: string, traceIdsParam?: string): stri
   `;
 }
 
+/**
+ * One observation's cost in USD: its `total` component when it reports one
+ * (derived and LangFuse costs always do), otherwise the sum of its components.
+ * Kept Decimal so sums are exact: in Float64, 0.7 + 0.1 falls just short of a
+ * 0.8 floor.
+ */
+const OBSERVATION_COST = `if(mapContains(cost_details, 'total'),
+  cost_details['total'],
+  arraySum(mapValues(cost_details)))`;
+
+/**
+ * One observation's token count in the canonical usage vocabulary
+ * (spec/usage-keys-v1.md): `total_tokens` when reported, otherwise input plus
+ * output. Other keys, such as cache reads, can overlap those two and are left
+ * out rather than double counted.
+ */
+const OBSERVATION_TOKENS = `if(mapContains(usage_details, 'total_tokens'),
+  usage_details['total_tokens'],
+  usage_details['input_tokens'] + usage_details['output_tokens'])`;
+const OBSERVATION_HAS_TOKENS = `(mapContains(usage_details, 'total_tokens')
+  or mapContains(usage_details, 'input_tokens')
+  or mapContains(usage_details, 'output_tokens'))`;
+
+/**
+ * A trace's duration in milliseconds, aggregated over its observations: first
+ * start to last end. Null when no observation has ended, the same rule as
+ * getAggregates' latency percentiles.
+ */
+const TRACE_DURATION_MS = "dateDiff('millisecond', min(start_time), max(end_time))";
+
+/** Trace ids with an observation matching `condition` in the filtered project. */
+function tracesWithObservations(condition: string): string {
+  return `id in (
+    select trace_id from observations final
+    where project_id = {projectId:String} and ${condition}
+  )`;
+}
+
+/** Trace ids whose observations, grouped per trace, satisfy `having`. */
+function tracesWhereObservations(having: string): string {
+  return `id in (
+    select trace_id from observations final
+    where project_id = {projectId:String}
+    group by trace_id
+    having ${having}
+  )`;
+}
+
 /** Shared by listTraces and getAggregates — same filter surface, different projection. */
-function buildTraceConditions(
-  filter: TraceFilter,
-  options: { includeSettledCondition?: boolean } = {}
-): {
+function buildTraceConditions(filter: TraceFilter): {
   conditions: string[];
   params: Record<string, unknown>;
 } {
@@ -93,8 +152,38 @@ function buildTraceConditions(
     params.metadataKey = filter.metadataKey;
     params.metadataValue = filter.metadataValue;
   }
+  // The observation filters below scan the project's observations, which are
+  // partitioned by their own start time rather than the trace's timestamp.
+  if (filter.search) {
+    const matches = (column: string) => `positionCaseInsensitiveUTF8(${column}, {search:String}) > 0`;
+    conditions.push(`(
+      id = {search:String}
+      or ${matches("name")} or ${matches("input")} or ${matches("output")}
+      or ${tracesWithObservations(`(${matches("name")} or ${matches("input")} or ${matches("output")})`)}
+    )`);
+    params.search = filter.search;
+  }
+  if (filter.level) {
+    conditions.push(tracesWithObservations("level = {level:String}"));
+    params.level = filter.level;
+  }
+  if (filter.model) {
+    conditions.push(tracesWithObservations("model = {model:String}"));
+    params.model = filter.model;
+  }
+  if (filter.minDurationMs !== undefined) {
+    conditions.push(tracesWhereObservations(`${TRACE_DURATION_MS} >= {minDurationMs:Int64}`));
+    params.minDurationMs = filter.minDurationMs;
+  }
+  if (filter.minCost !== undefined) {
+    conditions.push(
+      tracesWhereObservations(`sum(${OBSERVATION_COST}) >= toDecimal128({minCost:String}, 9)`)
+    );
+    // As decimal text: converting a Float64 truncates, so 1.001 would become 1.000999999.
+    params.minCost = filter.minCost.toFixed(9);
+  }
 
-  if (filter.settledBefore && options.includeSettledCondition !== false) {
+  if (filter.settledBefore) {
     conditions.push(`id in (
       select trace_id
       from (${traceActivityQuery()})
@@ -228,68 +317,58 @@ export async function listTraces(
   return rows.map((row) => ({ ...row, timestamp: fromClickHouseDateTime(row.timestamp) }));
 }
 
-export interface ExportTraceRow {
-  id: string;
-  timestamp: string;
-  name: string | null;
-  user_id: string | null;
-  session_id: string | null;
-  tags: string[];
-  metadata: Record<string, string>;
-  input: string | null;
-  output: string | null;
-  /** Stable version for one settled snapshot; advances on any later trace activity. */
-  last_activity_at: string;
+/**
+ * ClickHouse ignores skip indexes under FINAL by default. Enabling them is
+ * safe for these lookups because they filter only on id and trace_id, which
+ * every version of a row shares, so no newer version can be skipped while an
+ * older one is kept.
+ */
+const SKIP_INDEXES_WITH_FINAL = { use_skip_indexes_if_final: 1 } as const;
+
+export interface TraceMetricsRow {
+  trace_id: string;
+  /** Null when no observation has ended. */
+  duration_ms: number | null;
+  /** Null when no observation reports a cost. */
+  total_cost: number | null;
+  /** Null when no observation reports input, output or total tokens. */
+  total_tokens: number | null;
+  error_count: number;
+  models: string[];
 }
 
 /**
- * Fetches ALL traces matching a filter (no pagination) for a bulk export.
- * Buffered via .json() rather than streamed — acceptable at current scale;
- * a very large export should switch to ResultSet.stream() (see
- * @clickhouse/client's Row streaming API) before this becomes a memory
- * concern. FINAL is required here: retention uses the engine's tombstone
- * column, so reading physical rows directly could export a deleted trace
- * and treat its deletion marker as a new settled version.
+ * Per-trace figures for one page of the trace list, computed from each
+ * trace's observations with the same rules the list filters use. A trace
+ * with no observations has no row.
  */
-export async function exportTraces(
+export async function listTraceMetrics(
   client: ClickHouseClient,
-  filter: TraceFilter
-): Promise<ExportTraceRow[]> {
-  // The activity join both gates incomplete traces and returns the settled
-  // snapshot version used by webhook exactly-once delivery. Keep the normal
-  // trace predicates inside a subquery so their existing unqualified column
-  // names remain unambiguous after the join.
-  const { conditions, params } = buildTraceConditions(filter, {
-    includeSettledCondition: false
-  });
-  if (filter.settledBefore) {
-    params.settledBefore = toClickHouseDateTime(filter.settledBefore);
-  }
-
+  projectId: string,
+  traceIds: string[]
+): Promise<Map<string, TraceMetricsRow>> {
+  if (traceIds.length === 0) return new Map();
   const result = await client.query({
+    // 64-bit integers serialize as JSON strings; the display figures are cast
+    // to Float64 so they arrive as numbers, like getAggregates' sums.
     query: `
-      select t.id, t.timestamp, t.name, t.user_id, t.session_id, t.tags,
-             t.metadata, t.input, t.output,
-             activity.last_activity_at as last_activity_at
-      from (
-        select id, timestamp, name, user_id, session_id, tags, metadata, input, output
-        from traces final
-        where ${conditions.join(" and ")}
-      ) as t
-      inner join (${traceActivityQuery()}) as activity on activity.trace_id = t.id
-      ${filter.settledBefore ? "where activity.last_activity_at <= {settledBefore:DateTime64(6)}" : ""}
-      order by t.timestamp asc, t.id asc
+      select
+        trace_id,
+        toFloat64(${TRACE_DURATION_MS}) as duration_ms,
+        if(countIf(notEmpty(cost_details)) = 0, null, toFloat64(sum(${OBSERVATION_COST}))) as total_cost,
+        if(countIf(${OBSERVATION_HAS_TOKENS}) = 0, null, toFloat64(sum(${OBSERVATION_TOKENS}))) as total_tokens,
+        toUInt32(countIf(level = 'error')) as error_count,
+        arraySort(groupUniqArrayIf(assumeNotNull(model), model is not null)) as models
+      from observations final
+      where project_id = {projectId:String} and trace_id in {traceIds:Array(String)}
+      group by trace_id
     `,
-    query_params: params,
+    query_params: { projectId, traceIds: [...new Set(traceIds)] },
+    clickhouse_settings: SKIP_INDEXES_WITH_FINAL,
     format: "JSONEachRow"
   });
-
-  const rows = await result.json<ExportTraceRow>();
-  return rows.map((row) => ({
-    ...row,
-    timestamp: fromClickHouseDateTime(row.timestamp),
-    last_activity_at: fromClickHouseDateTime(row.last_activity_at)
-  }));
+  const rows = await result.json<TraceMetricsRow>();
+  return new Map(rows.map((row) => [row.trace_id, row]));
 }
 
 export interface TraceDetailRow {
@@ -620,14 +699,6 @@ export async function listObservationsForTrace(
       : null
   }));
 }
-
-/**
- * ClickHouse ignores skip indexes under FINAL by default. Enabling them is
- * safe for these lookups because they filter only on id and trace_id, which
- * every version of a row shares, so no newer version can be skipped while an
- * older one is kept.
- */
-const SKIP_INDEXES_WITH_FINAL = { use_skip_indexes_if_final: 1 } as const;
 
 /** A stored row with its exact ReplacingMergeTree version, as ClickHouse renders DateTime64(6). */
 export type StoredTraceRow = TraceDetailRow & { event_ts: string };

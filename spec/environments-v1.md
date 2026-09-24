@@ -1,10 +1,14 @@
 # Observed environments v1
 
-Issue #66 implements the environment decision from #61. An environment is a
-case-sensitive trace attribute inside one project. It is never an
-authorization, credential, retention, quota, destination, or configuration
-boundary. Use environments when those policies are shared; use separate
-projects when any policy or isolation boundary differs.
+Status: implemented. Owner: `packages/shared/src/environment.ts`,
+`packages/db/src/environments.ts`,
+`apps/worker/src/environments/environment-registry.ts`,
+`apps/api/src/routes/environments.ts`.
+
+An environment is a case-sensitive trace attribute inside one project. It is
+never an authorization, credential, retention, quota, destination, or
+configuration boundary. Use environments when those policies are shared; use
+separate projects when any policy or isolation boundary differs.
 
 ## Canonical value
 
@@ -116,13 +120,22 @@ switch. The selector shows visible registry names plus a synthetic selected
 option for a hidden, overflow-only, or not-yet-observed deep link. Applying or
 clearing user/session/tag filters does not erase the environment parameter.
 
-## Verification
+## Verified
 
 Tests cover normalization boundaries and Unicode, native/OTLP/LangFuse mapping,
 OTLP precedence, exact list/aggregate agreement, project isolation, concurrent
 100-row admission, updates at capacity, owner-only visibility, no manual
 creation, worker observation ordering, resumable retained-data rebuilds,
 hide-preserving deletion of expired names, 101-value overflow, bounded metrics,
-and URL/deep-link preservation. The existing Node-only web test setup still
-does not provide browser component interaction tests; pure URL/option helpers
-and the full TypeScript build pin that state contract.
+and URL/deep-link preservation. The main files are
+`packages/shared/test/environment.test.ts`,
+`packages/db/test/environments.test.ts`,
+`apps/worker/test/environment-registry.test.ts`,
+`apps/api/test/traces.test.ts`, `apps/api/test/projects.test.ts`, and
+`apps/web/test/project-context.test.ts`. The Node-only web test setup does not
+provide browser component interaction tests; pure URL/option helpers and the
+full TypeScript build pin that state contract.
+
+## History
+
+- Issue #66 implemented the environment decision from #61.

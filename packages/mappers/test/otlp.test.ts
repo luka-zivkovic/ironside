@@ -58,6 +58,17 @@ describe("otlpExportTraceServiceRequestSchema", () => {
   it("accepts an empty export (no resourceSpans)", () => {
     expect(otlpExportTraceServiceRequestSchema.parse({}).resourceSpans).toEqual([]);
   });
+
+  it("rejects a span timestamp that is not unsigned integer nanoseconds, which the mapper could not convert", () => {
+    for (const startTimeUnixNano of ["soon", "-1", "1.5e18", "", "123456789012345678901"]) {
+      const request = otlpRequest();
+      request.resourceSpans[0]!.scopeSpans[0]!.spans[0]!.startTimeUnixNano = startTimeUnixNano;
+      expect(otlpExportTraceServiceRequestSchema.safeParse(request).success, startTimeUnixNano).toBe(false);
+    }
+    const request = otlpRequest();
+    request.resourceSpans[0]!.scopeSpans[0]!.spans[0]!.endTimeUnixNano = "not-a-time";
+    expect(otlpExportTraceServiceRequestSchema.safeParse(request).success).toBe(false);
+  });
 });
 
 describe("mapOtlpTraceRequest", () => {
@@ -90,6 +101,31 @@ describe("mapOtlpTraceRequest", () => {
     expect(generation?.model).toBe("gpt-4o");
     expect(generation?.usageDetails).toEqual({ input_tokens: 120, output_tokens: 340 });
     expect(generation?.metadata["gen_ai.provider.name"]).toBe("openai");
+  });
+
+  it("stores token counts as the usage column needs them: doubles rounded, negative or non-finite values dropped", () => {
+    const request = otlpExportTraceServiceRequestSchema.parse(
+      otlpRequest({
+        childAttrs: [
+          { key: "gen_ai.request.model", value: { stringValue: "gpt-4o" } },
+          { key: "gen_ai.usage.input_tokens", value: { doubleValue: 120.6 } },
+          { key: "gen_ai.usage.output_tokens", value: { doubleValue: -3 } }
+        ]
+      })
+    );
+    const generation = mapOtlpTraceRequest("proj_x", request).observations.find((o) => o.id === "a1b2c3d4e5f60718");
+    expect(generation?.usageDetails).toEqual({ input_tokens: 121 });
+
+    const nonFinite = otlpExportTraceServiceRequestSchema.parse(
+      otlpRequest({
+        childAttrs: [
+          { key: "gen_ai.request.model", value: { stringValue: "gpt-4o" } },
+          { key: "gen_ai.usage.input_tokens", value: { intValue: "lots" } }
+        ]
+      })
+    );
+    const noUsage = mapOtlpTraceRequest("proj_x", nonFinite).observations.find((o) => o.id === "a1b2c3d4e5f60718");
+    expect(noUsage?.usageDetails).toBeUndefined();
   });
 
   it("maps the modern deployment environment, with legacy fallback only when modern is absent", () => {

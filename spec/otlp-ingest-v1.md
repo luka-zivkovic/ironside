@@ -1,52 +1,87 @@
 # OTLP Trace Ingest v1
 
-Status: implemented (M3-01/M3-02; protobuf encoding added in M9-06; canonical third-party role documented in issue #45). Owner: `packages/shared/src/otlp.ts`, `packages/mappers/src/otlp.ts`, `apps/api/src/routes/otlp.ts`, `apps/api/src/otlp-proto.ts`.
+Status: implemented. Owner: `apps/api/src/routes/otlp.ts`, `apps/api/src/otlp-proto.ts`, `packages/shared/src/otlp.ts`, `packages/mappers/src/otlp.ts`.
 
-This is Ironside's canonical integration surface for third-party frameworks and services. Emit standard OpenTelemetry traces with `gen_ai.*` semantic-convention attributes instead of depending on an Ironside-specific client library. Node.js applications that want provider wrappers, manual lifecycle handles, cost fields, or scores should use the `ironside` package; see `spec/integration-contract-v1.md`.
+## Purpose
+
+Accept OpenTelemetry traces over OTLP/HTTP and map them, including the `gen_ai.*` semantic-convention attributes, into Ironside traces and observations. This is the canonical integration surface for third-party frameworks and services: they emit standard OpenTelemetry instead of depending on an Ironside client library. Node.js applications that want provider wrappers, manual lifecycle handles, client-reported cost, or scores use the `ironside` package. `spec/integration-contract-v1.md` sets the role of each ingest surface.
 
 ## Endpoint
 
-`POST /v1/otel/traces` — top-level, not nested under `/api/v1` (matches the path OTel exporters expect, and how LangFuse/LangSmith expose OTLP ingest separately from their native API). Bearer-authenticated like every other ingest path.
+`POST /v1/otel/traces`. The path is top level, not under `/api/v1`, like other platforms that expose OTLP separately from their native API. It is not the exporters' default `/v1/traces` path, so the endpoint must be configured. Clients configure the signal-specific traces endpoint (`spec/integration-contract-v1.md`).
 
-- Accepts both OTLP/HTTP encodings (M9-06): `Content-Type: application/x-protobuf` (what most OTel exporters send by default) and `application/json`. Anything else returns 415.
-- `Content-Encoding: gzip` is accepted for both (the OTel Collector's `otlphttp` exporter compresses by default); other encodings return 415 (including multi-token values like `gzip, identity`, which no real exporter sends). A gzip-declared body that isn't gzip returns 400. **Decompressed size is capped at the same 10MB as the wire-size bodyLimit** (`gunzipSync` `maxOutputLength` → 413) — gzip reaches ~1000:1 on repetitive input, so without the cap a ~200KB compressed body could expand to 200MB in one synchronous allocation (PR #38 review finding, regression-tested with a real 64MB bomb).
-- Success: `200` in the request's content-type, per spec — protobuf-in gets a serialized empty `ExportTraceServiceResponse` (zero bytes — all-defaults message), JSON-in gets `{}`. No `partial_success` is ever set: acceptance is all-or-nothing at this edge (per-event failures surface later via dead letters, spec/dead-letters-v1.md).
-- Malformed payload: `400` with Zod issues (or a protobuf decode error message). Per OTLP spec, 400 is non-retryable — clients should not resend the same malformed payload.
-- **Known protobuf/JSON asymmetry, pinned deliberately**: a protobuf span with `start_time_unix_nano` unset or 0 (the proto3 zero-default, omitted by decode) is rejected 400 because `startTimeUnixNano` is schema-required, while a JSON body sending the string `"0"` explicitly is accepted. A compliant exporter always sets a real timestamp (the proto's own comment calls the field "semantically required"), and a 1970-epoch start time is garbage better rejected than stored — regression-tested rather than papered over with `defaults: true` (which would also materialize empty arrays and zero enums everywhere).
-- **Spec deviation, deliberate**: error responses are JSON regardless of request encoding. The OTLP spec prefers a `google.rpc.Status` in the request's encoding, but real exporters only log error bodies, and a readable JSON error beats an opaque binary one; vendoring `status.proto`+`any.proto` to encode what no client parses wasn't worth it.
+- Authentication: a project machine credential with the `ingest` capability, as a bearer token (`spec/scoped-machine-credentials-v1.md`). Requests count against the project's shared write rate limit (`spec/rate-limiting-quotas-retention-v1.md`).
+- Encodings: `Content-Type: application/x-protobuf`, which most exporters send by default, or `application/json`. Any other content type returns 415.
+- Compression: `Content-Encoding: gzip` is accepted for both encodings; `identity` or no header means uncompressed. Any other value returns 415, including lists such as `gzip, identity`. A body declared gzip that is not valid gzip returns 400.
+- Size: the wire body is limited to 10 MiB (`MAX_REQUEST_BODY_BYTES`, 413). A gzip body is limited to the same 10 MiB after decompression (`gunzipSync` `maxOutputLength`, 413), because gzip reaches about 1000:1 on repetitive input and a small compressed body could otherwise expand to hundreds of megabytes in one allocation.
+- Validation: the decoded body must match `otlpExportTraceServiceRequestSchema`. A failure returns 400 with `{ error, issues }` holding the Zod issues, or with an error message when the protobuf does not decode. Per the OTLP spec, 400 is not retryable. Attribute values may nest at most 32 levels (`MAX_ATTRIBUTE_VALUE_DEPTH`); deeper values are rejected so recursive validation cannot overflow the stack. `startTimeUnixNano` and `endTimeUnixNano` must be unsigned integer nanoseconds as decimal text (at most 20 digits), since the worker converts them to dates.
+- Success: 200 in the request's encoding. A protobuf request gets a serialized empty `ExportTraceServiceResponse` (zero bytes, `application/x-protobuf`); a JSON request gets `{}`. `partial_success` is never set: an export is accepted whole or rejected with 400. A failure in the worker surfaces later as a dead letter (`spec/dead-letters-v1.md`).
+- Error bodies are JSON whatever the request encoding. This deviates from the OTLP spec, which prefers a `google.rpc.Status` in the request's encoding; exporters only log error bodies, so a readable JSON error serves them better.
 
-### Protobuf decode path (M9-06)
+## Protobuf decoding
 
-A binary body is decoded (`apps/api/src/otlp-proto.ts`, protobufjs against vendored `.proto` files — `apps/api/proto/`, pinned to opentelemetry-proto v1.10.0, Apache-2.0) into the **same OTLP/JSON object shape** the JSON path receives: int64s as decimal strings, trace/span ids hex-encoded, other bytes base64. Everything downstream of the content-type branch — Zod validation, the stored raw envelope (still JSON), the worker mapper — is one shared code path. Consequence: the same export sent as protobuf and as JSON produces byte-identical stored events and the **same idempotency key** (the hash is computed post-conversion), proven by a parity test. Conformance is tested against the real `@opentelemetry/exporter-trace-otlp-proto` exporter over a real HTTP server, not hand-rolled fixtures (`apps/api/test/otlp-protobuf.test.ts`).
+`apps/api/src/otlp-proto.ts` decodes a binary body with protobufjs against `.proto` files vendored in `apps/api/proto/` (opentelemetry-proto v1.10.0, Apache-2.0). The result has the same shape as a JSON body: camelCase keys, int64 values as decimal strings, `traceId`/`spanId`/`parentSpanId` as hex, and other bytes as base64. Validation, the stored event, and the worker mapper are one shared path after decoding, so the same export sent as protobuf and as JSON stores an identical event body.
 
-## Wire format notes (easy to get wrong)
+Proto3 omits zero-valued fields, so a protobuf span whose `start_time_unix_nano` is unset or 0 decodes without `startTimeUnixNano` and is rejected with 400, because the schema requires that field. A JSON body that sends `"0"` explicitly is accepted. The asymmetry is intentional: a compliant exporter always sets a start time (the proto comment calls it semantically required), and decoding with defaults filled in would also materialize empty arrays and zero enums throughout the message.
 
-- Field casing is **camelCase** (standard protobuf JSON mapping): `resourceSpans`, `scopeSpans`, `startTimeUnixNano`.
-- `traceId`/`spanId`/`parentSpanId` are **hex strings**, not base64 — OTLP overrides the protobuf JSON default for these two fields specifically.
-- `startTimeUnixNano`/`endTimeUnixNano` are **stringified int64 nanoseconds** (JSON numbers can't hold full nanosecond precision). Converted to ISO-8601 via `unixNanoToIso` using `BigInt` division, not float math.
-- Attribute values are a oneof: `{stringValue}` / `{intValue}` (also a string) / `{doubleValue}` / `{boolValue}` / `{arrayValue}` / `{kvlistValue}` / `{bytesValue}` (base64 — this one *does* use standard base64).
+## Wire format
+
+- Field names are camelCase, per the protobuf JSON mapping: `resourceSpans`, `scopeSpans`, `startTimeUnixNano`.
+- `traceId`, `spanId` and `parentSpanId` are hex strings, not base64; OTLP overrides the protobuf JSON default for these fields.
+- `startTimeUnixNano` and `endTimeUnixNano` are int64 nanoseconds as decimal strings, because JSON numbers cannot hold nanosecond precision. `unixNanoToIso` converts them to ISO-8601 milliseconds with `BigInt` floor division, not float arithmetic.
+- An attribute value is exactly one of `stringValue`, `intValue` (a string or number), `doubleValue`, `boolValue`, `bytesValue` (standard base64), `arrayValue`, or `kvlistValue`.
+
+## Storage
+
+One request becomes one ingest event of type `otlp-export` with `source: "otlp"` and goes through the same envelope, raw storage, and queue as native ingest (`spec/trace-envelope-v1.md`): the API writes the raw batch and its pending intent to object storage and enqueues it before answering 200. The event is not split per span at the API; one export can hold spans from many traces, and the worker's mapper expands it into trace and observation rows.
+
+The event `body` is the export as parsed by `otlpExportTraceServiceRequestSchema`. It keeps resource attributes, scope name, and each span's ids, name, kind, times, attributes, status and events. Fields the schema does not declare, such as span links, `traceState`, `flags`, dropped-attribute counts, `schemaUrl`, and scope version, are not stored.
 
 ## Mapping to the domain model
 
-A span with no `parentSpanId` is the trace root — its `traceId` becomes the `Trace.id`, its own attributes/timing become both the Trace *and* an Observation (nothing is discarded by "promoting" it). Every span becomes an `Observation`; `parentSpanId` becomes `parentObservationId`.
+`mapOtlpTraceRequest` (`packages/mappers/src/otlp.ts`) maps each span:
 
-`gen_ai.*` attributes (still **Development/unstable** upstream as of 2026 — `gen_ai.system` was renamed to `gen_ai.provider.name` mid-spec) populate typed fields when present:
-- `gen_ai.request.model` / `gen_ai.response.model` → `Observation.model`
-- `gen_ai.usage.input_tokens` / `gen_ai.usage.output_tokens` → `Observation.usageDetails`
-- `gen_ai.request.temperature` / `.max_tokens` / `.top_p` / `.top_k` / `.frequency_penalty` / `.presence_penalty` / `.seed` → `Observation.modelParameters` (M4 direct-ingest-primacy audit; verified against the live `open-telemetry/semantic-conventions-genai` registry). `gen_ai.request.stop_sequences` is a string array and modelParameters values are scalar-only, so it isn't specially typed — it still survives in `metadata`, per the fallback below.
-- `gen_ai.input.messages` / `gen_ai.output.messages` → `Observation.input` / `Observation.output` when they contain the standard OpenTelemetry message arrays. Both span encodings allowed upstream are accepted: structured OTLP `arrayValue`/`kvlistValue`, or a JSON string when structured attributes are unavailable. This is a bounded query projection, not a rewrite of the stored evidence: each JSON-string attribute is limited to 128 KiB, each attribute is limited to 200 messages, 200 aggregate parts, and 10,000 decoded nodes, and one export can project at most 512 KiB of content and 50,000 decoded nodes across all spans. Nonstandard, malformed, or over-budget content leaves the typed field unset while the original attribute remains in metadata and the raw export envelope remains authoritative.
-- The root span's resource `deployment.environment.name` maps to the trace environment; deprecated `deployment.environment` is used only when the current attribute is absent. Both pass through `spec/environments-v1.md`'s canonicalizer, and an invalid current value does not silently fall through to legacy.
-- `gen_ai.provider.name` (falling back to legacy `gen_ai.system`) → normalized into `metadata["gen_ai.provider.name"]`
-- Presence of `gen_ai.operation.name` or a resolved model marks the span as `type: "generation"`; otherwise `type: "span"`.
-- `status.code === 2` (`STATUS_CODE_ERROR`) → `level: "error"`.
+- Every span becomes an `Observation`: `id` is the `spanId`, `parentObservationId` the `parentSpanId`, plus `traceId`, `name`, `startTime`, `endTime`, and `statusMessage` from `status.message`. `status.code` 2 (`STATUS_CODE_ERROR`) sets `level: "error"`; any other status sets `level: "default"`.
+- A span with no `parentSpanId` is the trace root and also produces the `Trace`: `id` is the `traceId`, `timestamp` the root's start time, `name` the root span's name, and `metadata` the resource attributes. The root stays an observation as well, so nothing on it is discarded. An export that carries only child spans writes observations only; the trace row comes with the export that carries the root.
+- The root's resource attribute `deployment.environment.name` sets the trace environment; the deprecated `deployment.environment` is read only when the current attribute is absent. Both pass through the environment canonicalizer (`spec/environments-v1.md`), and an invalid current value leaves the environment unset instead of falling back to the legacy attribute.
+- A span is `type: "generation"` when it has a `gen_ai.operation.name` attribute or a resolved model, and `type: "span"` otherwise.
+- Span `kind` and span events are validated and stored but not mapped to domain fields.
 
-**Every attribute — typed or not — is also copied verbatim into `metadata`** as a string. This is the data-flexibility mechanism: an unrecognized or future `gen_ai.*` attribute (the spec is still moving) is never silently dropped, just not specially typed yet.
+Typed `gen_ai.*` mappings. The upstream conventions are still Development stability (`gen_ai.system` has already been renamed to `gen_ai.provider.name`), so the mapper reads both names where a rename happened:
 
-## Known gaps (M4 direct-ingest-primacy audit, 2026-07-12)
+| Attribute | Domain field |
+| --- | --- |
+| `gen_ai.request.model`, else `gen_ai.response.model` | `model` |
+| `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` | `usageDetails.input_tokens`, `usageDetails.output_tokens` (`spec/usage-keys-v1.md`); a double is rounded, and a negative or non-finite value is dropped |
+| `gen_ai.request.temperature`, `.max_tokens`, `.top_p`, `.top_k`, `.frequency_penalty`, `.presence_penalty`, `.seed` | `modelParameters`, keyed without the `gen_ai.request.` prefix; numeric values only |
+| `gen_ai.provider.name`, else legacy `gen_ai.system` | `metadata["gen_ai.provider.name"]` |
+| `gen_ai.input.messages`, `gen_ai.output.messages` | `input`, `output` (see Message projection) |
 
-- **No cost mapping from attributes; cost is derived instead.** Verified directly against the live semconv registry (`open-telemetry/semantic-conventions-genai`, `model/gen-ai/registry.yaml`): there is no `gen_ai.usage.cost` or any standardized cost/price attribute upstream — this isn't a missed mapping, there's nothing to map. Since `gen_ai.usage.*` and `gen_ai.request.model` map to usage and model, the worker derives cost from the price table at ingest (`spec/cost-pricing-v1.md`). A client that needs an exact provider-billed figure can still send it via the native JSON ingest path (`Observation.costDetails`); a custom OTLP cost attribute is captured generically via the metadata fallback above but is not promoted into `costDetails`.
-- **No score support.** OTLP/OTel has no native "score" concept (human feedback, eval results). Scores can only be recorded via native JSON ingest (`score-upsert`) or the SDK's `score()` method — there is no OTLP-side workaround, documented here rather than left silent.
+`gen_ai.request.stop_sequences` is a string array while `modelParameters` values are scalars, so it is kept only in metadata.
 
-## Storage path
+Every span attribute, typed or not, is also copied into the observation's `metadata`: scalar values as their string form, and array, key-value list and bytes values as the JSON of the OTLP value. An unrecognized or future `gen_ai.*` attribute is therefore kept, only not typed.
 
-One `POST` = one `otlp-export` ingest event (`source: "otlp"`), whose `body` is the raw, Zod-validated `ExportTraceServiceRequest` — not split into per-span events at the API edge. The worker's OTLP mapper explodes it into many trace/observation rows, since a single export can span multiple traces. Same envelope/queue/ClickHouse pipeline as native ingest.
+### Message projection
+
+`gen_ai.input.messages` and `gen_ai.output.messages` set `input` and `output` when they hold the standard OpenTelemetry message arrays: every message has a string `role` and a `parts` array whose items each have a string `type`, and every output message also has a string `finish_reason`. Both encodings allowed upstream are accepted: a structured `arrayValue`/`kvlistValue`, or a JSON string for exporters without structured attributes. Integers outside JavaScript's safe range are kept as their exact decimal string.
+
+This is a bounded query projection, not a rewrite of the stored evidence. Each attribute is limited to 128 KiB of content, 10,000 decoded nodes, 200 messages, and 200 parts across its messages. One export can project at most 512 KiB and 50,000 decoded nodes across all spans and both directions. Content that is nonstandard, malformed, or over a limit leaves the field unset; the original attribute remains in metadata and the stored export body remains authoritative.
+
+## Cost and scores
+
+OpenTelemetry has no cost attribute (the `open-telemetry/semantic-conventions-genai` registry defines none) and no score concept.
+
+- Cost: the worker derives cost from the mapped usage and model with the price table (`spec/cost-pricing-v1.md`). A custom cost attribute is kept in metadata but not promoted into `costDetails`. A client that needs an exact provider-billed figure sends it through native JSON ingest or the `ironside` package.
+- Scores: OTLP has no way to send them. Scores are recorded through native JSON ingest (`score-upsert`) or the SDK's `score()` methods.
+
+## Verified
+
+`apps/api/test/otlp.test.ts` covers authentication, 415 for other content types, 400 for malformed payloads, and a JSON export stored raw, queued, and mapped the way the worker maps it. `apps/api/test/otlp-protobuf.test.ts` covers the protobuf response, identical stored events for the protobuf and JSON encodings of one export, gzip for both encodings, 400 for a body declared gzip that is not, 413 for a 64 MiB gzip bomb, 400 for a protobuf span without a start time, 415 for other content encodings, 400 for undecodable protobuf, and the real `@opentelemetry/exporter-trace-otlp-proto` exporter sending through a local HTTP server into the mapper. `packages/mappers/test/otlp.test.ts` covers root promotion, model, usage, provider and sampling-parameter mapping, environment precedence, message projection and its limits, error status, metadata passthrough, and timestamp conversion.
+
+## History
+
+- M3-01 and M3-02 added the endpoint with OTLP/HTTP JSON.
+- M9-06 added protobuf decoding. The decompressed-size cap on gzip bodies came from a review finding on PR #38.
+- The M4-05 direct-ingest audit added the `gen_ai.request.*` to `modelParameters` mapping (`spec/direct-ingest-primacy-v1.md`). OTLP observations gained cost later, when the worker began deriving it (`spec/cost-pricing-v1.md`).
+- Issue #45 made OTLP the canonical integration surface for third-party frameworks and services.
+- Through 0.3.0 the API also filled each event's idempotency key with a hash of the body, which was identical for the protobuf and JSON encodings of an export. The key is now the event id (`spec/trace-envelope-v1.md`).

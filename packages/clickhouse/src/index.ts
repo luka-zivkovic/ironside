@@ -38,6 +38,7 @@ export {
 } from "./environments.js";
 export {
   listTraces,
+  listTraceMetrics,
   listSettledTraceVersions,
   listTracePage,
   getTrace,
@@ -53,11 +54,11 @@ export {
   listScoresForTraces,
   listScoresForTrace,
   getAggregates,
-  exportTraces,
   type TraceFilter,
   type ListTracesFilter,
   type ListTracePageFilter,
   type TraceRow,
+  type TraceMetricsRow,
   type SettledTraceVersionRow,
   type SettledTraceVersionCursor,
   type TraceDetailRow,
@@ -68,8 +69,7 @@ export {
   type TraceRawAnchorRow,
   type ObservationRow,
   type ScoreRow,
-  type AggregatesRow,
-  type ExportTraceRow
+  type AggregatesRow
 } from "./queries.js";
 export {
   listPartitions,

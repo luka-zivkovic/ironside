@@ -155,14 +155,26 @@ export function startScheduler(options: SchedulerOptions): Scheduler {
     const due = await claimDueWebhookRules(options.pool, claimBatchSize);
     for (const rule of due) {
       try {
-        await runWebhooks({
+        const result = await runWebhooks({
           pool: options.pool,
           clickhouse: options.clickhouse,
           rule,
           signingSecret: decryptSecret(rule.signingSecretEncrypted),
           traceQuietPeriodSeconds: await traceQuietPeriodSeconds(rule.projectId)
         });
-        onRunOutcome("webhook", "success");
+        if (result.failed.length > 0) {
+          // The rule's last_run_error has the detail; surface it in logs and metrics too.
+          onError(
+            "webhook",
+            new Error(
+              `rule ${rule.id}: delivery stopped at ` +
+                result.failed.map((failure) => `${failure.traceId}: ${failure.error}`).join("; ")
+            )
+          );
+          onRunOutcome("webhook", "error");
+        } else {
+          onRunOutcome("webhook", "success");
+        }
       } catch (error) {
         onError("webhook", error);
         onRunOutcome("webhook", "error");
@@ -313,9 +325,23 @@ export function startScheduler(options: SchedulerOptions): Scheduler {
     if (stopped || ticking) return;
     ticking = true;
     try {
-      await tickExports();
-      await tickOtlpForwards();
-      await tickWebhooks();
+      // Per-row failures are handled inside each tick. This guard covers a
+      // failed claim query (Postgres unreachable): the fire-and-forget timer
+      // must not raise an unhandled rejection, which would stop the worker,
+      // and one subsystem's failed claim must not skip the others.
+      const ticks = [
+        ["export", tickExports],
+        ["otlp-forward", tickOtlpForwards],
+        ["webhook", tickWebhooks]
+      ] as const;
+      for (const [subsystem, tick] of ticks) {
+        try {
+          await tick();
+        } catch (error) {
+          onError(subsystem, error);
+          onRunOutcome(subsystem, "error");
+        }
+      }
     } finally {
       ticking = false;
     }

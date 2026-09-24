@@ -1,4 +1,5 @@
-import { runMigrations as runPgMigrations } from "@ironside/db";
+import { listImportSources, runMigrations as runPgMigrations } from "@ironside/db";
+import { decryptSecret } from "@ironside/shared";
 import { createClickHouseClient, runMigrations as runChMigrations } from "@ironside/clickhouse";
 import { createIngestQueue } from "@ironside/queue";
 import { createObjectStorage } from "@ironside/storage";
@@ -96,6 +97,14 @@ describe("import-sources CRUD (/api/v1/import-sources)", () => {
     const list = await req("GET", "/api/v1/import-sources", apiKey);
     const body = (await list.json()) as { importSources: { id: string }[] };
     expect(body.importSources.map((s) => s.id)).toContain(created.id);
+
+    const stored = (await listImportSources(pool, projectId)).find((source) => source.id === created.id);
+    expect(JSON.parse(decryptSecret(stored!.encryptedCredentials))).toMatchObject({
+      provider: "langfuse",
+      publicKey: "pk_test",
+      secretKey: "sk_super_secret",
+      baseUrl: "https://langfuse.example.com"
+    });
   });
 
   it("connects a LangSmith source (different credential shape) — the discriminated union accepts sessionIds, not publicKey/secretKey", async () => {

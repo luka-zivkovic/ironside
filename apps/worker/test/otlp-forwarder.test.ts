@@ -47,6 +47,7 @@ beforeAll(async () => {
         body: JSON.parse(body || "{}")
       });
       res.statusCode = respondWithStatus;
+      if (respondWithStatus >= 300 && respondWithStatus < 400) res.setHeader("location", "/elsewhere");
       res.setHeader("content-type", "application/json");
       res.end("{}");
     });
@@ -302,6 +303,31 @@ describe("forwardOtlpTraces", () => {
     expect(recorded?.feedCursor?.traceId).toBe(traceIds[1]);
   });
 
+  it("does not follow a redirect, which could lead past the SSRF guard", async () => {
+    const marker = `otlp_fwd_redirect_${ulid()}`;
+    const traceId = `trace_${marker}`;
+    await insertPublishedTrace({ pool, clickhouse }, {
+      trace: { id: traceId, projectId, timestamp: new Date().toISOString(), tags: [marker], metadata: {} }
+    });
+    const stored = await createDisabledRule({
+      id: `rule_${ulid()}`,
+      name: "redirecting destination",
+      destinationUrl: serverUrl,
+      filter: { tags: [marker] }
+    });
+
+    respondWithStatus = 307;
+    const result = await forwardOtlpTraces({
+      pool,
+      clickhouse,
+      rule: stored,
+      traceQuietPeriodSeconds: 0,
+      allowPrivateDestinations: true
+    });
+    expect(result.failed).toEqual([{ traceId, error: "destination responded HTTP 307", skipped: false }]);
+    expect(receivedRequests).toHaveLength(1);
+  });
+
   it("stops at a destination that does not answer within the request timeout", async () => {
     const marker = `otlp_fwd_timeout_${ulid()}`;
     const traceId = `trace_${marker}`;
@@ -353,14 +379,17 @@ describe("forwardOtlpTraces", () => {
     expect(result.forwarded).toBe(1);
   });
 
-  it("refuses to run against a destination URL that resolves to a private/internal address (SSRF guard)", async () => {
-    const result = forwardOtlpTraces({
-      pool,
-      clickhouse,
-      rule: rule({ destinationUrl: "http://127.0.0.1:9/v1/traces" }),
-      traceQuietPeriodSeconds: 0
+  it("refuses to run against a destination URL that resolves to a private/internal address (SSRF guard), and records why", async () => {
+    const stored = await createDisabledRule({
+      id: `rule_${ulid()}`,
+      name: "private destination",
+      destinationUrl: "http://127.0.0.1:9/v1/traces",
+      filter: {}
     });
+    const result = forwardOtlpTraces({ pool, clickhouse, rule: stored, traceQuietPeriodSeconds: 0 });
     await expect(result).rejects.toThrow(/non-public address/);
     expect(receivedRequests).toHaveLength(0);
+    const recorded = await getOtlpForwardRule(pool, projectId, stored.id);
+    expect(recorded).toMatchObject({ lastRunStatus: "error", lastRunError: expect.stringMatching(/non-public address/) });
   });
 });

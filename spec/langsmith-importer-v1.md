@@ -1,46 +1,82 @@
 # LangSmith Historical Importer v1
 
-Status: implemented (M5-03, full-data M5-06); scheduling + credentials CRUD (M5-07) since added. Owner: `apps/worker/src/importers/langsmith-{client,mapper,importer}.ts`.
+Status: implemented. Owner: `apps/worker/src/importers/langsmith-client.ts`, `apps/worker/src/importers/langsmith-mapper.ts`, `apps/worker/src/importers/langsmith-importer.ts`, `apps/worker/src/importers/evaluator-publication.ts`, `packages/db/src/import-checkpoints.ts`.
 
 ## Purpose
 
-Same rationale as the LangFuse importer (`spec/langfuse-importer-v1.md`): pull-based backfill of a team's existing LangSmith history, since a future ingest-side compat layer would only capture new traces going forward.
+Pull a team's existing LangSmith history (root runs as traces, their descendant runs as observations, and feedback as scores) into Ironside, for the same reason as the LangFuse importer (`spec/langfuse-importer-v1.md`): an SDK pointed at Ironside only captures new traces. Runs are triggered by the scheduler for each configured import source (`spec/import-source-scheduling-v1.md`).
 
-## API verification note
+## Source API
 
-An existing sibling-codebase client (rubrist) called `GET /runs` with `x-api-key` auth and a `project_name` query param. **This is not a documented LangSmith endpoint** — verified directly against the live OpenAPI spec at `api.smith.langchain.com/openapi.json`: no bare `GET /runs` listing endpoint exists. The only endpoint for listing/searching runs is `POST /api/v1/runs/query`, which filters by `session` (an array of project UUIDs, not a name string) and paginates via an opaque `cursor` string, not offset/limit.
+All requests send `x-api-key: <apiKey>` to `baseUrl`, which defaults to `https://api.smith.langchain.com`.
 
-The response's `cursors` field is typed in the OpenAPI schema only as a generic open string-keyed dict — the "next page" key name is **not recoverable from the spec alone**. Verified instead against the official `langsmith` SDK source (both JS `client.ts` and Python `client.py`, independently converging): both read `cursors.next`, treating a missing/falsy value as pagination exhaustion.
+- **Root runs:** `POST /api/v1/runs/query` with `{ session: <sessionIds>, is_root: true, limit, order: "asc", cursor?, start_time? }`. `session` is an array of LangSmith project UUIDs, not project names. Pagination is by an opaque cursor: the next page's cursor is `cursors.next`, and a missing or null value means the window is exhausted. The OpenAPI schema types `cursors` only as an open string map; the `next` key comes from the official `langsmith` JS and Python clients, which both read it.
+- **One trace's runs:** `POST /api/v1/runs/query` with `{ trace: <traceId> }`. The OpenAPI description of the `trace` filter says limit and cursor pagination are not applied and all runs in the trace come back in one response. `runs/query` returns full run bodies (tokens, cost, status, parent id), so no per-run detail request is needed.
+- **Feedback:** `GET /api/v1/feedback?run=<id>&run=<id>…&limit=100&offset=N`, which returns a plain array. The request carries every run id in the trace's tree (root and all descendants), because feedback can be attached to any run and the API does not document that `run` scopes to a whole trace. Run ids are sent 50 per request so a large tree cannot produce an over-long URL, and each chunk is paged by offset until a page shorter than 100 comes back.
 
-## Design
+## Run
 
-Same checkpoint/resume/concurrency-guard shape as `runLangfuseImport` (see `spec/langfuse-importer-v1.md`), adapted for LangSmith's different pagination model:
+`runLangsmithImport(options)` performs one bounded run for one project, with the same claim, lease, recovery, staging and failure contract as `runLangfuseImport` (`spec/langfuse-importer-v1.md`), keyed on `(project_id, 'langsmith')`:
 
-- **Cursor-based, not page-based.** LangSmith has no equivalent of "page >= totalPages" — exhaustion is signaled by `cursors.next` being absent/null, not a computable total.
-- **`startTime` (LangSmith's `start_time` filter) must stay fixed for the whole run**, for the identical reason LangFuse's `fromTimestamp` must: the source re-evaluates the filter server-side per request, and a cursor is only meaningful relative to *that* filtered window. A moving anchor mid-run desyncs the cursor's position from what the caller expects, silently skipping or duplicating runs — this is the same bug class M5-02 found and fixed for LangFuse, deliberately avoided here from the start and locked in with a dedicated regression test (`apps/worker/test/langsmith-importer.test.ts`, "startTime stays fixed for the whole run").
-- **Trace-level scope only** (`is_root: true`): LangSmith's "runs" include every nested span; this importer pulls root runs (traces) only, matching the LangFuse importer's scope (traces, not observations).
-- **`eventTs` fixed per run**, matching the established `ReplacingMergeTree` retry-safety contract (`packages/clickhouse/src/rows.ts`) — applied from the start here, having been a review-driven fix in the LangFuse importer.
+1. Claim the checkpoint row with a run token and a five-minute renewable lease, or return `null` when a live run holds it.
+2. Complete any snapshots a previous run left pending.
+3. Query a page of root runs. For each root run, with trace id `trace_id` (or `id` when absent), fetch the trace's runs and then the feedback for all of its run ids. The trace query returns the root run again; it is removed by id so it is not also mapped as an observation.
+4. Map, stage and materialize the page, then save the checkpoint.
+5. Stop when the window is exhausted or after `maxPagesPerRun` pages (default 20); `pageSize` defaults to 50. Return `{ imported, resumable }`.
 
-## Full-data import (M5-06) — child runs and feedback, everything
+The source project UUIDs come from the import source's `sessionIds`.
 
-The importer follows the same full-data requirement as the LangFuse path. The original importer only mapped root runs (traces) — no observations, no feedback. LangSmith's data model differs from LangFuse's in a way that changes the shape of the fix:
+## Checkpoint and pagination
 
-- **No separate detail endpoint needed.** LangFuse's list API returns trace summaries only, requiring one `GET /traces/{id}` per trace to get the full tree. LangSmith's `POST /api/v1/runs/query` already returns full run bodies (tokens, cost, status, parent linkage) for every run, root or not — the gap was never "missing fields," it was "only root runs were ever queried."
-- **The `trace` filter, not deeper pagination, gets the whole tree.** Verified directly against the live OpenAPI spec's `BodyParamsForRunsQuerySchema.trace` field description: *"Filter runs by trace ID. When set, limit and cursor-based pagination are not applied — all runs in the trace are returned in a single response."* So the importer keeps its proven-resumable root-run pagination/checkpoint loop for the trace-level backfill, and for each root run in a page issues one additional trace-scoped `runs/query` call (`LangsmithClient.getTraceRuns`) to fetch every descendant run in one unpaginated response — architecturally the same "per-trace detail fetch" pattern as the LangFuse fix, just via a different API shape.
-- **`run_type` → Ironside's observation type**: `llm` maps to `generation` (the type Ironside's usage/cost columns are meant for); every other type (`tool`/`chain`/`retriever`/`embedding`/`prompt`/`parser`) maps to `span`, with the original `run_type` preserved as a `langsmith:runType` metadata key.
-- **Costs are decimal STRINGS on the wire** (`"0.00123"`, not a JSON number) — confirmed directly against the live schema, not assumed. Parsed at the mapping boundary (not in the Zod schema, so a malformed string is caught by an explicit `Number.isFinite` guard rather than silently coercing to `NaN` via `z.coerce.number()`).
-- **Feedback (LangSmith's score equivalent) is fetched per trace via `GET /api/v1/feedback?run=<id>&run=<id>...`**, passed the FULL set of run ids in the trace's tree (root + every descendant), not just the trace/root id. The OpenAPI spec's `run` parameter has no scope description (unlike the `trace` filter's explicit "all runs in the trace" docstring) — deliberately not assumed to auto-scope by trace, since LangSmith's UI attaches feedback to individual runs, which can be any node in the tree, not just the root. Feedback whose `run_id` equals the trace's own root id maps to a trace-level score (no `observationId`); feedback on any other run id links to that run's `Observation` via `observationId`. Run ids are sent to the feedback endpoint in chunks of 50, not one unbounded query string per trace — a trace with hundreds of runs (plausible for agentic/looping workflows) could otherwise grow the URL past a proxy/load-balancer's length limit.
+The checkpoint is `{ cursor?, lastStartTime? }`.
 
-### Three bugs caught by code review, fixed and regression-tested
+- `start_time` is an inclusive lower bound, and the run's anchor is `lastStartTime`, read once when the run starts and kept fixed for the whole run. The source re-applies the filter on every request and a cursor is only meaningful within the window it was issued for, so moving the anchor mid-run would skip or duplicate runs.
+- In the middle of a window, a save stores the next cursor and leaves `lastStartTime` unchanged.
+- When the window is exhausted (no `cursors.next`, or an empty page), the cursor is removed and `lastStartTime` moves to the newest root-run `start_time` seen in this run. The next run starts a fresh window from there rather than resending a cursor from a finished window.
+- Progress is saved after every page.
 
-1. **`observationId` scoping compared against the wrong field.** The first version compared a feedback entry's `run_id` against `feedback.trace_id` (a field on the feedback response itself, independently nullable/optional) instead of the importer's own resolved `traceId` parameter. If the API ever returns feedback with `trace_id` absent, root-run feedback would fail the equality check and get misclassified as pointing at a child observation. Fixed to compare against the `traceId` the mapper already receives; regression-tested (including a case where `feedback.trace_id` is deliberately omitted from the fixture) and verified to discriminate by reverting and confirming the test fails.
-2. **A categorical `value` was silently dropped whenever a numeric `score` was also present.** LangSmith feedback can carry both simultaneously (e.g. `score: 1, value: "thumbs_up"`) — neither field implies the absence of the other. The original code only computed `stringValue` when `!isNumeric`, discarding real data against the "all data I can get" directive. Fixed to compute `stringValue` unconditionally; regression-tested and verified to discriminate.
-3. **Feedback with neither a score nor a value produced an invalid `Score`.** The domain schema requires at least one of `value`/`stringValue`; a comment-only feedback entry (both fields absent) would otherwise silently write a row with both columns null — indistinguishable from data loss. `mapLangsmithFeedback` now returns `Score | null`, and the importer skips a `null` return rather than inserting an invalid row; regression-tested at the mapper level.
+The tied-timestamp and concurrent-change limits described for LangFuse apply here too, with `start_time` in place of `fromTimestamp`.
 
-## Not yet done (follow-up, not blocking either M5-03's or M5-06's DoD)
+## Mapping
 
-~~No scheduler/trigger route~~ — **done since**: import source credentials + scheduling in M5-07 (spec/import-source-scheduling-v1.md).
+**Trace** (from the root run):
 
-## Still blocked
+- `id` is `trace_id`, falling back to `id`; `timestamp` is `start_time`; `name`; `sessionId` is the run's `session_id`; `input` and `output` come from `inputs` and `outputs` (an explicit `null` is kept, an absent value is omitted).
+- Tags are the run's tags plus `imported:langsmith`.
+- Metadata merges `extra` and `metadata` (a `metadata` key wins over the same `extra` key); values that are not strings are JSON-stringified.
+- The root run's own tokens, costs, end time and status are not stored: the root run maps only to the trace, and only descendant runs become observations.
 
-Real conformance against a live LangSmith account — the exact `cursors.next` key name, `is_root` filtering behavior, `session` UUID resolution, the `trace` filter's unpaginated-full-tree behavior, and the `run` feedback parameter's actual filter scope are all verified against the OpenAPI spec and SDK source, not a live response. This remains an explicit conformance item pending access to a suitable live account (LangFuse's equivalent conformance item is done — see `spec/langfuse-importer-v1.md`).
+**Observation** (every descendant run):
+
+- `run_type` `llm` becomes `generation`; every other run type becomes `span`, and the original run type is kept in metadata as `langsmith:runType`.
+- `level` is `error` when `status` is `error` or `error` is set, otherwise `default`. `statusMessage` is the `error` text when present, otherwise the raw `status`.
+- `parent_run_id`, `name`, `start_time`, `end_time`, `first_token_time` (as `completionStartTime`), `inputs` and `outputs` map directly; metadata is built as for the trace.
+- `prompt_tokens`, `completion_tokens` and `total_tokens` become `input_tokens`, `output_tokens` and `total_tokens` (`spec/usage-keys-v1.md`), rounded; negative counts are dropped.
+- Costs arrive as decimal strings (`"0.00123"`). `prompt_cost`, `completion_cost` and `total_cost` are parsed at the mapping boundary into `input`, `output` and `total`; a string that does not parse to a finite, non-negative number is dropped rather than stored as `NaN`.
+
+**Score** (each feedback entry):
+
+- `name` is `key`, `comment` maps directly, `source` is always `api`, and `timestamp` is `created_at`. A score without a timestamp takes its trace's timestamp, as for LangFuse.
+- A numeric `score` becomes `value` with data type `numeric` (`0` is kept). A `value` becomes `stringValue`, JSON-stringified when it is not a string, and data type `categorical` when there is no numeric score. Both are kept when both are present.
+- Feedback with neither a numeric score nor a value is skipped.
+- `observationId` is the feedback's `run_id`, except when `run_id` is absent or equals the resolved trace id, in which case the score is trace-level. The comparison uses the trace id the importer resolved, not the feedback's own `trace_id` field, which is optional.
+- `correction` and `feedback_source` are not stored.
+
+**Invalid traces.** If a trace, one of its observations, or one of its mapped scores fails domain validation (for example an identifier longer than 512 UTF-8 bytes, or an unparseable `created_at`), the whole trace is skipped and reported through `onInvalidTrace`; the scheduler reports it to its error hook as `import:langsmith:<traceId>`. The page still advances. Unlike the LangFuse importer, an invalid feedback entry skips its trace rather than only the score.
+
+## Publication and failure behavior
+
+Staging, generations, tombstoning, the score-only path, the import retention cutoff and crash recovery are the same as for LangFuse (`spec/langfuse-importer-v1.md#publication`), with `import_source = 'langsmith'` on imported scores. A failed root-run, trace-runs or feedback request fails the run before the page is staged or its checkpoint saved, sets `status = 'error'` and `last_error`, and rethrows.
+
+## Verified
+
+`apps/worker/test/langsmith-importer.test.ts` runs `runLangsmithImport` against a mock LangSmith server whose cursor is an offset within the `start_time`-filtered set, with real Postgres and ClickHouse. It covers a multi-page import that clears the cursor on exhaustion, `startTime` staying fixed for every request of a run, resuming from `lastStartTime`, the page cap keeping the cursor, full trees with child runs as observations and feedback on root and child runs as scores, a concurrent run returning `null`, and `error` status on a source failure. `apps/worker/test/langsmith-mapper.test.ts` covers the trace id fallback, run type and level mapping, decimal-string costs (including a malformed one), token mapping and rounding, explicit `null` output, and the feedback rules: score `0`, stringified values, score and value together, skipping empty feedback, and root versus child `observationId`.
+
+## History
+
+- M5-03 added the importer for root runs only. A sibling codebase's client called `GET /runs` with a `project_name` parameter; the live OpenAPI spec has no such listing endpoint, so the importer uses `POST /api/v1/runs/query` with project UUIDs and cursor pagination. The fixed per-run `start_time` anchor and a fixed per-run `event_ts` were built in from the start, after both had been fixed in the LangFuse importer.
+- M5-06 made imports full-data: descendant runs through the `trace` filter, feedback over every run id in the tree, chunked by 50. Review found three mapper bugs, each fixed with a regression test: `observationId` was compared against the feedback's optional `trace_id` instead of the resolved trace id, a categorical `value` was dropped whenever a numeric `score` was present, and feedback with neither produced an invalid score row.
+- M5-07 added import sources and the scheduler (`spec/import-source-scheduling-v1.md`).
+- M9-04 changed usage keys from `input`/`output`/`total` to `input_tokens`/`output_tokens`/`total_tokens`.
+- Imports moved onto the evaluator publication barrier, as described in the LangFuse importer's history.
+- Still open: conformance against a live LangSmith account. The `cursors.next` key, `is_root` filtering, `session` UUID filtering, the unpaginated `trace` filter and the scope of the feedback `run` parameter are checked against the OpenAPI spec and SDK source only (`ROADMAP.md`).

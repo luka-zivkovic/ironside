@@ -1,8 +1,13 @@
 # Raw retention intents v1
 
-Status: implemented. Preparation is non-destructive; execution is bounded and
-runs automatically through the raw retention sweep, on by default (see
-"Automatic sweep"), or explicitly through the operator command.
+Status: implemented. Owner: `packages/db/src/raw-retention-intents.ts`,
+`apps/worker/src/retention/raw-retention-intent-preparer.ts`,
+`apps/worker/src/retention/raw-retention-intent-executor.ts`,
+`apps/worker/src/retention/raw-retention-sweep.ts`.
+
+Preparation is non-destructive; execution is bounded and runs automatically
+through the raw retention sweep, on by default (see "Automatic sweep"), or
+explicitly through the operator command.
 
 ## Product boundary
 
@@ -22,8 +27,9 @@ query-visible trace row and raw ref are gone.
 
 ## Preparing work
 
-The operator supplies one exact project and an explicit JSON array of canonical
-raw object keys:
+Every preparation call names one exact project and an explicit list of
+canonical raw object keys. The automatic sweep supplies them on a schedule (see
+"Automatic sweep"); an operator can also supply them as a JSON array:
 
 ```sh
 docker compose exec \
@@ -32,10 +38,10 @@ docker compose exec \
   worker node apps/worker/dist/src/scripts/raw-retention-intents.js
 ```
 
-This input is deliberately separate from the Batch 2A lifecycle manifest. The
-manifest is inventory, never an executable deletion list. Preparation writes
-metadata-only rows to Postgres and returns
-`destructiveActionsEnabled: false`; it has no deletion path.
+This input is deliberately separate from the lifecycle manifest
+(`spec/lifecycle-planning-v1.md`). The manifest is inventory, never an
+executable deletion list. Preparation writes metadata-only rows to Postgres and
+returns `destructiveActionsEnabled: false`; it has no deletion path.
 
 One invocation is capped at 100 unique objects, 1 GiB of exact HEAD-reported
 raw-object bytes, 10,000 aggregate raw trace refs, and 1 MiB of conservatively
@@ -68,8 +74,9 @@ an older captured cutoff or trace set.
 
 `raw_retention_intents` retains the preparation id, project, ingest batch,
 exact object key and byte size, captured cutoff/policy, affected trace ids,
-classification, diagnostic count, state, attempts, and a bounded future error
-slot. Project deletion does not cascade away this audit record.
+classification, diagnostic count, state (`prepared`, `executing`, or
+`complete`), attempts, and a bounded last error. Project deletion does not
+cascade away this audit record.
 
 ## Executing reviewed intents
 
@@ -170,9 +177,9 @@ Setting the flag to anything other than exactly `true` on every worker disables
 the sweep and the operator executor and keeps raw events indefinitely. Ingest
 and recovery always take the per-object lock and honor `executing`/`complete`
 intents, whatever the flag says, so switching deletion off never lets a
-delayed job resurrect rows an already-started deletion removed. Throughput is bounded by the per-object executor work; an
-installation ingesting many small batches can fall behind, and its backlog is
-visible in the lifecycle plan.
+delayed job resurrect rows an already-started deletion removed. Throughput is
+bounded by the per-object executor work; an installation ingesting many small
+batches can fall behind, and its backlog is visible in the lifecycle plan.
 
 ## Explicitly deferred
 
@@ -183,3 +190,27 @@ visible in the lifecycle plan.
   WORM/Object Lock, and physical compaction of marker tables;
 - replay of executing/complete objects (enabled ingest workers terminally
   no-op delayed/recovered jobs instead of resurrecting derived rows).
+
+## Verified
+
+`apps/worker/test/raw-retention-intent-preparer.test.ts` covers the
+preparation vetoes and caps. `apps/worker/test/raw-retention-intent-preparer.integration.test.ts`
+runs against live stores: deletion order, resumption after a failed raw
+delete, post-delete convergence despite a policy change, a zero-ref executing
+intent, and the sweep (deletion past retention, a visible trace kept until a
+later cycle, budget continuation, page splitting, a failing project, and
+project rotation). `apps/worker/test/raw-retention-intent-executor.test.ts`,
+`apps/worker/test/raw-retention-execution-config.test.ts`,
+`apps/worker/test/raw-retention-storage-permissions.test.ts`,
+`packages/db/test/raw-retention-intents.test.ts`, and
+`apps/api/test/raw-events-route.test.ts` cover the execution gates and flag
+default, the target-day probes, intent creation and locks, and
+`retention_expired` reads.
+
+## History
+
+- The lifecycle planner (`spec/lifecycle-planning-v1.md`) came first as a
+  read-only inventory. Non-destructive intent preparation and the operator
+  executor followed as separately reviewed steps.
+- The worker sweep now runs execution automatically, and
+  `RAW_RETENTION_EXECUTION_ENABLED` defaults to `true`.

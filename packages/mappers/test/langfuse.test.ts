@@ -418,6 +418,20 @@ describe("mapLangfuseIngestionRequest — fields each row actually received", ()
     );
   });
 
+  it("keeps a generation's first-token time", () => {
+    const { rows } = mapLangfuseIngestionRequest(
+      "proj_x",
+      request([
+        batchEvent({
+          type: "generation-update",
+          body: { id: "obs_1", traceId: "trace_1", completionStartTime: "2026-07-12T00:00:00.450Z" }
+        })
+      ])
+    );
+    expect(rows.observations[0]?.completionStartTime).toBe("2026-07-12T00:00:00.450Z");
+    expect(rows.providedFields.observations.get("obs_1")?.has("completionStartTime")).toBe(true);
+  });
+
   it("does not count a defaulted trace timestamp, tags, or metadata as sent", () => {
     const { rows } = mapLangfuseIngestionRequest(
       "proj_x",

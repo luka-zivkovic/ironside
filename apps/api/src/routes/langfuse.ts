@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import type { IngestBatch, IngestEvent, QueueMessage } from "@ironside/shared";
 import {
   INGEST_SCHEMA_VERSION,
@@ -17,10 +16,6 @@ import type { AuthEnv } from "../middleware/auth.js";
 export interface LangfuseDeps {
   storage: ObjectStorage;
   queue: Queue<QueueMessage>;
-}
-
-function contentHash(value: unknown): string {
-  return createHash("sha256").update(JSON.stringify(value) ?? "null").digest("hex");
 }
 
 /**
@@ -57,12 +52,13 @@ export function langfuseRoutes(deps: LangfuseDeps): Hono<AuthEnv> {
     const batchId = ulid();
     const receivedAt = new Date();
 
+    const eventId = ulid();
     const event: IngestEvent = {
-      id: ulid(),
+      id: eventId,
       type: "langfuse-ingestion",
       source: "langfuse",
       schemaVersion: INGEST_SCHEMA_VERSION,
-      idempotencyKey: contentHash(parsed.data),
+      idempotencyKey: eventId,
       body: parsed.data
     };
 
@@ -135,12 +131,13 @@ export function langfuseRoutes(deps: LangfuseDeps): Hono<AuthEnv> {
       metadata: stringifyMetadata(score.metadata)
     };
 
+    const eventId = ulid();
     const event: IngestEvent = {
-      id: ulid(),
+      id: eventId,
       type: "score-upsert",
       source: "native",
       schemaVersion: INGEST_SCHEMA_VERSION,
-      idempotencyKey: contentHash(body),
+      idempotencyKey: eventId,
       body
     };
 

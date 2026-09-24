@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import type { ObjectStorage } from "@ironside/storage";
 import type { QueueMessage, IngestBatch, IngestEvent } from "@ironside/shared";
 import {
@@ -14,10 +13,6 @@ import type { AuthEnv } from "../middleware/auth.js";
 export interface IngestDeps {
   storage: ObjectStorage;
   queue: Queue<QueueMessage>;
-}
-
-function contentHash(value: unknown): string {
-  return createHash("sha256").update(JSON.stringify(value) ?? "null").digest("hex");
 }
 
 /**
@@ -41,14 +36,19 @@ export function ingestRoutes(deps: IngestDeps): Hono<AuthEnv> {
     const batchId = ulid();
     const receivedAt = new Date();
 
-    const events: IngestEvent[] = parsed.data.events.map((event) => ({
-      id: event.id ?? ulid(),
-      type: event.type,
-      source: "native",
-      schemaVersion: INGEST_SCHEMA_VERSION,
-      idempotencyKey: event.idempotencyKey ?? contentHash(event.body),
-      body: event.body
-    }));
+    const events: IngestEvent[] = parsed.data.events.map((event) => {
+      const id = event.id ?? ulid();
+      return {
+        id,
+        type: event.type,
+        source: "native",
+        schemaVersion: INGEST_SCHEMA_VERSION,
+        // The event id rather than a hash of the body: nothing deduplicates on
+        // the key, and releases up to 0.3.0 require one to read the batch.
+        idempotencyKey: event.idempotencyKey ?? id,
+        body: event.body
+      };
+    });
 
     const batch: IngestBatch = {
       batchId,

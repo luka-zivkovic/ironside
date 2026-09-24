@@ -1,55 +1,93 @@
 # LangFuse Historical Importer v1
 
-Status: implemented (M5-02); scheduling + credentials CRUD (M5-07) since added. Owner: `apps/worker/src/importers/langfuse-{client,mapper,importer}.ts`, `packages/db/src/import-checkpoints.ts`.
+Status: implemented. Owner: `apps/worker/src/importers/langfuse-client.ts`, `apps/worker/src/importers/langfuse-mapper.ts`, `apps/worker/src/importers/langfuse-importer.ts`, `apps/worker/src/importers/evaluator-publication.ts`, `packages/db/src/import-checkpoints.ts`.
 
 ## Purpose
 
-Pull-based backfill: page through a project's existing LangFuse traces (via LangFuse's read API, `GET /api/public/traces`) and import them into Ironside, so a team migrating off LangFuse doesn't lose history that predates switching their ingest endpoint (the M5-01 compat layer only captures *new* traces going forward).
+Pull a project's existing LangFuse history (traces with their observations and scores) into Ironside, so a team moving off LangFuse keeps the history that predates pointing its SDK at the compat endpoint (`spec/langfuse-compat-v1.md`), which only captures new traces. Runs are triggered by the scheduler for each configured import source (`spec/import-source-scheduling-v1.md`).
 
-## Design
+## Run
 
-`runLangfuseImport(options)` — a single callable function, not (yet) a scheduled job:
-1. `claimImportRun` atomically transitions the project's `(project_id, 'langfuse')` checkpoint row to `status = 'running'`, or returns `null` if another run is already in progress — prevents two concurrent triggers from racing the same checkpoint.
-2. Pages through `GET /api/public/traces?page=N&limit=…&orderBy=timestamp.asc[&fromTimestamp=…]`, oldest-first, mapping each page to Ironside `Trace` rows (tagged `imported:langfuse` for provenance) and batch-inserting into ClickHouse.
-3. **Checkpoints after every page**, not just at the end — `saveImportProgress` persists `{page, lastTimestamp}` to Postgres. If the process is killed mid-run, the next invocation picks up from the last saved page/timestamp instead of restarting.
-4. A single invocation stops after `maxPagesPerRun` pages (default 20) as a safety cap against one call running unbounded against a huge account; `resumable: true` in the result signals the caller should invoke again.
-5. Once a `fromTimestamp` window is fully paged through, the checkpoint resets to `page: 1` with `lastTimestamp` advanced — so the *next* run (not the current one) picks up anything created after this run started, using LangFuse's `fromTimestamp` filter instead of re-scanning from the beginning.
+`runLangfuseImport(options)` performs one bounded run for one project:
 
-### A subtle bug this design had to avoid
+1. **Claim.** `claimImportRun` creates the project's `(project_id, 'langfuse')` row in `import_checkpoints` if it is missing and sets `status = 'running'` with a new run token and a five-minute lease. If a live run already holds the lease it returns `null` and the call does nothing; an expired lease is taken over. Progress saves, staging, publication and the final status all require the same token and an unexpired lease, so a worker that lost its lease fails with `import run lease was lost` instead of writing. The lease is renewed before every page and every trace detail request.
+2. **Recover.** Snapshots a previous run staged but did not finish materializing are completed first (see Publication).
+3. **List.** Pages through `GET /api/public/traces?page=N&limit=<pageSize>&orderBy=timestamp.asc[&fromTimestamp=<anchor>]`, oldest first, with `Authorization: Basic base64(publicKey:secretKey)`.
+4. **Detail.** For each listed trace, fetches `GET /api/public/traces/{id}`. The list endpoint returns trace fields only; the detail endpoint is the only public API that returns observations and scores, so every trace costs one extra request.
+5. **Stage and materialize** the page's traces, then save the checkpoint.
+6. **Stop** when the window is exhausted or after `maxPagesPerRun` pages (default 20). `pageSize` defaults to 50; the scheduler uses both defaults. The run returns `{ imported, resumable }`; `resumable: true` means the page cap stopped it before the window was exhausted and the next run continues. A finished run sets `status = 'idle'`. `imported_count` accumulates across runs.
 
-`fromTimestamp` must stay **fixed for the whole run**, not update after each page. LangFuse's API filters+re-paginates server-side against `fromTimestamp` — if it changed mid-run (e.g. naively re-reading the checkpoint's `lastTimestamp` on every loop iteration), page N+1's `page` offset would be applied against a *different* filtered result set than page N was counted against, silently skipping or duplicating traces. Caught by an integration test against a real multi-page paginated mock server, not by unit-testing the mapper alone (see `apps/worker/test/langfuse-importer.test.ts`).
+## Checkpoint and pagination
 
-### The cross-RUN variant of the same bug, caught only by the real-account conformance run (M5-04)
+The checkpoint is `{ page, lastTimestamp? }`. LangFuse's list API has no cursor token, only `page`/`limit` and an inclusive `fromTimestamp` filter.
 
-The in-run fix above had a cross-run sibling that survived until the conformance run against a real LangFuse account: the checkpoint saved the incremented `page` together with an **advanced** `lastTimestamp` after every page — but that page number was counted against the window anchored at the run's *original* timestamp. The next run re-anchored its query window at the newly-saved (later) `lastTimestamp`, renumbering every page; it then requested a page beyond the smaller window's end, received an empty response, and falsely concluded the source was exhausted. Against the real account (51 traces, `pageSize=10`, `maxPagesPerRun=3`): run 1 imported 30 and saved `{lastTimestamp: T30, page: 4}`; run 2 queried page 4 of the ~3-page `[T30, ∞)` window → empty → reported `resumable: false` with 21 traces silently missing. A crash mid-run had the same inconsistency, with skip potential rather than just early stop.
+Invariant: `page` is always the next page to fetch within the window anchored at `lastTimestamp`.
 
-Fixed by making the checkpoint invariant explicit: **`checkpoint.page` is always the next page within the window anchored at `checkpoint.lastTimestamp`**. Mid-window saves advance only the page (anchor untouched); the anchor advances — with `page` reset to 1 — only when the window is exhausted. The fixture suite had a "stops after maxPagesPerRun" test that asserted the checkpoint's *shape* after a capped run but never resumed to completion — exactly the missing assertion; a new regression test (capped run → resume loop → assert every fixture trace arrived) was verified to genuinely discriminate by temporarily reintroducing the mid-loop anchor advance and watching it fail with the same 4-of-7 signature the real account produced (30-of-51).
+- The anchor is read once when the run starts and stays fixed for the whole run. LangFuse re-applies the filter and re-paginates on every request, so a page number only means something against the window it was counted in; moving the anchor mid-run would skip or duplicate traces.
+- A save in the middle of a window advances only `page`.
+- When the window is exhausted (`page >= meta.totalPages`, or an empty page), `lastTimestamp` moves to the newest trace timestamp seen in this run and `page` resets to 1. The next run queries from there and picks up traces created since.
+- Progress is saved after every page, so an interrupted run resumes at the first unsaved page.
 
-## Conformance against a real LangFuse account (M5-04) — done
+## Mapping
 
-Run against a real self-hosted LangFuse instance (user-provided credentials, passed via environment variables only — never written to any file) holding 51 real production traces:
-- **Capped + resume**: `pageSize=10`, `maxPagesPerRun=3` → run 1 imported 30 (`resumable: true`), run 2 imported the remaining 21 (`resumable: false`). 51/51 distinct traces in ClickHouse, newest imported trace exactly matching the account's newest via the public API.
-- **Idempotency**: cleared the checkpoint and re-imported everything from scratch — distinct count still 51, no duplicates (deterministic `event_ts` per run + ReplacingMergeTree dedup, per the established contract).
-- **Field fidelity**: names, user ids, session ids, tags (plus the `imported:langfuse` marker tag), and timestamps all spot-checked against the API's own responses.
+**Trace** (list fields plus the detail-only `environment`):
 
-Live LangSmith conformance is tracked separately and has not yet been completed.
+- `id`, `timestamp`, `name`, `userId`, `sessionId`, `release`, `version`, `input` and `output` map to the same native fields.
+- Tags are the source tags plus `imported:langfuse`.
+- Metadata values that are not strings are JSON-stringified.
+- `environment` is normalized as in `spec/environments-v1.md`; an invalid value is omitted.
+- An explicit `null` input or output is kept as a recorded `null`; an absent one is omitted.
 
-## Full-data import (M5-05) — observations, scores, everything
+**Observation:**
 
-User directive (2026-07-12): "we need full traces in all integrations — all data that I can get." The original importer only mapped trace-level fields from the list endpoint; imported traces had empty observation trees and no scores. Now, for each listed trace, the importer fetches `GET /api/public/traces/{id}` (the only way LangFuse's public API exposes the tree — one extra request per trace) and imports:
-- **Observations**: type/level (uppercase → Ironside's lowercase enums, unknown type falls back to `span` rather than dropping the row), parent linkage, name, timing (start/end/completionStartTime), statusMessage, model, modelParameters, input/output, `usageDetails` (modern record; values rounded to satisfy the integer domain constraint), `costDetails` (falling back to legacy `calculated*Cost` fields when absent), metadata — plus prompt linkage (`promptName`/`promptVersion`) preserved as `langfuse:*` metadata keys since Ironside has no dedicated column.
-- **Scores**: name, dataType/source (normalized, with the same `api` fallback as the ingest-side compat mapper), value (`0` is meaningful — null-checked, never truthiness-checked), stringValue, comment, observationId linkage, and the **original timestamp** — which required adding an optional `timestamp` field to the shared `Score` domain schema and threading it through `insertScores`, since the ClickHouse column otherwise defaults to insert time and backfilled scores would all look like they were created at import time.
-- **Trace detail-only fields**: `environment`.
+- `type` and `level` are lowercased. An unknown type becomes `span` and an unknown or missing level becomes `default`, so the row is kept.
+- `parentObservationId`, `name`, `startTime`, `endTime`, `completionStartTime`, `statusMessage`, `model`, `input` and `output` map directly (an explicit `null` input or output is kept).
+- `modelParameters` keep string, number, boolean and null values; other values are JSON-stringified.
+- `usageDetails`: finite, non-negative values are rounded to integers (the column is an unsigned integer map) and others are dropped; key names are canonicalized (`input` becomes `input_tokens`, see `spec/usage-keys-v1.md`) and unknown keys pass through. Only `usageDetails` is read, not the legacy `usage` object.
+- `costDetails` is used when present and non-empty; otherwise the legacy `calculatedInputCost`, `calculatedOutputCost` and `calculatedTotalCost` become `input`, `output` and `total`.
+- Prompt linkage has no native column and is kept in metadata as `langfuse:promptName` and `langfuse:promptVersion`.
 
-Failure containment: a failed detail fetch fails the whole run *before* that page's checkpoint save — a retry re-fetches the page and all its details idempotently; no partial page is ever recorded as done (fixture-tested, including the retry-after-recovery path).
+**Score:**
 
-Full-data conformance against the real account (same isolated project, cleared first): **51/51 traces, 48/48 observations, 6/6 scores** — each count checked against the API's own `meta.totalItems`, plus a per-trace tree-size spot-check, a field-level spot-check (model/input/output/usage), and confirmation the oldest imported scores carry their original May-2026 timestamps rather than import time.
+- `name`, `value`, `stringValue`, `comment`, `observationId` and stringified `metadata` map directly. `value` is checked for null, not truthiness, so `0` is kept.
+- `dataType` `NUMERIC`/`CATEGORICAL`/`BOOLEAN` is lowercased; any other value becomes `numeric` when `value` is a number and `categorical` otherwise.
+- `source` `API`/`EVAL`/`ANNOTATION` is lowercased; any other value becomes `api`, the same fallback as the compat mapper.
+- The score keeps its original `timestamp`. A score without one takes its trace's timestamp, because the ClickHouse score key includes the score's date and an insert-time default would create a second row when a retry crosses UTC midnight.
+- A score that fails the domain schema (no `value` and no `stringValue`, an invalid timestamp) is dropped; its trace still imports.
 
-### Accepted limitations inherent to LangFuse's page/limit pagination (flagged in code review, documented rather than fixed)
+**Invalid traces.** If a trace or one of its observations fails mapping or domain validation (for example an identifier longer than 512 UTF-8 bytes or containing NUL), that trace is skipped and reported through `onInvalidTrace`; the scheduler reports it to its error hook as `import:langfuse:<traceId>`. The rest of the page imports and the checkpoint advances, so one bad trace cannot pin the source.
 
-- **Tied-timestamp tail group**: the inclusive-`fromTimestamp` resume re-fetches not just one boundary trace but every trace sharing the anchor's exact timestamp. If such a tied group sits at the true end of the dataset (no newer data ever arrives), every future scheduled invocation re-fetches and re-inserts the whole group — harmless per-row (ReplacingMergeTree dedups), but an unbounded repeating cost proportional to the tie-group size. A tie-breaker (e.g. secondary ordering by trace id) would bound it, but LangFuse's list API offers no such parameter; accepted as-is.
-- **Live mutation during a fixed-anchor window**: `page`/`limit` offsets are computed against whatever the server's live query returns at request time. A trace becoming visible with an earlier sort position *between two page fetches of the same run* (out-of-order arrival, clock skew) can shift page boundaries and skip or duplicate a row — inherent to offset pagination against a mutable dataset with no stable cursor, and not something the anchor/page checkpoint invariant can close. Duplicates are dedup-safe; a skip would be caught by a later full re-import (which the idempotency property makes cheap to run periodically).
+## Publication
 
-## Not yet done (follow-up, not blocking M5-02's DoD)
+Imported traces pass through the same fail-closed publication barrier as ingested ones (`spec/evaluator-integration-v1.md`):
 
-~~No scheduler, cron, or API-triggered route~~ — **done since**: import source credentials + scheduling in M5-07 (spec/import-source-scheduling-v1.md); a periodic worker tick claims due sources and calls `runLangfuseImport`, exactly the rubrist-poller-style pattern this note anticipated.
+- Each page's valid snapshots (trace, observations and scores) are staged in Postgres `evaluator_import_trace_state`, keyed by project, trace and source with a content hash, before anything is written to ClickHouse.
+- An unchanged snapshot that is already materialized writes nothing. Re-importing, including after the checkpoint is cleared, is therefore idempotent.
+- A changed snapshot gets a new generation, strictly later than the trace's previous one, which becomes the rows' `event_ts`. Materialization tombstones the previously imported tree first, so observations and scores the source no longer returns disappear, then writes the new rows and publishes a new trace version to the trace feed.
+- A change to scores alone replaces this provider's imported scores and notifies the score feed without reopening the trace. Imported scores carry `import_source = 'langfuse'`, so native, manual and evaluator scores on the same trace are never replaced.
+- Materialization fails closed when the project's import retention cutoff is missing, and discards a snapshot whose trace timestamp is older than the cutoff. The inclusive `fromTimestamp` boundary therefore cannot bring back a trace that retention removed.
+- A snapshot left pending by a crash is completed by the next run, or, once the lease has expired, by the scheduler's recovery pass, which needs no provider credentials.
+
+`imported` counts the traces staged per page, including unchanged ones.
+
+## Failure behavior
+
+A failed list or detail request (a non-2xx response, a network error, or a body that fails schema parsing) fails the run before that page is staged or its checkpoint saved, so the next run fetches the whole page again; a partial page is never recorded as done. A failed run sets `status = 'error'` and `last_error` and rethrows.
+
+## Known limits of page/limit pagination
+
+- **Tied timestamps at the tail.** The inclusive `fromTimestamp` re-fetches every trace sharing the anchor's exact timestamp. If such a group is the newest data, every later run fetches it again until newer data arrives. The re-fetch writes nothing when the content is unchanged, but it costs one detail request per trace in the group. LangFuse's list API has no secondary sort key to break the tie.
+- **Changes during a run.** Offsets are computed against the live query at request time. A trace that becomes visible at an earlier sort position between two page requests of one run (late arrival, clock skew) can shift page boundaries and skip or duplicate a row. A duplicate is harmless; a skipped trace is picked up by a full re-import, which is cheap because unchanged traces write nothing.
+
+## Verified
+
+`apps/worker/test/langfuse-importer.test.ts` runs `runLangfuseImport` against a mock LangFuse HTTP server with real Postgres and ClickHouse. It covers a multi-page import, resuming from the checkpoint, the page cap, a capped run resumed until every fixture trace arrives (the checkpoint invariant), full trees with observations and scores keeping their original timestamps, dropping unusable scores, tombstoning rows a later snapshot omits, recovering a staged snapshot after its lease expires, monotonic score generations, a failed detail fetch not advancing the checkpoint, skipping an invalid identifier while advancing the page, not resurrecting an expired boundary trace, failing closed without a retention cutoff, a concurrent run returning `null`, and `error` status on a source failure. `apps/worker/test/langfuse-mapper.test.ts` covers the field mapping: enum normalization and fallbacks, explicit `null` input/output, legacy cost fallback, usage rounding, prompt metadata, environment normalization, and score value, source, timestamp and drop rules.
+
+## History
+
+- M5-02 added the importer: trace-level fields only, a checkpoint saved after every page, and an anchor fixed for the whole run. An integration test against a multi-page mock server caught the anchor moving within a run.
+- M5-04 ran it against a real self-hosted LangFuse account with 51 traces. With `pageSize=10` and `maxPagesPerRun=3`, run 1 saved `{lastTimestamp: T30, page: 4}`; run 2 asked for page 4 of the re-anchored `[T30, ∞)` window, got an empty page, and reported the source exhausted with 21 traces missing. The fixture test had checked the checkpoint's shape after a capped run but never resumed to completion. The checkpoint invariant above fixed it, with a regression test that resumes a capped run to completion. After the fix the account imported 51 of 51 traces across two runs, re-importing produced no duplicates, and names, user and session ids, tags and timestamps matched the API.
+- M5-05 made imports full-data: the per-trace detail request, observations, scores and `environment`. It added the optional `timestamp` to the shared `Score` schema and `insertScores` so imported scores keep their original time instead of the insert time. Conformance against the same account: 51/51 traces, 48/48 observations and 6/6 scores, each checked against the API's `meta.totalItems`.
+- M5-07 added import sources and the scheduler (`spec/import-source-scheduling-v1.md`); before that `runLangfuseImport` had no trigger.
+- M9-04 canonicalized usage keys to `input_tokens`/`output_tokens`/`total_tokens`.
+- Imports moved onto the evaluator publication barrier. Before, each page was inserted straight into ClickHouse with one fixed `event_ts` per run and ReplacingMergeTree collapsed re-imported rows. The barrier added staged snapshots with content-hash generations, run tokens with renewable leases, tombstoning of rows the source no longer returns, the import retention cutoff, and per-trace skipping of invalid rows.

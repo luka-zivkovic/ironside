@@ -8,8 +8,8 @@ import protobuf from "protobufjs";
 // hex, other bytes as base64 — the standard protobuf JSON mapping with
 // OTLP's id-fields-are-hex override), so everything downstream of the
 // content-type branch (Zod schema, raw envelope, worker mapper) is one
-// shared code path and the two encodings are idempotency-equivalent:
-// the same export sent as protobuf and as JSON hashes to the same key.
+// shared code path: the same export sent as protobuf and as JSON is stored
+// as the same event body.
 //
 // The .proto files are vendored (apps/api/proto/, Apache-2.0, pinned to
 // opentelemetry-proto v1.10.0 — see proto/README.md) rather than pulled

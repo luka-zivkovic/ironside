@@ -1,38 +1,71 @@
-# Import Source Scheduling v1 (M5-07)
+# Import Source Scheduling v1
 
-Status: implemented, verified live end-to-end. Owner: `packages/db/migrations/0001_baseline.sql`, `packages/db/src/import-sources.ts`, `apps/api/src/routes/import-sources.ts`, `apps/worker/src/scheduler.ts`.
+Status: implemented. Owner: `packages/db/src/import-sources.ts`, `apps/api/src/routes/import-sources.ts`, `packages/shared/src/management.ts`, `apps/worker/src/scheduler.ts`, `packages/db/migrations/0001_baseline.sql`.
 
 ## Purpose
 
-M6-05 wired a scheduler for exports/forwards/webhooks/retention but deliberately deferred LangFuse/LangSmith import scheduling — unlike those three, there was no persisted credentials/config table for the importers at all. `import_checkpoints` (M5) is runtime *progress* state (only exists once an import has actually run, holds no secrets); this batch adds the actual source *configuration* those checkpoints are progress against.
+Store the credentials and schedule for each project's LangFuse or LangSmith import, so the worker runs the importers (`spec/langfuse-importer-v1.md`, `spec/langsmith-importer-v1.md`) on its own. `import_sources` holds this configuration; `import_checkpoints` holds the progress and status of the runs made against it.
 
-## Design
+## Storage
 
-- **`import_sources` table**: one row per (project, provider) — same uniqueness shape as `import_checkpoints`. Credentials are stored as a single AES-256-GCM-encrypted JSON blob rather than per-field columns, since the two providers' credential shapes genuinely differ (LangFuse: `{publicKey, secretKey, baseUrl}`; LangSmith: `{apiKey, baseUrl?, sessionIds}`) — a blob keeps the table generic across future importer providers too.
-- **Same `poll_interval_seconds`/`next_run_at` + `claimDueImportSources`** (`FOR UPDATE SKIP LOCKED`) pattern M6-05 established for the other three subsystems — no new scheduling mechanism invented, the existing one just gets a fourth table.
-- **`upsertImportSource` upserts by (project, provider)**, not a plain create — connecting the same provider twice (e.g. rotating credentials) replaces the existing row (and re-enables it if previously disabled) rather than erroring on a uniqueness conflict the caller would then have to resolve by finding and deleting the old row first.
-- **A discriminated-union wire schema** (`createImportSourceRequestSchema` in `packages/shared/src/management.ts`), not one loose bag of optional fields — a LangFuse request can't accidentally carry `sessionIds`, nor a LangSmith request `publicKey`/`secretKey`, with the mistaken field silently ignored.
-- **Imports run on their own scheduler timer, separate from the fast exports/forwards/webhooks tick.** A real backfill against an external API can genuinely take minutes (paginated, source-rate-limited); bundling it into the shared tick would stall the other three subsystems behind a slow import run every cycle. `runImportTick` mirrors `runTick`'s reentrancy guard (`importTicking`) for the same "don't pile up under sustained slowness" reason.
-- **The scheduler's own catch block only needs to cover the narrow pre-importer failure window** (decrypting/JSON-parsing the stored credentials blob) — `runLangfuseImport`/`runLangsmithImport` already record their own outcome via `markImportRunIdle`/`markImportRunFailed` on every path they reach and rethrow, the identical self-bookkeeping pattern M6-05 established for `runExport`. No redundant recording, and no risk of the M6-05 "double-record corrupts the empty-result case" bug class recurring here.
+`import_sources` has one row per `(project_id, provider)`, the same uniqueness as `import_checkpoints`: `provider` (`langfuse` | `langsmith`), `encrypted_credentials`, `enabled` (default true), `poll_interval_seconds` (default 3600, must be positive), `next_run_at` (default now, so a new source is due at once), and timestamps. Rows are deleted with their project.
 
-## Verification
+Credentials are one JSON object, encrypted with AES-256-GCM by `encryptSecret` (key from `IRONSIDE_ENCRYPTION_SECRET`) before they reach Postgres:
 
-- `packages/db/test/import-sources.test.ts`: 8 tests — upsert-creates-new, upsert-by-(project,provider)-replaces-not-duplicates (proven with a deliberately different id on the second call), re-upsert re-enables a disabled source, custom `pollIntervalSeconds` respected, claim/reschedule/disabled-exclusion/concurrent-claim-exclusivity (same properties `scheduling.test.ts` proves for the other three tables), project-scoped delete. **Every test uses its own freshly-created project**, not one shared project across the file — found empirically that two tests sharing a project and the same provider silently collapsed onto the same upserted row and corrupted each other's assertions, since `import_sources`' uniqueness is genuinely per-(project, provider), unlike the other three tables' per-row-id uniqueness.
-- `apps/api/test/import-sources.test.ts`: 6 tests — connect LangFuse and LangSmith sources (different credential shapes), credentials never echoed back (asserted both by key-absence and by `JSON.stringify` not containing the plaintext anywhere), a LangFuse request carrying LangSmith-only fields is rejected 400, upsert-replaces on reconnect, patch/delete project-scoping.
-- `apps/worker/test/scheduler.test.ts`: 4 new integration tests — a claimed LangFuse import source is decrypted and dispatched to the real `runLangfuseImport`, proven via the `import_checkpoints` row it independently writes (status transitions to `'error'` with a real network failure, since no live LangFuse account is available in this environment) — this proves the scheduler → decrypt → real-importer wiring works end to end, not just that `claimDueImportSources` returns a row. A source whose decrypted credentials' provider disagrees with the DB row's own provider column is rejected before either importer runs (the provider-mismatch hardening below). One project's malformed import source doesn't block a different project's import in the same tick. Uses a closed local port (`127.0.0.1:9`, fails fast with `ECONNREFUSED`) rather than an unroutable address (RFC 5737 TEST-NET-1), which was the first version and timed out — an unroutable address can hang for a full OS-level TCP connect timeout (60s+) instead of rejecting immediately.
-- **Live end-to-end, not just tests**: started the real API and worker processes against the live local stack, connected a LangFuse import source via `POST /api/v1/import-sources` with an unreachable `baseUrl`, and confirmed the running scheduler picked it up on its own next tick, decrypted the credentials, called the real `runLangfuseImport`, and recorded the resulting network failure in `import_checkpoints` — the full create-via-API → scheduler-picks-it-up → real-importer-invoked chain proven in a real running deployment.
-- Full suite: 339/339 passing (18 new), run 4× to confirm no flakiness; build + typecheck clean.
+- LangFuse: `{ provider, publicKey, secretKey, baseUrl }`
+- LangSmith: `{ provider, apiKey, baseUrl?, sessionIds }`, where `sessionIds` are the LangSmith project UUIDs to import from.
 
-## A SQL type-inference bug caught and fixed before merge
+A single blob keeps the table the same across providers whose credential shapes differ.
 
-`upsertImportSource`'s INSERT used `coalesce($5, $6)` for the optional `pollIntervalSeconds` override, where `$5` is `null` on most calls (no override supplied). Unlike `updateExportConfig`/`updateOtlpForwardRule`/`updateWebhookRule`'s `coalesce($n, existing_column)` (where the column reference gives Postgres a typed context to resolve against), an INSERT's `coalesce($5, $6)` has no such context — both sides are bind parameters, and node-postgres sends an untyped `null` as text by default, producing `column "poll_interval_seconds" is of type integer but expression is of type text`. Caught immediately by the new DB-layer tests (not discovered later in an integration test or in production), fixed with an explicit `$5::integer` cast, verified against real Postgres before and after.
+## API
 
-## Provider-mismatch hardening, caught by code review
+Owner-session routes under `/api/v1/projects/:projectId` (`spec/project-session-routing-v1.md`); machine credentials cannot reach them.
 
-`tickImports`' original version parsed the decrypted credentials blob with a bare `as` type assertion and dispatched on the parsed blob's OWN `provider` field, not the DB row's `provider` column. `as` performs no runtime validation — a decrypted-but-tampered or corrupted blob whose `provider` field disagreed with the stored column (e.g. under direct DB tampering, or an encryption-key mixup across environments) would silently run the WRONG importer against the wrong project's `import_checkpoints` row, rather than failing cleanly. Verified as a real, reachable bug (not theoretical) by reverting the fix and confirming a `langsmith`-column row with a `langfuse`-claiming decrypted blob dispatched straight into `runLangfuseImport` with no error. Fixed: dispatch is now keyed on `source.provider` (the trusted DB column), with an explicit `parsed.provider !== source.provider` check that fails loudly via `onError` before either importer is ever invoked. Regression-tested by reverting and confirming the exact failure signature (`TypeError: fetch failed` instead of the expected mismatch error) reproduces.
+- `GET /import-sources` returns `{ importSources: [...] }` in creation order.
+- `POST /import-sources` connects a source and returns 201. The body is a union discriminated on `provider` (`createImportSourceRequestSchema`):
+  - `langfuse`: `publicKey` and `secretKey` (non-empty), `baseUrl` (a URL).
+  - `langsmith`: `apiKey` (non-empty), optional `baseUrl` (a URL), `sessionIds` (a non-empty array of non-empty strings).
+  - Either may add `pollIntervalSeconds`, an integer from 1 to 2,592,000 (30 days).
 
-## Not yet done (follow-up, not blocking this batch's DoD)
+  A body missing a field its provider requires returns 400 `{ error: "invalid request", issues }`. Fields the chosen provider does not define are dropped before encryption. `POST` upserts by `(project, provider)`: connecting a provider again (for example to rotate credentials) keeps the same id, replaces the whole credential blob, re-enables the source, and keeps the existing poll interval unless a new one is given. It does not change `next_run_at`.
+- `PATCH /import-sources/:id` updates `enabled` and `pollIntervalSeconds` only.
+- `DELETE /import-sources/:id` returns 204. It does not remove the project's `import_checkpoints` row, so connecting the same provider again resumes from the saved checkpoint.
 
-- **No route to update credentials without a full reconnect.** `POST /import-sources` always replaces the entire credential blob; there's no partial-credential-rotation endpoint (same scope decision M6-06 made for exports/forwards/webhooks — `PATCH` only covers `enabled`/`pollIntervalSeconds`).
-- **`sessionIds` for a LangSmith source is fixed at connect time.** Adding/removing which LangSmith projects to pull from requires a full reconnect (re-`POST`), not a dedicated `PATCH` field — same "the common day-2 knobs are `enabled`/`pollIntervalSeconds`, broader field updates deferred" scope decision.
-- **Real LangSmith account conformance remains blocked** on user-provided credentials (tracked in `ROADMAP.md`, unrelated to this batch — this batch's job was scheduling wiring, not the importer's own correctness, which M5-03/M5-06 already fixture-tested).
+Responses are `{ id, projectId, provider, enabled, pollIntervalSeconds, nextRunAt }`; no credential field appears in any response. `PATCH` and `DELETE` match on both id and project, so another project's source returns the same 404 `{ error: "import source not found" }` as a missing one.
+
+## Scheduling
+
+Imports run on their own timer in the worker's scheduler, at the same interval as the main tick (`SCHEDULER_TICK_INTERVAL_MS`, default 30 seconds). A backfill against an external API can take minutes, and the main tick runs exports, OTLP forwards and webhooks one after another, so sharing it would delay them behind a slow import. A new import tick does not start while the previous one is still running.
+
+Each import tick:
+
+1. Ensures every project has an import retention cutoff (`seedEvaluatorImportRetentionCutoffs`). If that fails, the tick stops and no import runs, because an import without a cutoff could bring back traces retention removed.
+2. Runs `recoverAbandonedEvaluatorImports`, which completes staged snapshots whose run is no longer live, for up to 25 project/provider pairs. It needs no provider credentials, so a disabled or deleted source cannot leave a snapshot stuck.
+3. Claims up to 25 due sources with `claimDueImportSources`: enabled, `next_run_at <= now()`, oldest first, `FOR UPDATE SKIP LOCKED`. The claim sets `next_run_at` to now plus the poll interval, so concurrent ticks or worker replicas never claim the same row, and a slow or failed run does not change the cadence.
+4. For each claimed source in turn, decrypts and parses the credentials, checks that the blob's `provider` equals the row's `provider` column, and calls `runLangfuseImport` or `runLangsmithImport`, chosen by the column, with the importers' default page size and page cap.
+
+A run imports at most 20 pages of 50 traces. A larger history continues on the next scheduled run, one poll interval later.
+
+## Failure behavior
+
+- The importers record their own outcome in `import_checkpoints` (`idle`, or `error` with `last_error`) and rethrow; the scheduler reports the error to its error hook under `import` and counts it in `ironside_scheduler_runs_total{subsystem="import"}`.
+- A failure before the importer starts (a decryption error, unparseable JSON, or a provider mismatch) is reported to the error hook and the metric only; nothing is written to `import_checkpoints`. The provider check keeps a tampered blob, or one decrypted with the wrong environment's key, from running the wrong importer against the wrong checkpoint row.
+- One source's failure does not stop the other sources in the tick. Either way the claim has already moved `next_run_at`, so the source is tried again one poll interval later.
+- A trace the importer skips as invalid is reported to the error hook as `import:langfuse:<traceId>` or `import:langsmith:<traceId>`.
+- When another live run holds the source's checkpoint, the importer returns without running and the tick counts it as a success.
+
+## Verified
+
+- `packages/db/test/import-sources.test.ts` covers upsert defaults, reconnecting the same provider replacing the row rather than adding one, re-enabling a disabled source, a custom poll interval, a claim advancing `next_run_at`, a disabled source never being claimed, concurrent claims never taking the same row, and project-scoped delete. Each test creates its own project, since two tests sharing a project and provider would collapse onto one upserted row.
+- `apps/api/test/import-sources.test.ts` covers the 401 without an owner session, connecting LangFuse and LangSmith sources, credentials absent from responses (checked by key and by searching the serialized body for the secret) and decrypting to what was sent, a 400 for a LangFuse body carrying LangSmith fields instead of its own, reconnect keeping the same id, and patch and delete including cross-project 404s.
+- `apps/worker/test/scheduler.test.ts` covers a claimed LangFuse source being decrypted and passed to the real `runLangfuseImport` (shown by the `error` row it writes in `import_checkpoints` after failing against a closed local port), a provider mismatch being reported without running either importer, and one project's undecryptable source not blocking another project's import in the same tick.
+
+## History
+
+- M6-05 added the scheduler for exports, OTLP forwards, webhooks and retention but left imports out, because there was no table of import credentials. M5-07 added `import_sources`, the CRUD routes and the separate import timer, and was checked live: a source created through the API was picked up by a running worker, which decrypted it and ran the real importer.
+- `upsertImportSource` first used `coalesce($5, $6)` for the optional poll interval. node-postgres sends an untyped `null` as text, so the insert failed with a type error; the DB tests caught it, and `$5::integer` fixed it.
+- Review found that dispatch used the decrypted blob's own `provider` behind an `as` cast, so a blob disagreeing with the row ran the wrong importer. Dispatch now uses the row's column plus the explicit mismatch check, with a regression test.
+- The scheduler tests first pointed sources at an unroutable TEST-NET-1 address, which can hang for a full TCP connect timeout; they now use the closed local port `127.0.0.1:9`, which fails at once.
+- Issue #64 moved the routes from the flat `/api/v1/import-sources` to the owner-session `/api/v1/projects/:projectId/import-sources`.
+- The retention cutoff step and the recovery pass were added when imports moved onto the evaluator publication barrier (`spec/evaluator-integration-v1.md`).
+- Still open: there is no way to rotate credentials or change a LangSmith source's `sessionIds` without reconnecting with a full `POST`; `PATCH` covers only `enabled` and `pollIntervalSeconds`.

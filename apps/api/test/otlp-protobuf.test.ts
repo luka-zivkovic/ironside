@@ -23,7 +23,7 @@ import { createTestMachineCredential } from "./helpers/machine-credential.js";
 
 // OTLP/HTTP+protobuf ingest (M9-06). Three layers of proof:
 // 1. Parity: the same export sent as protobuf and as JSON produces an
-//    identical stored raw envelope (same body, same idempotency key) —
+//    identical stored raw envelope body —
 //    the protobuf path is a decode step, not a second pipeline.
 // 2. Conformance: the REAL OTel JS SDK protobuf exporter
 //    (@opentelemetry/exporter-trace-otlp-proto — what actual users run)
@@ -189,7 +189,7 @@ describe("POST /v1/otel/traces (protobuf)", () => {
     expect((await res.arrayBuffer()).byteLength).toBe(0);
   });
 
-  it("stores the SAME raw envelope for protobuf and JSON encodings of one export (parity + shared idempotency key)", async () => {
+  it("stores the SAME raw envelope body for protobuf and JSON encodings of one export", async () => {
     storedBatches.length = 0;
 
     const protoRes = await post(protobufExport(), { "content-type": "application/x-protobuf" });
@@ -200,7 +200,13 @@ describe("POST /v1/otel/traces (protobuf)", () => {
 
     const [protoEvent, jsonEvent] = [storedBatches[0]!.events[0]!, storedBatches[1]!.events[0]!];
     expect(protoEvent.body).toEqual(jsonEvent.body);
-    expect(protoEvent.idempotencyKey).toBe(jsonEvent.idempotencyKey);
+    // Only the per-request event id (and the key that defaults to it) differ.
+    expect({ ...protoEvent, id: undefined, idempotencyKey: undefined }).toEqual({
+      ...jsonEvent,
+      id: undefined,
+      idempotencyKey: undefined
+    });
+    expect(protoEvent.idempotencyKey).toBe(protoEvent.id);
   });
 
   it("accepts gzip content-encoding for both encodings", async () => {

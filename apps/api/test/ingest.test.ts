@@ -125,7 +125,8 @@ describe("POST /api/v1/ingest", () => {
     expect(raw.batchId).toBe(batchId);
     expect(raw.events).toHaveLength(1);
     expect(raw.events[0]?.source).toBe("native");
-    expect(raw.events[0]?.idempotencyKey).toMatch(/^[0-9a-f]{64}$/);
+    // Without a client key, the event id stands in for it (no body hashing).
+    expect(raw.events[0]?.idempotencyKey).toBe(raw.events[0]?.id);
     // Server assigns ids to events that lack one.
     expect(raw.events[0]?.id).toBeTruthy();
 
@@ -137,6 +138,28 @@ describe("POST /api/v1/ingest", () => {
     await storage.delete(
       pendingIngestObjectKey(raw.batchId)
     );
+    await job?.remove();
+  });
+
+  it("stores a client-sent idempotencyKey as sent", async () => {
+    const payload = tracePayload();
+    const res = await app.request("/api/v1/ingest", {
+      method: "POST",
+      body: JSON.stringify({
+        events: payload.events.map((event) => ({ ...event, idempotencyKey: "client-request-7" }))
+      }),
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${apiKey}`
+      }
+    });
+    expect(res.status).toBe(202);
+    const { batchId } = (await res.json()) as { batchId: string };
+    const job = await queue.getJob(batchId);
+    const raw = (await storage.getJson(job!.data.objectKey)) as IngestBatch;
+    expect(raw.events[0]?.idempotencyKey).toBe("client-request-7");
+
+    await storage.delete(pendingIngestObjectKey(raw.batchId));
     await job?.remove();
   });
 });

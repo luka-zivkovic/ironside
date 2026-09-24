@@ -286,6 +286,7 @@ function mapMergedObservation(
     ...(body.parentObservationId && { parentObservationId: body.parentObservationId }),
     ...(body.name && { name: body.name }),
     ...(body.endTime && { endTime: body.endTime }),
+    ...(body.completionStartTime && { completionStartTime: body.completionStartTime }),
     ...(body.statusMessage && { statusMessage: body.statusMessage }),
     ...(body.model && { model: body.model }),
     ...(body.modelParameters && {

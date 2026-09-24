@@ -98,6 +98,7 @@ Changes after 0.3.0 are separate migrations:
 | Postgres `0003_destination_feed_cursors` | Trace-feed positions for scheduled exports and OTLP forward rules (spec/scheduled-export-v1.md) |
 | Postgres `0004_trace_score_feed_and_forward_status` | Score feed and score positions for exports; last-run status for OTLP forward rules (spec/scheduled-export-v1.md, spec/otlp-forwarding-v1.md) |
 | Postgres `0005_langfuse_field_provenance` | When each LangFuse-compatible field was last sent, for order-independent merging (spec/langfuse-compat-v1.md) |
+| Postgres `0006_webhook_feed_cursors` | Trace-feed positions, last-run status, and the handoff from activity-time delivery keys, for webhook rules (spec/webhooks-v1.md) |
 
 Protocol compatibility is a separate concern and is not removed by this policy.
 Ironside still accepts supported OTLP and LangFuse wire shapes because those are

@@ -81,6 +81,11 @@ export interface ListTracesParams {
   tags?: string[];
   metadataKey?: string;
   metadataValue?: string;
+  search?: string;
+  level?: string;
+  model?: string;
+  minDurationMs?: number;
+  minCost?: number;
   limit?: number;
   cursor?: string;
 }
@@ -94,6 +99,11 @@ function buildQuery(params: ListTracesParams): string {
   if (params.environment) search.set("environment", params.environment);
   if (params.metadataKey) search.set("metadataKey", params.metadataKey);
   if (params.metadataValue) search.set("metadataValue", params.metadataValue);
+  if (params.search) search.set("search", params.search);
+  if (params.level) search.set("level", params.level);
+  if (params.model) search.set("model", params.model);
+  if (params.minDurationMs !== undefined) search.set("minDurationMs", String(params.minDurationMs));
+  if (params.minCost !== undefined) search.set("minCost", String(params.minCost));
   if (params.limit) search.set("limit", String(params.limit));
   if (params.cursor) search.set("cursor", params.cursor);
   for (const tag of params.tags ?? []) search.append("tags", tag);
@@ -246,8 +256,8 @@ export async function revokeMachineCredential(projectId: string, id: string): Pr
 
 // Media assets (M9-09): trace input/output JSON carries compact refs
 // ("ironside://media/<id>") instead of blob bytes; the viewer resolves
-// them here. Returns the blob so callers can build an object URL — an
-// <img src> can't carry the Authorization header.
+// them here. Returns the blob so callers can build an object URL, which
+// also keeps a failed fetch visible to the caller instead of a broken image.
 export const MEDIA_REF_PATTERN = /ironside:\/\/media\/([0-9A-HJKMNP-TV-Z]{26})/g;
 
 export async function fetchMediaBlob(projectId: string, id: string): Promise<Blob> {

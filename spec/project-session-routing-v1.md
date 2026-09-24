@@ -1,6 +1,8 @@
 # Owner-session project routing v1
 
-Status: implemented for issue #64; machine credential details updated by #65.
+Status: implemented. Owner: `apps/api/src/app.ts`,
+`apps/api/src/middleware/owner-session.ts`, `apps/api/src/routes/projects.ts`,
+`apps/web/src/App.tsx`.
 
 Ironside has two deliberately separate principals. A human owner uses the
 HttpOnly `ironside_session` cookie for the browser/control plane. A machine
@@ -14,7 +16,7 @@ Session APIs name the project explicitly:
 - `GET|POST /api/v1/projects` lists or creates projects in the session's organization.
 - `GET /api/v1/viewer-config` returns deployment-level viewer settings (currently the optional `rubristUrl`; see [`evaluator-integration-v1.md`](./evaluator-integration-v1.md#viewer-deep-links)). It is not project-scoped.
 - `/api/v1/projects/:projectId/traces[...]` is the native browser query surface.
-- `/api/v1/projects/:projectId/{credentials,environments,exports,otlp-forwards,webhooks,import-sources}` is management/discovery.
+- `/api/v1/projects/:projectId/{credentials,environments,exports,otlp-forwards,webhooks,import-sources,quotas,model-prices}` is management/discovery.
 - `/api/v1/projects/:projectId/{ingest-failures,media/:mediaId}` and raw-event inspection are sensitive owner reads.
 
 Every nested request passes through `ownerProjectAuth`: it resolves the URL
@@ -30,10 +32,10 @@ Machine credentials remain key-implicit and cannot choose a project:
 - `POST /v1/otel/traces`
 - `/api/public/*` LangFuse-compatible reads, ingestion, and score writes
 
-The former flat native query and management routes are removed. Supplying a
-Bearer key to a nested session route returns 401 before project lookup. Owner
-mutations additionally require an exact configured browser `Origin` and reject
-cross-site Fetch Metadata.
+There are no flat, project-implicit native query or management routes.
+Supplying a Bearer key to a nested session route returns 401 before project
+lookup. Owner mutations additionally require an exact configured browser
+`Origin` and reject cross-site Fetch Metadata.
 
 ## Browser model
 
@@ -55,8 +57,8 @@ are in `spec/scoped-machine-credentials-v1.md`.
 
 ## Cookie-jar management example
 
-For automation during this owner-only management phase, use a cookie jar and
-the exact origin configured in `WEB_ORIGINS`:
+For automation, use a cookie jar and the exact origin configured in
+`WEB_ORIGINS`:
 
 ```sh
 ORIGIN=http://localhost:8080
@@ -78,3 +80,9 @@ delete it after the operation. The browser UI is the preferred human workflow.
 
 The frozen baseline contains the scoped credential table
 directly; see `spec/scoped-machine-credentials-v1.md`.
+
+## History
+
+- Issue #64 moved native queries and management under project-explicit
+  owner-session routes and removed the former flat routes. #65 updated the
+  machine credential details.

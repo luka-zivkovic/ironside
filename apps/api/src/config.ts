@@ -132,7 +132,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       "AUTH_RATE_LIMIT_PER_15_MINUTES"
     ),
     authTrustProxy: env.AUTH_TRUST_PROXY === "true",
-    defaultRateLimitPerMinute: Number(env.DEFAULT_RATE_LIMIT_PER_MINUTE ?? 300),
+    // A non-numeric value would otherwise become NaN, which the limiter never exceeds.
+    defaultRateLimitPerMinute: positiveInteger(
+      env.DEFAULT_RATE_LIMIT_PER_MINUTE,
+      300,
+      "DEFAULT_RATE_LIMIT_PER_MINUTE"
+    ),
     defaultTraceQuietPeriodSeconds: Number(
       env.DEFAULT_TRACE_QUIET_PERIOD_SECONDS ?? DEFAULT_TRACE_QUIET_PERIOD_SECONDS
     ),
