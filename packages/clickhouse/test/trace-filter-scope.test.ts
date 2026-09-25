@@ -3,7 +3,7 @@ import type { Observation, Trace } from "@ironside/shared";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createClickHouseClient } from "../src/client.js";
 import { runMigrations } from "../src/migrate.js";
-import { getAggregates, listTraces, type TraceFilter } from "../src/queries.js";
+import { buildTraceConditions, getAggregates, listTraces, observationScopeApplies, type TraceFilter } from "../src/queries.js";
 import { deleteMovedObservationRows, insertObservations, insertTraces } from "../src/rows.js";
 
 const clickhouse = createClickHouseClient({
@@ -29,8 +29,8 @@ const ids = {
   moved: `trace_moved_${randomUUID()}`
 };
 
-function trace(id: string, timestamp: string, userId?: string): Trace {
-  return { id, projectId, timestamp, tags: [], metadata: {}, ...(userId && { userId }) };
+function trace(id: string, timestamp: string, extra: Partial<Trace> = {}): Trace {
+  return { id, projectId, timestamp, tags: [], metadata: {}, ...extra };
 }
 
 /** An observation matching every filter below: model, level, search, duration and cost. */
@@ -67,9 +67,9 @@ beforeAll(async () => {
   await insertTraces(
     clickhouse,
     [
-      trace(ids.startedMonthsBefore, "2026-06-15T12:00:00.000Z", "u-scope"),
-      trace(ids.startedMonthsAfter, "2026-06-20T12:00:00.000Z"),
-      trace(ids.outsideRange, "2026-05-01T12:00:00.000Z", "u-scope"),
+      trace(ids.startedMonthsBefore, "2026-06-15T12:00:00.000Z", { userId: "u-scope", metadata: { tier: "gold" } }),
+      trace(ids.startedMonthsAfter, "2026-06-20T12:00:00.000Z", { sessionId: "s-scope" }),
+      trace(ids.outsideRange, "2026-05-01T12:00:00.000Z", { userId: "u-scope", sessionId: "s-scope", metadata: { tier: "gold" } }),
       trace(ids.changed, "2026-06-10T12:00:00.000Z"),
       trace(ids.deleted, "2026-06-11T12:00:00.000Z"),
       trace(ids.moved, "2026-06-12T12:00:00.000Z")
@@ -122,28 +122,64 @@ describe("observation filters limited to the traces the trace-level conditions s
   it.each(filters)("%s: matches traces whose observations start in other months, and only their latest versions", async (_name, filter) => {
     const inJune = await listTraces(clickhouse, { projectId, ...june, ...filter, limit: 100 });
     expect(inJune.map((row) => row.id)).toEqual([ids.startedMonthsAfter, ids.startedMonthsBefore]);
-    expect((await getAggregates(clickhouse, { projectId, ...june, ...filter })).trace_count).toBe(2);
+    // The aggregates read the same observations: one of 5 USD and 90 seconds per trace.
+    expect(await getAggregates(clickhouse, { projectId, ...june, ...filter })).toMatchObject({
+      trace_count: 2,
+      cost_totals: { total: 10 },
+      latency_p50: 90_000
+    });
 
-    // Another trace-level condition limits them the same way.
+    // A user or a session limits them the same way, and further trace-level conditions narrow the scope.
     const byUser = await listTraces(clickhouse, { projectId, userId: "u-scope", ...filter, limit: 100 });
     expect(byUser.map((row) => row.id)).toEqual([ids.startedMonthsBefore, ids.outsideRange]);
+    const bySession = await listTraces(clickhouse, { projectId, sessionId: "s-scope", ...filter, limit: 100 });
+    expect(bySession.map((row) => row.id)).toEqual([ids.startedMonthsAfter, ids.outsideRange]);
+    const byMetadata = await listTraces(clickhouse, { projectId, ...june, metadataKey: "tier", metadataValue: "gold", ...filter, limit: 100 });
+    expect(byMetadata.map((row) => row.id)).toEqual([ids.startedMonthsBefore]);
 
     // Without any, every trace in the project is considered.
     const all = await listTraces(clickhouse, { projectId, ...filter, limit: 100 });
     expect(all.map((row) => row.id)).toEqual([ids.startedMonthsAfter, ids.startedMonthsBefore, ids.outsideRange]);
   });
 
-  it("combines several observation filters within the range", async () => {
-    const rows = await listTraces(clickhouse, {
-      projectId,
-      ...june,
-      model: "m-scope",
-      level: "error",
-      search: "needle",
-      minDurationMs: 60_000,
-      minCost: 5,
-      limit: 100
-    });
-    expect(rows.map((row) => row.id)).toEqual([ids.startedMonthsAfter, ids.startedMonthsBefore]);
+  it("combines several observation filters within a range or for a user", async () => {
+    const every = { model: "m-scope", level: "error", search: "needle", minDurationMs: 60_000, minCost: 5, limit: 100 };
+    expect((await listTraces(clickhouse, { projectId, ...june, ...every })).map((row) => row.id)).toEqual([
+      ids.startedMonthsAfter,
+      ids.startedMonthsBefore
+    ]);
+    expect((await listTraces(clickhouse, { projectId, userId: "u-scope", ...every })).map((row) => row.id)).toEqual([
+      ids.startedMonthsBefore,
+      ids.outsideRange
+    ]);
+  });
+});
+
+describe("observationScopeApplies", () => {
+  it("scopes observation filters by a time range, a user or a session", async () => {
+    for (const narrowing of [june, { from: june.from }, { to: june.to }, { userId: "u-scope" }, { sessionId: "s-scope" }]) {
+      expect(await observationScopeApplies(clickhouse, { projectId, ...narrowing, model: "m-scope" }), JSON.stringify(narrowing)).toBe(true);
+    }
+  });
+
+  it("does not scope by environment, tags or metadata alone, which select traces across the whole history", async () => {
+    for (const spread of [{ environment: "production" }, { tags: ["t"] }, { metadataKey: "tier", metadataValue: "gold" }, {}]) {
+      expect(await observationScopeApplies(clickhouse, { projectId, ...spread, level: "error" }), JSON.stringify(spread)).toBe(false);
+    }
+  });
+
+  it("does not scope without an observation filter, or when the scope holds more traces than the limit", async () => {
+    expect(await observationScopeApplies(clickhouse, { projectId, ...june })).toBe(false);
+    // Five traces in June.
+    expect(await observationScopeApplies(clickhouse, { projectId, ...june, model: "m-scope" }, 5)).toBe(true);
+    expect(await observationScopeApplies(clickhouse, { projectId, ...june, model: "m-scope" }, 4)).toBe(false);
+  });
+
+  it("puts the trace-level conditions in each observation filter's PREWHERE only when asked", () => {
+    const filter: TraceFilter = { projectId, ...june, userId: "u", search: "s", level: "error", model: "m", minDurationMs: 1, minCost: 1 };
+    const scoped = buildTraceConditions(filter, { scopeObservations: true }).conditions.join("\n");
+    const scope = "prewhere trace_id in (select id from traces final where project_id = {projectId:String} and timestamp >= {from:DateTime64(3)} and timestamp <= {to:DateTime64(3)} and user_id = {userId:String})";
+    expect(scoped.split(scope)).toHaveLength(6);
+    expect(buildTraceConditions(filter).conditions.join("\n")).not.toContain("prewhere");
   });
 });
