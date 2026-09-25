@@ -13,10 +13,20 @@ import {
 import type { Trace } from "@ironside/shared";
 import { Pool } from "pg";
 import { ulid } from "ulid";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { runWebhooks, type RunWebhooksOptions } from "../src/webhooks/webhook-runner.js";
 import { loadConfig } from "../src/config.js";
 import { insertPublishedTrace } from "./support/published-traces.js";
+import { REBINDING_HOST } from "./support/rebinding-dns.js";
+
+// A destination whose DNS answers the per-run check with a public address and
+// the connection with loopback (DNS rebinding); see support/rebinding-dns.ts.
+vi.mock("node:dns", async (importOriginal) =>
+  (await import("./support/rebinding-dns.js")).withRebindingLookup(await importOriginal())
+);
+vi.mock("node:dns/promises", async (importOriginal) =>
+  (await import("./support/rebinding-dns.js")).withRebindingPromises(await importOriginal())
+);
 
 const config = loadConfig();
 const pool = new Pool({ connectionString: config.databaseUrl });
@@ -474,5 +484,25 @@ describe("runWebhooks", () => {
     await expect(run(hook, { allowPrivateDestinations: false })).rejects.toThrow(/non-public address/);
     expect(receivedRequests).toHaveLength(0);
     expect((await getWebhookRule(pool, projectId, hook.id))!.lastRunStatus).toBe("error");
+  });
+
+  it("refuses a destination that rebinds to a private address after the per-run check, sending nothing", async () => {
+    const projectId = await newProject();
+    const published = trace(projectId);
+    await publish(published);
+    const hook = await createWebhookRule(pool, {
+      id: `webhook_${ulid()}`,
+      projectId,
+      name: "rebinding rule",
+      destinationUrl: `http://${REBINDING_HOST}:${new URL(serverUrl).port}/hook`,
+      signingSecretEncrypted: "unused-in-this-test",
+      filter: {}
+    });
+    // The per-run check sees a public address; the connection is refused at loopback.
+    const result = await run(hook, { allowPrivateDestinations: false });
+    expect(result.failed).toEqual([
+      { traceId: published.id, error: "destination URL resolves to a non-public address: 127.0.0.1" }
+    ]);
+    expect(receivedRequests).toHaveLength(0);
   });
 });

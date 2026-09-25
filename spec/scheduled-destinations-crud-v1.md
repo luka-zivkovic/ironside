@@ -34,7 +34,7 @@ Every create request takes `name` (1–200 characters), an optional `filter` and
 - OTLP forwards take `destinationUrl` (a URL) and an optional `destinationAuthHeader`.
 - Webhooks take `destinationUrl` (a URL).
 
-A new destination is enabled, due on the next scheduler tick (`next_run_at` defaults to `now()`), and starts at the beginning of the trace feed. The API validates a destination URL only as a URL; the worker applies the SSRF guard before each run (`apps/worker/src/lib/ssrf-guard.ts`).
+A new destination is enabled, due on the next scheduler tick (`next_run_at` defaults to `now()`), and starts at the beginning of the trace feed. The API validates a destination URL only as a URL; for OTLP forwards and webhooks the worker applies the SSRF guard before each run and at each connection (`apps/worker/src/lib/ssrf-guard.ts`). An export's `destinationEndpoint` is not guarded, because it commonly points at S3-compatible storage on a private network, such as the bundled MinIO.
 
 ## Secrets are write-only
 

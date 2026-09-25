@@ -14,7 +14,7 @@ import type { Pool } from "pg";
 import { ulid } from "ulid";
 import { readSettledTraceFeed } from "../exporters/settled-trace-feed.js";
 import { matchesExportFilter } from "../exporters/trace-filter.js";
-import { assertPublicHttpDestination, publicFetch } from "../lib/ssrf-guard.js";
+import { anyAddressFetch, assertPublicHttpDestination, publicFetch } from "../lib/ssrf-guard.js";
 
 const FEED_PAGE_SIZE = 100;
 /** Deliveries per run; a larger backlog continues on the next scheduler tick. */
@@ -37,11 +37,12 @@ export interface RunWebhooksOptions {
   signingSecret: string;
   fetchImpl?: typeof fetch;
   /**
-   * Skips the SSRF guard on `rule.destinationUrl`. Only ever set by tests
-   * against a local mock server (which legitimately resolves to
-   * loopback) — never by production code paths, which must always be
-   * guarded against a customer-supplied destination reaching internal
-   * network addresses.
+   * Skips the SSRF guard on `rule.destinationUrl`, sending with
+   * anyAddressFetch (publicFetch's transport, refusing no address). Only
+   * ever set by tests against a local mock server (which legitimately
+   * resolves to loopback) — never by production code paths, which must
+   * always be guarded against a customer-supplied destination reaching
+   * internal network addresses.
    */
   allowPrivateDestinations?: boolean;
   /** Project-effective quiet period used to exclude in-flight traces. */
@@ -108,8 +109,10 @@ type ScannerKeyMode = "claim" | "check" | "none";
  * `rule.destinationUrl` is customer-supplied (set via the rule-creation
  * API), so before sending anything this validates it resolves to a public
  * address — otherwise the worker is an SSRF proxy into whatever network
- * it runs on (cloud metadata endpoints, internal services). Checked once
- * per run, not per-trace: the destination is fixed for the whole rule.
+ * it runs on (cloud metadata endpoints, internal services). It is checked
+ * once per run, for an early error recorded on the rule, and again by
+ * publicFetch at each connection, at the address actually connected to, so
+ * DNS rebinding between the two is refused as well.
  */
 export async function runWebhooks(options: RunWebhooksOptions): Promise<WebhookRunResult> {
   const { pool, clickhouse, rule } = options;
@@ -242,7 +245,7 @@ async function deliver(
 
   try {
     // publicFetch checks each connection's address again, so DNS rebinding after the guard is refused too.
-    const fetchImpl = options.fetchImpl ?? (options.allowPrivateDestinations ? fetch : publicFetch);
+    const fetchImpl = options.fetchImpl ?? (options.allowPrivateDestinations ? anyAddressFetch : publicFetch);
     const response = await fetchImpl(rule.destinationUrl, {
       method: "POST",
       headers: {

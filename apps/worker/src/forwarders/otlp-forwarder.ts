@@ -5,7 +5,7 @@ import { traceSettledBefore } from "@ironside/shared";
 import type { Pool } from "pg";
 import { readSettledTraceFeed } from "../exporters/settled-trace-feed.js";
 import { matchesExportFilter } from "../exporters/trace-filter.js";
-import { assertPublicHttpDestination, publicFetch } from "../lib/ssrf-guard.js";
+import { anyAddressFetch, assertPublicHttpDestination, publicFetch } from "../lib/ssrf-guard.js";
 import { mapTraceToOtlpExportRequest } from "./otlp-mapper.js";
 
 const FEED_PAGE_SIZE = 100;
@@ -75,7 +75,7 @@ function isPermanentRejection(status: number): boolean {
 export async function forwardOtlpTraces(options: ForwardOtlpOptions): Promise<ForwardOtlpResult> {
   const { pool, clickhouse, rule } = options;
   // publicFetch checks each connection's address again, so DNS rebinding after the guard is refused too.
-  const fetchImpl = options.fetchImpl ?? (options.allowPrivateDestinations ? fetch : publicFetch);
+  const fetchImpl = options.fetchImpl ?? (options.allowPrivateDestinations ? anyAddressFetch : publicFetch);
   const settledBefore = traceSettledBefore(options.traceQuietPeriodSeconds);
 
   let cursor = rule.feedCursor;
