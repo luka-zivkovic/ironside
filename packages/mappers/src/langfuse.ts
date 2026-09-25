@@ -195,7 +195,7 @@ function idFromEvent(event: LangfuseBatchEvent): string {
  * Native JSON.stringify does the walk, so it takes the same nesting the API's
  * own serialization of the stored batch did.
  */
-function canonicalJson(value: unknown): string {
+export function canonicalJson(value: unknown): string {
   return (
     JSON.stringify(value, (_key, entry: unknown) =>
       entry !== null && typeof entry === "object" && !Array.isArray(entry)

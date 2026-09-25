@@ -376,6 +376,36 @@ describe("instrumentAsyncIterable", () => {
     expect(finishes).toEqual([{ consumed: true }]);
   });
 
+  it("records each chunk once whether or not the stream's [Symbol.asyncIterator] goes through its iterator()", async () => {
+    // A provider-shaped stream: [Symbol.asyncIterator]() may call iterator(), or read the source itself.
+    const streamLike = (routesThroughIterator: boolean) => {
+      const source = (): AsyncIterator<unknown> => asyncIterableOf([1, 2, 3])[Symbol.asyncIterator]();
+      const stream = {
+        iterator: source,
+        tee: () => [],
+        [Symbol.asyncIterator](): AsyncIterator<unknown> {
+          return routesThroughIterator ? this.iterator() : source();
+        }
+      };
+      return stream;
+    };
+    for (const routesThroughIterator of [true, false]) {
+      const chunks: unknown[] = [];
+      const finishes: unknown[] = [];
+      const stream = instrumentAsyncIterable(
+        streamLike(routesThroughIterator),
+        (chunk) => chunks.push(chunk),
+        (outcome) => finishes.push(outcome)
+      );
+      for await (const chunk of stream) void chunk;
+      expect({ routesThroughIterator, chunks, finishes }).toEqual({
+        routesThroughIterator,
+        chunks: [1, 2, 3],
+        finishes: [{ consumed: true }]
+      });
+    }
+  });
+
   it("a non-iterable value is returned untouched and finishes immediately as unconsumed", () => {
     const finishes: Array<{ consumed: boolean }> = [];
     const value = { not: "a stream" };

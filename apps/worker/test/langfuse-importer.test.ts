@@ -5,6 +5,7 @@ import {
   getEvaluatorTracePublications,
   getImportCheckpoint,
   listPendingEvaluatorImportTraceIds,
+  listTraceScoreActivities,
   recordEvaluatorImportRetentionCutoffs,
   runMigrations as runPgMigrations,
   stageEvaluatorImportTraces
@@ -17,7 +18,8 @@ import {
   importedEvaluatorTraceContentHash,
   importedTraceContentHash,
   materializeEvaluatorImportSnapshot,
-  recoverAbandonedEvaluatorImports
+  recoverAbandonedEvaluatorImports,
+  recoverPendingEvaluatorImportSnapshots
 } from "../src/importers/evaluator-publication.js";
 import { loadConfig } from "../src/config.js";
 
@@ -693,6 +695,65 @@ describe("runLangfuseImport", () => {
     expect(await secondTraceRows.json()).toEqual([firstTraceRow]);
   });
 
+  it("publishes a score-only change to the score feed before clearing the snapshot, so a stop in between loses nothing", async () => {
+    const traceId = `trace_${ulid()}`;
+    const runToken = `import_score_feed_${ulid()}`;
+    const trace = { id: traceId, projectId, timestamp: "2026-08-12T05:50:00.000Z", tags: [], metadata: {} };
+    const score = {
+      id: `score_${ulid()}`,
+      projectId,
+      traceId,
+      name: "provider-score",
+      dataType: "numeric" as const,
+      value: 1,
+      source: "api" as const,
+      metadata: {}
+    };
+    const stage = async (contentHash: string, scores: (typeof score)[]) =>
+      (await stageEvaluatorImportTraces(pool, {
+        projectId,
+        source: "langfuse",
+        runToken,
+        candidateActivityId: `import_activity_${ulid()}`,
+        candidateActivityAt: "2026-08-30T12:30:00.000Z",
+        traces: [{ traceId, contentHash, evaluatorContentHash: "e".repeat(64), snapshot: { trace, observations: [], scores } }]
+      })).get(traceId)!;
+    await claimImportRun(pool, projectId, "langfuse", runToken);
+    const first = await stage("a".repeat(64), []);
+    await materializeEvaluatorImportSnapshot({ pool, clickhouse, projectId, runToken }, {
+      ...first,
+      source: "langfuse",
+      snapshot: { trace, observations: [], scores: [] }
+    });
+
+    // Only the score changes; the worker stops just before clearing the snapshot.
+    const second = await stage("b".repeat(64), [score]);
+    const scoreOnly = { ...second, source: "langfuse" as const, snapshot: { trace, observations: [], scores: [score] } };
+    await expect(
+      materializeEvaluatorImportSnapshot({ pool: poolFailingOnce("set pending = false"), clickhouse, projectId, runToken }, scoreOnly)
+    ).rejects.toThrow("simulated stop");
+    const scoreFeedEntry = async () =>
+      (await listTraceScoreActivities(pool, { projectId, limit: 1_000 })).find((entry) => entry.traceId === traceId);
+    const snapshotPending = async () =>
+      (
+        await pool.query<{ pending: boolean }>(
+          "select pending from evaluator_import_trace_state where project_id = $1 and trace_id = $2",
+          [projectId, traceId]
+        )
+      ).rows[0]?.pending;
+    const published = await scoreFeedEntry();
+    expect(published).toBeDefined();
+    expect(await snapshotPending()).toBe(true);
+
+    // Recovery claims the pending snapshot, publishes the score feed again and clears it.
+    await expect(
+      recoverPendingEvaluatorImportSnapshots({ pool, clickhouse, projectId, source: "langfuse", runToken })
+    ).resolves.toBe(1);
+    expect(await snapshotPending()).toBe(false);
+    // Fixed-width ISO strings with microseconds compare exactly; Date.parse would drop the microseconds.
+    expect((await scoreFeedEntry())!.publishedAt > published!.publishedAt).toBe(true);
+  });
+
   it("a failed detail fetch fails the run without advancing the checkpoint past that page", async () => {
     // Two traces on one page; the second's detail endpoint returns 500.
     // The run must fail (not silently import a partial page), and the
@@ -883,3 +944,33 @@ describe("runLangfuseImport", () => {
     expect(checkpoint?.lastError).toBeTruthy();
   });
 });
+
+
+/** The test pool, except that the first query containing `failOn`, on a checked-out client, fails. */
+function poolFailingOnce(failOn: string): Pool {
+  let failed = false;
+  const bound = (target: object, property: string | symbol) => {
+    const value = Reflect.get(target, property);
+    return typeof value === "function" ? value.bind(target) : value;
+  };
+  return new Proxy(pool, {
+    get(target, property) {
+      if (property !== "connect") return bound(target, property);
+      return async () => {
+        const client = await target.connect();
+        return new Proxy(client, {
+          get(clientTarget, clientProperty) {
+            if (clientProperty !== "query") return bound(clientTarget, clientProperty);
+            return (text: unknown, ...rest: unknown[]) => {
+              if (!failed && typeof text === "string" && text.includes(failOn)) {
+                failed = true;
+                return Promise.reject(new Error("simulated stop"));
+              }
+              return (clientTarget.query as (...args: unknown[]) => unknown)(text, ...rest);
+            };
+          }
+        });
+      };
+    }
+  });
+}

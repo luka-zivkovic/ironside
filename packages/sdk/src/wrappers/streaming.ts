@@ -2,9 +2,20 @@
 // SDKs return a Stream object that is an async iterable with extra API
 // surface (.tee(), .controller, .toReadableStream(), ...). Returning our
 // own wrapper generator would silently break every caller using that
-// surface, so instead the stream's [Symbol.asyncIterator] is patched IN
-// PLACE and the SAME object is returned — identical to how the wrappers
-// patch client.chat.completions.create itself.
+// surface, so instead the stream is instrumented IN PLACE and the SAME
+// object is returned — identical to how the wrappers patch
+// client.chat.completions.create itself.
+//
+// The OpenAI and Anthropic streams keep their iterator factory as an
+// instance `iterator` method, which [Symbol.asyncIterator]() and tee() both
+// call, and toReadableStream() goes through [Symbol.asyncIterator]. Wrapping
+// `iterator` therefore records every way of reading the stream, and a
+// tee'd stream exactly once: tee() reads the one underlying iterator and
+// hands each chunk to both branches. [Symbol.asyncIterator] is patched as
+// well, for a stream whose [Symbol.asyncIterator] does not go through
+// `iterator`; an iterator the patched `iterator` already made is passed
+// through, so each chunk is recorded once either way. Any other async
+// iterable gets only its [Symbol.asyncIterator] patched.
 //
 // The generation can only be finalized when the caller actually consumes
 // the stream (that's when the text/usage exists at all). Three exits all
@@ -14,11 +25,10 @@
 // but never ends — visible in the UI as a dangling in-progress
 // generation, which is the honest representation of what happened.
 //
-// KNOWN LIMIT — .tee(): the OpenAI and Anthropic streams' tee() reads their
-// internal iterator() directly, not [Symbol.asyncIterator], so neither
-// branch passes through this patch: nothing is recorded and the generation
-// never ends. .toReadableStream() goes through [Symbol.asyncIterator] and is
-// recorded normally.
+// A tee'd stream that no branch reads to the end never reaches the end of the
+// underlying iterator, so its generation stays open like an unconsumed one.
+// The SDKs' tee branches have no return(), so a `break` in a branch neither
+// records the output nor cancels the request.
 
 /**
  * Patches `stream`'s async iterator in place so every yielded chunk feeds
@@ -35,6 +45,8 @@ export function instrumentAsyncIterable<T>(
 ): T {
   const iterable = stream as T & {
     [Symbol.asyncIterator]?: () => AsyncIterator<unknown>;
+    iterator?: () => AsyncIterator<unknown>;
+    tee?: unknown;
   };
   if (typeof iterable?.[Symbol.asyncIterator] !== "function") {
     onFinish({ consumed: false });
@@ -48,34 +60,49 @@ export function instrumentAsyncIterable<T>(
     onFinish({ ...outcome, consumed: true });
   };
 
-  const originalFactory = iterable[Symbol.asyncIterator]!.bind(iterable);
-  iterable[Symbol.asyncIterator] = () => {
-    const inner = originalFactory();
-    return {
-      async next(): Promise<IteratorResult<unknown>> {
-        try {
-          const result = await inner.next();
-          if (result.done) finishOnce({});
-          else onChunk(result.value);
-          return result;
-        } catch (error) {
-          finishOnce({ error });
-          throw error;
-        }
-      },
-      // Called on `break`/`return` inside a for-await — the caller chose
-      // to stop early; what accumulated so far is the real output.
-      async return(value?: unknown): Promise<IteratorResult<unknown>> {
-        finishOnce({});
-        if (inner.return) return inner.return(value);
-        return { done: true, value: undefined };
-      },
-      async throw(error?: unknown): Promise<IteratorResult<unknown>> {
+  const instrument = (inner: AsyncIterator<unknown>): AsyncIterableIterator<unknown> => ({
+    // Async-iterable itself, like the generator it replaces.
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+    async next(): Promise<IteratorResult<unknown>> {
+      try {
+        const result = await inner.next();
+        if (result.done) finishOnce({});
+        else onChunk(result.value);
+        return result;
+      } catch (error) {
         finishOnce({ error });
-        if (inner.throw) return inner.throw(error);
         throw error;
       }
+    },
+    // Called on `break`/`return` inside a for-await — the caller chose
+    // to stop early; what accumulated so far is the real output.
+    async return(value?: unknown): Promise<IteratorResult<unknown>> {
+      finishOnce({});
+      if (inner.return) return inner.return(value);
+      return { done: true, value: undefined };
+    },
+    async throw(error?: unknown): Promise<IteratorResult<unknown>> {
+      finishOnce({ error });
+      if (inner.throw) return inner.throw(error);
+      throw error;
+    }
+  });
+
+  const instrumented = new WeakSet<object>();
+  if (typeof iterable.iterator === "function" && typeof iterable.tee === "function") {
+    const originalIterator = iterable.iterator.bind(iterable);
+    iterable.iterator = () => {
+      const iterator = instrument(originalIterator());
+      instrumented.add(iterator);
+      return iterator;
     };
+  }
+  const originalFactory = iterable[Symbol.asyncIterator]!.bind(iterable);
+  iterable[Symbol.asyncIterator] = () => {
+    const iterator = originalFactory();
+    return instrumented.has(iterator) ? iterator : instrument(iterator);
   };
   return stream;
 }
