@@ -264,8 +264,9 @@ export function wrapAnthropic<T extends AnthropicLike>(
           });
         }
 
-        const message = result as MessageLike;
-        const usageDetails = usageDetailsFrom(message.usage);
+        // An empty body (content-length 0) parses to undefined.
+        const message = result as MessageLike | undefined;
+        const usageDetails = usageDetailsFrom(message?.usage);
         generation.end({
           output: message,
           ...(usageDetails && { usageDetails })

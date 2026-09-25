@@ -48,6 +48,8 @@ const messageEvents: [string, object][] = [
 
 let server: Server;
 let baseUrl: string;
+/** Set while a "slow-body" response is held open; resolves once its headers and first bytes are sent. */
+let slowBody: { sent: Promise<void>; finish: () => void } | undefined;
 
 beforeAll(async () => {
   server = createServer((req, res) => {
@@ -57,6 +59,22 @@ beforeAll(async () => {
       const body = JSON.parse(raw || "{}") as { model?: string; stream?: boolean };
       if (body.model === "fail") {
         res.writeHead(500, { "content-type": "application/json" }).end(JSON.stringify({ error: { type: "api_error", message: "boom" } }));
+        return;
+      }
+      if (body.model === "malformed") {
+        res.writeHead(200, { "content-type": "application/json" }).end("{not json");
+        return;
+      }
+      if (body.model === "empty") {
+        res.writeHead(200, { "content-type": "application/json", "content-length": "0" }).end();
+        return;
+      }
+      if (body.model === "slow-body") {
+        // Headers and the start of the body now; the rest never comes until the test finishes it.
+        let sent!: () => void;
+        slowBody = { sent: new Promise<void>((resolve) => (sent = resolve)), finish: () => res.end("}") };
+        res.writeHead(200, { "content-type": "application/json" });
+        res.write('{"id":"c1",', () => sent());
         return;
       }
       const openai = req.url?.includes("/chat/completions");
@@ -164,10 +182,47 @@ describe("wrapped create() keeps the SDKs' APIPromise", () => {
     expect(recorded).toHaveLength(2);
     expect(recorded.every((ending) => ending.level === "error")).toBe(true);
 
-    // Also when nobody reads the result: the failure is seen without awaiting create(), and
-    // nothing is left unhandled (an APIPromise rejects only when read; .catch() would read it).
+    // Also when nobody reads the result: the failure is seen through asResponse(), without
+    // awaiting create(). (Unlike the unwrapped SDK, whose failed request then goes unhandled,
+    // that observer handles it; .catch() here would read the result.)
     const unread = mockIngest();
     void openai(unread.ironside).chat.completions.create({ ...openaiRequest, model: "fail" });
     await vi.waitFor(async () => expect(await unread.endings()).toMatchObject([{ level: "error" }]));
+  });
+
+  it("records a failure after the response arrived once, as an error: a body that does not parse, or an abort while it downloads", async () => {
+    const malformed = mockIngest();
+    await expect(openai(malformed.ironside).chat.completions.create({ ...openaiRequest, model: "malformed" })).rejects.toThrow(SyntaxError);
+    await expect(anthropic(malformed.ironside).messages.create({ ...anthropicRequest, model: "malformed" })).rejects.toThrow(SyntaxError);
+    // Through withResponse() and OpenAI's parse(), which derive further promises from the wrapped one.
+    await expect(openai(malformed.ironside).chat.completions.create({ ...openaiRequest, model: "malformed" }).withResponse()).rejects.toThrow(SyntaxError);
+    await expect(openai(malformed.ironside).chat.completions.parse({ ...openaiRequest, model: "malformed" })).rejects.toThrow(SyntaxError);
+    const endings = await malformed.endings();
+    expect(endings).toHaveLength(4);
+    expect(endings.every((ending) => ending.level === "error")).toBe(true);
+
+    const aborted = mockIngest();
+    slowBody = undefined;
+    const controller = new AbortController();
+    const pending = openai(aborted.ironside).chat.completions.create({ ...openaiRequest, model: "slow-body" }, { signal: controller.signal });
+    const settled = pending.then(
+      () => "resolved",
+      () => "rejected"
+    );
+    await vi.waitFor(() => expect(slowBody).toBeDefined());
+    await slowBody!.sent;
+    controller.abort();
+    expect(await settled).toBe("rejected");
+    slowBody!.finish();
+    expect(await aborted.endings()).toMatchObject([{ level: "error" }]);
+  });
+
+  it("records an empty body, which the SDKs parse to undefined, without failing", async () => {
+    const { ironside, endings } = mockIngest();
+    await expect(openai(ironside).chat.completions.create({ ...openaiRequest, model: "empty" })).resolves.toBeUndefined();
+    await expect(anthropic(ironside).messages.create({ ...anthropicRequest, model: "empty" })).resolves.toBeUndefined();
+    const recorded = await endings();
+    expect(recorded).toHaveLength(2);
+    expect(recorded.some((ending) => ending.level === "error")).toBe(false);
   });
 });

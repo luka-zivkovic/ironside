@@ -269,8 +269,9 @@ export function wrapOpenAI<T extends OpenAILike>(
           });
         }
 
-        const completion = result as ChatCompletionLike;
-        const usageDetails = usageDetailsFrom(completion.usage);
+        // An empty body (content-length 0) parses to undefined.
+        const completion = result as ChatCompletionLike | undefined;
+        const usageDetails = usageDetailsFrom(completion?.usage);
         generation.end({
           output: completion,
           ...(usageDetails && { usageDetails })
