@@ -177,8 +177,11 @@ const BLOCKED_IPV4 = blockList("ipv4", [
 const BLOCKED_IPV6 = blockList("ipv6", [
   ["64:ff9b:1::", 48], // local-use NAT64
   ["100::", 64], // discard-only
+  ["100:0:0:1::", 64], // dummy prefix
   ["2001::", 23], // IETF protocol assignments, including Teredo and benchmarking
   ["2001:db8::", 32], // documentation
+  ["3fff::", 20], // documentation
+  ["5f00::", 16], // SRv6 segment identifiers
   ["fc00::", 7], // unique local
   ["fe80::", 10], // link-local
   ["fec0::", 10], // site-local (deprecated)

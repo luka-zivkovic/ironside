@@ -132,12 +132,16 @@ describe("isPrivateOrReservedAddress", () => {
       "100::1",
       "2001::1", // Teredo
       "2001:db8::1",
+      "3fff::1",
+      "3fff:fff:ffff::1",
+      "5f00::1",
+      "100:0:0:1::1",
       "64:ff9b:1::1",
       "fe80::1%en0"
     ]) {
       expect(isPrivateOrReservedAddress(address), address).toBe(true);
     }
-    for (const address of ["2606:4700:4700::1111", "2a00:1450:4001::200e", "2001:200::1"]) {
+    for (const address of ["2606:4700:4700::1111", "2a00:1450:4001::200e", "2001:200::1", "3fff:1000::1", "5f01::1"]) {
       expect(isPrivateOrReservedAddress(address), address).toBe(false);
     }
   });
