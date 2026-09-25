@@ -273,11 +273,14 @@ Chainguard's MinIO build (above).
   `traceVersion` instead of one summary row per trace, and `parquet` writes
   `traces/`, `observations/` and `scores/` folders instead of one file. Runs
   are incremental from the durable trace feed. An existing export or OTLP
-  forward rule starts at the beginning of the feed, so its first 0.4.0 run
-  sends every trace still in retention once, as every 0.3.x run did.
+  forward rule starts at the beginning of the feed, so its first 0.4.0 runs
+  send every matching trace still in retention once (at most 10,000 traces per
+  export run and 5,000 per forward run), the traces every 0.3.x run sent,
+  now as full traces with observations and scores.
 - **Webhooks** move to the durable trace feed. The webhook `traceVersion`
-  changes from the trace's activity time (`YYYY-MM-DD HH:MM:SS.ffffff`) to its
-  feed version (ISO 8601, `...Z`), and a republished trace, including a late
+  keeps its format (ISO 8601 UTC with microseconds) but changes meaning, from
+  the trace's latest activity time to its feed version, the time of each
+  publication, which only increases; a republished trace, including a late
   batch that does not change its activity time, gets another webhook. For 24
   hours after the upgrade each trace is sent by only one of a running 0.3.x
   worker and a 0.4.0 worker (a claim a stopped worker left pending for over 10
@@ -295,7 +298,8 @@ Chainguard's MinIO build (above).
   (NAT64, 6to4, IPv4-translated and -compatible). Their requests ignore
   `HTTP_PROXY`, `HTTPS_PROXY` and `NODE_USE_ENV_PROXY`.
 - **The API refuses to start** with an invalid `DEFAULT_RATE_LIMIT_PER_MINUTE`
-  (not a positive integer); 0.3.x silently disabled the limit.
+  (not a positive integer). 0.3.x ran with it: a non-numeric value disabled
+  the limit, and zero or a negative value rejected every request.
 - **The local `docker-compose.yml`** publishes every port, including `api` and
   `web`, on `127.0.0.1` only. Set `IRONSIDE_BIND_ADDRESS` to publish `api` and
   `web` on another interface.
