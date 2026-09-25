@@ -18,7 +18,8 @@ import {
   importedEvaluatorTraceContentHash,
   importedTraceContentHash,
   materializeEvaluatorImportSnapshot,
-  recoverAbandonedEvaluatorImports
+  recoverAbandonedEvaluatorImports,
+  recoverPendingEvaluatorImportSnapshots
 } from "../src/importers/evaluator-publication.js";
 import { loadConfig } from "../src/config.js";
 
@@ -731,8 +732,8 @@ describe("runLangfuseImport", () => {
     await expect(
       materializeEvaluatorImportSnapshot({ pool: poolFailingOnce("set pending = false"), clickhouse, projectId, runToken }, scoreOnly)
     ).rejects.toThrow("simulated stop");
-    const inScoreFeed = async () =>
-      (await listTraceScoreActivities(pool, { projectId, limit: 1_000 })).some((entry) => entry.traceId === traceId);
+    const scoreFeedEntry = async () =>
+      (await listTraceScoreActivities(pool, { projectId, limit: 1_000 })).find((entry) => entry.traceId === traceId);
     const snapshotPending = async () =>
       (
         await pool.query<{ pending: boolean }>(
@@ -740,13 +741,16 @@ describe("runLangfuseImport", () => {
           [projectId, traceId]
         )
       ).rows[0]?.pending;
-    expect(await inScoreFeed()).toBe(true);
+    const published = await scoreFeedEntry();
+    expect(published).toBeDefined();
     expect(await snapshotPending()).toBe(true);
 
-    // Recovery repeats the step and finishes it.
-    await materializeEvaluatorImportSnapshot({ pool, clickhouse, projectId, runToken }, scoreOnly);
+    // Recovery claims the pending snapshot, publishes the score feed again and clears it.
+    await expect(
+      recoverPendingEvaluatorImportSnapshots({ pool, clickhouse, projectId, source: "langfuse", runToken })
+    ).resolves.toBe(1);
     expect(await snapshotPending()).toBe(false);
-    expect(await inScoreFeed()).toBe(true);
+    expect(Date.parse((await scoreFeedEntry())!.publishedAt)).toBeGreaterThan(Date.parse(published!.publishedAt));
   });
 
   it("a failed detail fetch fails the run without advancing the checkpoint past that page", async () => {

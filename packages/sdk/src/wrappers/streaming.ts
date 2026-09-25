@@ -11,8 +11,11 @@
 // call, and toReadableStream() goes through [Symbol.asyncIterator]. Wrapping
 // `iterator` therefore records every way of reading the stream, and a
 // tee'd stream exactly once: tee() reads the one underlying iterator and
-// hands each chunk to both branches. Any other async iterable gets its
-// [Symbol.asyncIterator] patched instead.
+// hands each chunk to both branches. [Symbol.asyncIterator] is patched as
+// well, for a stream whose [Symbol.asyncIterator] does not go through
+// `iterator`; an iterator the patched `iterator` already made is passed
+// through, so each chunk is recorded once either way. Any other async
+// iterable gets only its [Symbol.asyncIterator] patched.
 //
 // The generation can only be finalized when the caller actually consumes
 // the stream (that's when the text/usage exists at all). Three exits all
@@ -22,8 +25,10 @@
 // but never ends — visible in the UI as a dangling in-progress
 // generation, which is the honest representation of what happened.
 //
-// A tee'd stream whose branches both stop early never reaches the end of the
+// A tee'd stream that no branch reads to the end never reaches the end of the
 // underlying iterator, so its generation stays open like an unconsumed one.
+// The SDKs' tee branches have no return(), so a `break` in a branch neither
+// records the output nor cancels the request.
 
 /**
  * Patches `stream`'s async iterator in place so every yielded chunk feeds
@@ -85,13 +90,20 @@ export function instrumentAsyncIterable<T>(
     }
   });
 
+  const instrumented = new WeakSet<object>();
   if (typeof iterable.iterator === "function" && typeof iterable.tee === "function") {
     const originalIterator = iterable.iterator.bind(iterable);
-    iterable.iterator = () => instrument(originalIterator());
-  } else {
-    const originalFactory = iterable[Symbol.asyncIterator]!.bind(iterable);
-    iterable[Symbol.asyncIterator] = () => instrument(originalFactory());
+    iterable.iterator = () => {
+      const iterator = instrument(originalIterator());
+      instrumented.add(iterator);
+      return iterator;
+    };
   }
+  const originalFactory = iterable[Symbol.asyncIterator]!.bind(iterable);
+  iterable[Symbol.asyncIterator] = () => {
+    const iterator = originalFactory();
+    return instrumented.has(iterator) ? iterator : instrument(iterator);
+  };
   return stream;
 }
 

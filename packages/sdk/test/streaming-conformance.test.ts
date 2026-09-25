@@ -146,8 +146,13 @@ describe("real-SDK streaming conformance", () => {
       messages: [{ role: "user", content: "hi" }]
     });
     const [a, b] = stream.tee();
-    for await (const chunk of a) void chunk;
-    for await (const chunk of b) void chunk;
+    const text = async (branch: typeof a) => {
+      let content = "";
+      for await (const chunk of branch) content += chunk.choices[0]?.delta?.content ?? "";
+      return content;
+    };
+    expect(await text(a)).toBe("streamed");
+    expect(await text(b)).toBe("streamed");
 
     await ironside.flush();
     expect(endings()).toHaveLength(1);
@@ -163,8 +168,14 @@ describe("real-SDK streaming conformance", () => {
 
     const teed = mockIngest();
     const [a, b] = (await wrapAnthropic(client(), teed.ironside).messages.create(request)).tee();
-    for await (const event of a) void event;
-    for await (const event of b) void event;
+    const types = async (branch: typeof a) => {
+      const seen: string[] = [];
+      for await (const event of branch) seen.push(event.type);
+      return seen;
+    };
+    const fromA = await types(a);
+    expect(fromA).toContain("message_stop");
+    expect(await types(b)).toEqual(fromA);
     await teed.ironside.flush();
     expect(teed.endings()).toHaveLength(1);
     expect(teed.ended()?.output).toMatchObject({ content: [{ type: "text", text: "streamed" }] });

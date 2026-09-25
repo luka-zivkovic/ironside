@@ -6,6 +6,7 @@ import {
   langfuseIngestionRequestSchema,
   type LangfuseIngestionResponse
 } from "@ironside/shared";
+import { canonicalJson } from "@ironside/mappers";
 import type { ObjectStorage } from "@ironside/storage";
 import type { Queue } from "bullmq";
 import { Hono } from "hono";
@@ -106,17 +107,19 @@ export function langfuseRoutes(deps: LangfuseDeps): Hono<AuthEnv> {
     const projectId = c.get("projectId");
     const batchId = ulid();
     const receivedAt = new Date();
-    // Without a body id, an Idempotency-Key names the score, so a client that
-    // resends the same request replaces it instead of adding a copy. Without
-    // either, every request is a new score: two identical scores can be real.
-    const idempotencyKey = c.req.header("idempotency-key")?.trim();
+    // Without a body id, an Idempotency-Key names the score together with its
+    // content, so a client that resends the same request replaces the score
+    // instead of adding a copy, and a key reused for a different score (say,
+    // one key per workflow run) still makes a distinct one. Without either,
+    // every request is a new score: two identical scores can be real.
+    const idempotencyKey = score.id === undefined ? c.req.header("idempotency-key")?.trim() : undefined;
     if (idempotencyKey !== undefined && (idempotencyKey === "" || idempotencyKey.length > 255)) {
       return c.json({ error: "Idempotency-Key must be 1 to 255 characters" }, 400);
     }
     const scoreId =
       score.id ??
       (idempotencyKey !== undefined
-        ? `idem_${createHash("sha256").update(idempotencyKey).digest("hex").slice(0, 32)}`
+        ? `idem_${createHash("sha256").update(canonicalJson([idempotencyKey, score])).digest("hex").slice(0, 32)}`
         : ulid());
 
     const isNumeric = typeof score.value === "number";
