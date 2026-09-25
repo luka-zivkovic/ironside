@@ -8,11 +8,21 @@ import {
   type OtlpForwardRule
 } from "@ironside/db";
 import { ulid } from "ulid";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { Pool } from "pg";
 import { forwardOtlpTraces } from "../src/forwarders/otlp-forwarder.js";
 import { loadConfig } from "../src/config.js";
 import { insertPublishedTrace } from "./support/published-traces.js";
+import { REBINDING_HOST } from "./support/rebinding-dns.js";
+
+// A destination whose DNS answers the per-run check with a public address and
+// the connection with loopback (DNS rebinding); see support/rebinding-dns.ts.
+vi.mock("node:dns", async (importOriginal) =>
+  (await import("./support/rebinding-dns.js")).withRebindingLookup(await importOriginal())
+);
+vi.mock("node:dns/promises", async (importOriginal) =>
+  (await import("./support/rebinding-dns.js")).withRebindingPromises(await importOriginal())
+);
 
 const config = loadConfig();
 const pool = new Pool({ connectionString: config.databaseUrl });
@@ -391,5 +401,26 @@ describe("forwardOtlpTraces", () => {
     expect(receivedRequests).toHaveLength(0);
     const recorded = await getOtlpForwardRule(pool, projectId, stored.id);
     expect(recorded).toMatchObject({ lastRunStatus: "error", lastRunError: expect.stringMatching(/non-public address/) });
+  });
+
+  it("refuses a destination that rebinds to a private address after the per-run check, sending nothing", async () => {
+    const marker = `otlp_rebind_${ulid()}`;
+    const traceId = `trace_${ulid()}`;
+    await insertPublishedTrace(
+      { pool, clickhouse },
+      { trace: { id: traceId, projectId, timestamp: new Date().toISOString(), tags: [marker], metadata: {} } }
+    );
+    // The per-run check sees a public address; the connection is refused at loopback.
+    const result = await forwardOtlpTraces({
+      pool,
+      clickhouse,
+      rule: rule({ filter: { tags: [marker] }, destinationUrl: `http://${REBINDING_HOST}:${new URL(serverUrl).port}/v1/traces` }),
+      traceQuietPeriodSeconds: 0
+    });
+    expect(result.forwarded).toBe(0);
+    expect(result.failed).toEqual([
+      { traceId, error: "destination URL resolves to a non-public address: 127.0.0.1", skipped: false }
+    ]);
+    expect(receivedRequests).toHaveLength(0);
   });
 });
