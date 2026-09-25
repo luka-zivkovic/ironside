@@ -98,29 +98,73 @@ const OBSERVATION_HAS_TOKENS = `(mapContains(usage_details, 'total_tokens')
  */
 const TRACE_DURATION_MS = "dateDiff('millisecond', min(start_time), max(end_time))";
 
-/** Trace ids with an observation matching `condition` in the filtered project. */
-function tracesWithObservations(condition: string): string {
+/**
+ * Trace ids with an observation matching `condition` in the filtered project.
+ * `scope`, when set, is a PREWHERE limiting the observations read to the
+ * traces the trace-level conditions select (see buildTraceConditions).
+ */
+function tracesWithObservations(condition: string, scope: string): string {
   return `id in (
     select trace_id from observations final
+    ${scope}
     where project_id = {projectId:String} and ${condition}
   )`;
 }
 
 /** Trace ids whose observations, grouped per trace, satisfy `having`. */
-function tracesWhereObservations(having: string): string {
+function tracesWhereObservations(having: string, scope: string): string {
   return `id in (
     select trace_id from observations final
+    ${scope}
     where project_id = {projectId:String}
     group by trace_id
     having ${having}
   )`;
 }
 
-/** Shared by listTraces and getAggregates — same filter surface, different projection. */
-function buildTraceConditions(filter: TraceFilter): {
-  conditions: string[];
-  params: Record<string, unknown>;
-} {
+/**
+ * The most traces an observation scope may select (see buildTraceConditions).
+ * Each observation filter builds the scope's set of trace ids, about 200 bytes
+ * per id, once per query, so a larger scope is left out and the filters read
+ * the whole history instead, as they did before scoping.
+ */
+export const OBSERVATION_SCOPE_MAX_TRACES = 250_000;
+
+/**
+ * Whether buildTraceConditions should limit the observation filters to the
+ * traces the trace-level conditions select. Only a time range, a user or a
+ * session is worth it: their traces' observations sit in few granules, since
+ * observations are keyed by their start time. Environment, tags and metadata
+ * select traces spread over the whole history, so the scope would skip
+ * nothing and only add its own cost. The scope must also select at most
+ * `maxTraces` traces, counted without FINAL (unmerged versions count twice,
+ * so the count can only be too high) and stopping once past the limit.
+ */
+export async function observationScopeApplies(
+  client: ClickHouseClient,
+  filter: TraceFilter,
+  maxTraces: number = OBSERVATION_SCOPE_MAX_TRACES
+): Promise<boolean> {
+  const hasObservationFilter =
+    Boolean(filter.search) ||
+    Boolean(filter.level) ||
+    Boolean(filter.model) ||
+    filter.minDurationMs !== undefined ||
+    filter.minCost !== undefined;
+  const narrows = Boolean(filter.from || filter.to || filter.userId || filter.sessionId);
+  if (!hasObservationFilter || !narrows) return false;
+  const { conditions, params } = traceLevelConditions(filter);
+  const result = await client.query({
+    query: `select toUInt32(count()) as traces from (select 1 from traces where ${conditions.join(" and ")} limit {scopeLimit:UInt32})`,
+    query_params: { ...params, scopeLimit: maxTraces + 1 },
+    format: "JSONEachRow"
+  });
+  const [row] = await result.json<{ traces: number }>();
+  return (row?.traces ?? 0) <= maxTraces;
+}
+
+/** The conditions on the trace row itself: project, time range, user, session, environment, tags, metadata. */
+function traceLevelConditions(filter: TraceFilter): { conditions: string[]; params: Record<string, unknown> } {
   const conditions: string[] = ["project_id = {projectId:String}"];
   const params: Record<string, unknown> = { projectId: filter.projectId };
 
@@ -153,32 +197,60 @@ function buildTraceConditions(filter: TraceFilter): {
     params.metadataKey = filter.metadataKey;
     params.metadataValue = filter.metadataValue;
   }
-  // The observation filters below scan the project's observations, which are
-  // partitioned by their own start time rather than the trace's timestamp.
+  return { conditions, params };
+}
+
+/**
+ * Shared by listTraces and getAggregates — same filter surface, different projection.
+ *
+ * The observation filters read the project's observations, which are keyed
+ * by their own start time rather than the trace's timestamp, so the selected
+ * time range cannot bound them directly. With `scopeObservations` (decided by
+ * observationScopeApplies), the observations read are limited to the traces
+ * the trace-level conditions select, as a PREWHERE on trace_id. ClickHouse
+ * reads trace_id across the project's history and the filtered columns
+ * (inputs and outputs for search) only in granules holding one of those
+ * traces, which for a time range, user or session are few. The results are
+ * exact: the outer query requires the same conditions. PREWHERE runs before
+ * FINAL here, which is safe because trace_id is part of the sort key, so
+ * every version of an observation, deletions included, has the same trace_id
+ * and is kept or dropped together.
+ */
+export function buildTraceConditions(
+  filter: TraceFilter,
+  options: { scopeObservations?: boolean } = {}
+): {
+  conditions: string[];
+  params: Record<string, unknown>;
+} {
+  const { conditions, params } = traceLevelConditions(filter);
+  const scope = options.scopeObservations
+    ? `prewhere trace_id in (select id from traces final where ${conditions.join(" and ")})`
+    : "";
   if (filter.search) {
     const matches = (column: string) => `positionCaseInsensitiveUTF8(${column}, {search:String}) > 0`;
     conditions.push(`(
       id = {search:String}
       or ${matches("name")} or ${matches("input")} or ${matches("output")}
-      or ${tracesWithObservations(`(${matches("name")} or ${matches("input")} or ${matches("output")})`)}
+      or ${tracesWithObservations(`(${matches("name")} or ${matches("input")} or ${matches("output")})`, scope)}
     )`);
     params.search = filter.search;
   }
   if (filter.level) {
-    conditions.push(tracesWithObservations("level = {level:String}"));
+    conditions.push(tracesWithObservations("level = {level:String}", scope));
     params.level = filter.level;
   }
   if (filter.model) {
-    conditions.push(tracesWithObservations("model = {model:String}"));
+    conditions.push(tracesWithObservations("model = {model:String}", scope));
     params.model = filter.model;
   }
   if (filter.minDurationMs !== undefined) {
-    conditions.push(tracesWhereObservations(`${TRACE_DURATION_MS} >= {minDurationMs:Int64}`));
+    conditions.push(tracesWhereObservations(`${TRACE_DURATION_MS} >= {minDurationMs:Int64}`, scope));
     params.minDurationMs = filter.minDurationMs;
   }
   if (filter.minCost !== undefined) {
     conditions.push(
-      tracesWhereObservations(`sum(${OBSERVATION_COST}) >= toDecimal128({minCost:String}, 9)`)
+      tracesWhereObservations(`sum(${OBSERVATION_COST}) >= toDecimal128({minCost:String}, 9)`, scope)
     );
     // As decimal text: converting a Float64 truncates, so 1.001 would become 1.000999999.
     params.minCost = filter.minCost.toFixed(9);
@@ -287,7 +359,9 @@ export async function listTraces(
   client: ClickHouseClient,
   filter: ListTracesFilter
 ): Promise<TraceRow[]> {
-  const { conditions, params } = buildTraceConditions(filter);
+  const { conditions, params } = buildTraceConditions(filter, {
+    scopeObservations: await observationScopeApplies(client, filter)
+  });
 
   if (filter.cursor) {
     // Keyset pagination on (timestamp DESC, id DESC): strictly-less-than the
@@ -943,7 +1017,9 @@ export async function getAggregates(
   client: ClickHouseClient,
   filter: TraceFilter
 ): Promise<AggregatesRow> {
-  const { conditions, params } = buildTraceConditions(filter);
+  const { conditions, params } = buildTraceConditions(filter, {
+    scopeObservations: await observationScopeApplies(client, filter)
+  });
 
   // Three separate queries, each re-running the traces filter as a
   // subquery — simpler and safer to get correct than combining into one
@@ -983,8 +1059,10 @@ export async function getAggregates(
           mapApply((k, v) -> (k, toFloat64(v)), sumMap(o.usage_details)) as token_totals,
           mapApply((k, v) -> (k, toFloat64(v)), sumMap(o.cost_details)) as cost_totals
         from observations as o final
+        -- Before FINAL, which is safe on trace_id, a sort key column (see buildTraceConditions):
+        -- usage and cost are read only in granules holding a matched trace.
+        prewhere o.trace_id in (${matchedTracesQuery})
         where o.project_id = {projectId:String}
-          and o.trace_id in (${matchedTracesQuery})
       `,
       query_params: params,
       format: "JSONEachRow"
@@ -998,8 +1076,8 @@ export async function getAggregates(
         from (
           select dateDiff('millisecond', min(o.start_time), max(o.end_time)) as duration_ms
           from observations as o final
+          prewhere o.trace_id in (${matchedTracesQuery})
           where o.project_id = {projectId:String}
-            and o.trace_id in (${matchedTracesQuery})
           group by o.trace_id
           having max(o.end_time) is not null
         )
