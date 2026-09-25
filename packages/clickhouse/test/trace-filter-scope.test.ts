@@ -106,7 +106,42 @@ beforeAll(async () => {
     ],
     { eventTs: t2 }
   );
+
+  // Matched traces' observations with later versions, which the aggregates must read through FINAL:
+  // one whose cost and end are dropped, one deleted. A stale version would add 3 or 100 USD to the
+  // cost totals, or 10 minutes to a trace's duration.
+  const shortened = matching(ids.startedMonthsAfter, "2026-09-10T08:00:00.000Z", {
+    ...unmatched,
+    endTime: "2026-09-10T08:10:00.000Z",
+    costDetails: { total: 3 }
+  });
+  const removed = matching(ids.startedMonthsBefore, "2026-03-02T08:00:00.000Z", { ...unmatched, costDetails: { total: 100 } });
+  await insertObservations(clickhouse, [shortened, removed], { eventTs: t1 });
+  await insertObservations(clickhouse, [{ ...shortened, endTime: undefined, costDetails: {} }], { eventTs: t2 });
+  await deleteMovedObservationRows(
+    clickhouse,
+    [{ projectId, id: removed.id, traceId: removed.traceId, startTime: removed.startTime }],
+    { eventTs: t2 }
+  );
 });
+
+/** The client, recording the SQL of every query made through it. */
+function recordingQueries(): { client: typeof clickhouse; queries: string[] } {
+  const queries: string[] = [];
+  const client = new Proxy(clickhouse, {
+    get(target, property, receiver) {
+      if (property === "query") {
+        return (params: Parameters<typeof clickhouse.query>[0]) => {
+          queries.push(params.query);
+          return target.query(params);
+        };
+      }
+      const value: unknown = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+  return { client, queries };
+}
 
 afterAll(() => clickhouse.close());
 
@@ -173,6 +208,20 @@ describe("observationScopeApplies", () => {
     // Five traces in June.
     expect(await observationScopeApplies(clickhouse, { projectId, ...june, model: "m-scope" }, 5)).toBe(true);
     expect(await observationScopeApplies(clickhouse, { projectId, ...june, model: "m-scope" }, 4)).toBe(false);
+  });
+
+  it("is applied by listTraces and getAggregates", async () => {
+    const scopeSql = "prewhere trace_id in (select id from traces final";
+    const scoped = recordingQueries();
+    await listTraces(scoped.client, { projectId, ...june, model: "m-scope", limit: 100 });
+    await getAggregates(scoped.client, { projectId, ...june, model: "m-scope" });
+    // The list query and all three aggregates queries.
+    expect(scoped.queries.filter((query) => query.includes(scopeSql))).toHaveLength(4);
+
+    const unscoped = recordingQueries();
+    await listTraces(unscoped.client, { projectId, environment: "production", model: "m-scope", limit: 100 });
+    await getAggregates(unscoped.client, { projectId, environment: "production", model: "m-scope" });
+    expect(unscoped.queries.some((query) => query.includes(scopeSql))).toBe(false);
   });
 
   it("puts the trace-level conditions in each observation filter's PREWHERE only when asked", () => {
