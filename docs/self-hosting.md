@@ -64,9 +64,10 @@ by Coolify, and trustctl does not update a Coolify Service.
 Every tagged release (`vX.Y.Z`) runs the build, typecheck, and test suite,
 validates the generic Compose checksum and render, and then publishes
 multi-architecture `ghcr.io/luka-zivkovic/ironside-{api,worker,web}:X.Y.Z`
-images. The `0.3.1` images are the current release and are public and
-anonymously pullable (amd64 and arm64); `0.3.1` is `0.3.0` with MinIO moved to
-a pullable image (see [Upgrading](#upgrading)). `0.2.0` was the first version
+images. The `0.4.0` images are the current release and are public and
+anonymously pullable (amd64 and arm64); installations on `0.3.x` upgrade to it
+in place (see [Upgrading](#upgrading)). `0.3.1` is `0.3.0` with MinIO moved to
+a pullable image. `0.2.0` was the first version
 installable this way; `0.3.0` changed the clean-install baselines, so install it
 fresh rather than updating a `0.2.0` instance. `0.1.0` predates the
 public-image contract. The release tag is immutable; a `sha-<full commit>` tag is published
@@ -78,11 +79,11 @@ its matching exact `image:` reference.
 ```yaml
 services:
   api:
-    image: ghcr.io/luka-zivkovic/ironside-api:0.3.1
+    image: ghcr.io/luka-zivkovic/ironside-api:0.4.0
   worker:
-    image: ghcr.io/luka-zivkovic/ironside-worker:0.3.1
+    image: ghcr.io/luka-zivkovic/ironside-worker:0.4.0
   web:
-    image: ghcr.io/luka-zivkovic/ironside-web:0.3.1
+    image: ghcr.io/luka-zivkovic/ironside-web:0.4.0
 ```
 
 After every image publishes, the workflow pulls those exact tags into the
@@ -245,13 +246,33 @@ in the Compose file, not in the application images: when updating to 0.3.1,
 take `compose.yaml` (or `docker-compose.yml`) from the `v0.3.1` tag along with
 the version; later releases' files include it.
 
-**Upgrading from 0.3.x to 0.4.0 starts deleting raw event objects.** Raw
-retention is on by default from 0.4.0: within 15 minutes of the first boot, the
-worker begins deleting raw event objects whose receive day is past their
+**Take the Compose file from the `v0.4.0` tag.** The 0.3.x Compose files pin
+`RAW_RETENTION_EXECUTION_ENABLED: "false"` for the worker; the 0.4.0 files
+read the setting from the environment instead and add
+`RAW_RETENTION_SWEEP_INTERVAL_MS`. With the new images alone, raw retention
+stays off.
+
+**With the 0.4.0 Compose file, upgrading starts deleting raw event objects.**
+Raw retention is on by default from 0.4.0: within 15 minutes of the first boot,
+the worker begins deleting raw event objects whose receive day is past their
 project's retention (default 90 days). To keep raw events, set
 `RAW_RETENTION_EXECUTION_ENABLED=false` (in the self-host bundle,
 `IRONSIDE_RAW_RETENTION_ENABLED=false` also works) on every worker before
 upgrading.
+
+**Other 0.4.0 changes to check before upgrading:**
+
+- Scheduled exports change format: `jsonl` writes native ingest events with a
+  `traceVersion` instead of one summary row per trace, and `parquet` writes
+  `traces/`, `observations/` and `scores/` folders instead of one file.
+  Exports are also incremental, from the durable trace feed.
+- Webhook and OTLP forward destinations are refused on more address ranges,
+  checked again at each connection: every range that is not globally
+  reachable, including `100.64.0.0/10` (carrier-grade NAT, also used by
+  Tailscale). Their requests ignore `HTTP_PROXY` and `NODE_USE_ENV_PROXY`.
+- Webhooks move to the durable trace feed. Migration `0006` hands existing rules
+  over so that a rolling upgrade neither resends old deliveries nor sends one
+  twice while 0.3.x and 0.4.0 workers overlap (see `spec/webhooks-v1.md`).
 
 Downgrades are not supported: an older release refuses to start on a schema a
 newer release migrated. To go back, restore the pre-upgrade backup. See
