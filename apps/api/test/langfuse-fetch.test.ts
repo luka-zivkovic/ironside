@@ -387,7 +387,7 @@ describe("POST /api/public/scores without an id", () => {
     const first = await idOf(await postScore(thumbsUp(), apiKey, { "idempotency-key": key }));
     const resent = await idOf(await postScore(thumbsUp(), apiKey, { "idempotency-key": key }));
     const other = await idOf(await postScore(thumbsUp(), apiKey, { "idempotency-key": `${key}-other` }));
-    // Surrounding whitespace is not part of the key.
+    // Surrounding whitespace is not part of the key (HTTP strips it before the route sees the header).
     const padded = await idOf(await postScore(thumbsUp(), apiKey, { "idempotency-key": `  ${key}\t` }));
 
     expect(first).toMatch(/^idem_[0-9a-f]{32}$/);

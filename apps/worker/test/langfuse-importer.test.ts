@@ -750,7 +750,8 @@ describe("runLangfuseImport", () => {
       recoverPendingEvaluatorImportSnapshots({ pool, clickhouse, projectId, source: "langfuse", runToken })
     ).resolves.toBe(1);
     expect(await snapshotPending()).toBe(false);
-    expect(Date.parse((await scoreFeedEntry())!.publishedAt)).toBeGreaterThan(Date.parse(published!.publishedAt));
+    // Fixed-width ISO strings with microseconds compare exactly; Date.parse would drop the microseconds.
+    expect((await scoreFeedEntry())!.publishedAt > published!.publishedAt).toBe(true);
   });
 
   it("a failed detail fetch fails the run without advancing the checkpoint past that page", async () => {
