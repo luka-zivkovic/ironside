@@ -209,6 +209,8 @@ describe("wrapped create() keeps the SDKs' APIPromise", () => {
       () => "resolved",
       () => "rejected"
     );
+    // The response has arrived (asResponse() does not read the body), so the abort lands while the body downloads.
+    await pending.asResponse();
     await vi.waitFor(() => expect(slowBody).toBeDefined());
     await slowBody!.sent;
     controller.abort();
