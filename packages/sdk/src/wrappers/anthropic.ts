@@ -1,4 +1,5 @@
 import type { IronsideClient, TraceHandle } from "../client.js";
+import { recordResult } from "./api-promise.js";
 import { errorEndOptions, instrumentAsyncIterable } from "./streaming.js";
 
 // Wraps the Anthropic Node SDK's messages.create() to automatically record
@@ -18,8 +19,9 @@ import { errorEndOptions, instrumentAsyncIterable } from "./streaming.js";
 // fragments), and the final message_delta carries the cumulative
 // output_tokens and stop_reason — so unlike OpenAI (which hides usage
 // behind stream_options.include_usage), a streamed Anthropic call always
-// records full usage. The `messages.stream()` helper is NOT wrapped —
-// it builds its own request path; only create() calls are traced.
+// records full usage. The `messages.stream()` helper calls create() with
+// `stream: true` and withResponse() on its result, so it is recorded like a
+// streamed create(); create()'s APIPromise is kept for it (api-promise.ts).
 
 export interface WrapAnthropicOptions {
   /** Attach generations to an existing trace instead of creating a new standalone trace per call. */
@@ -227,11 +229,9 @@ export function wrapAnthropic<T extends AnthropicLike>(
   const messages = client.messages as MessagesLike & { __ironsideWrapped?: boolean };
   if (messages.__ironsideWrapped) return client;
 
-  const originalCreate = messages.create.bind(messages) as (
-    ...args: unknown[]
-  ) => Promise<unknown>;
+  const originalCreate = messages.create.bind(messages) as (...args: unknown[]) => unknown;
 
-  const wrappedCreate = async (...args: unknown[]): Promise<unknown> => {
+  const wrappedCreate = (...args: unknown[]): unknown => {
     const requestBody = args[0] as
       | (RequestModelParameters & { model?: string; messages?: unknown; stream?: boolean })
       | undefined;
@@ -245,29 +245,36 @@ export function wrapAnthropic<T extends AnthropicLike>(
       input: requestBody?.messages
     });
 
+    let pending: unknown;
     try {
-      const result = await originalCreate(...args);
-
-      if (requestBody?.stream) {
-        const accumulator = createEventAccumulator();
-        return instrumentAsyncIterable(result, accumulator.onEvent, ({ error, consumed }) => {
-          if (error) generation.end(errorEndOptions(error));
-          else if (consumed) generation.end(accumulator.endOptions());
-          else generation.end({ metadata: { streamed: "true" } });
-        });
-      }
-
-      const message = result as MessageLike;
-      const usageDetails = usageDetailsFrom(message.usage);
-      generation.end({
-        output: message,
-        ...(usageDetails && { usageDetails })
-      });
-      return result;
+      pending = originalCreate(...args);
     } catch (error) {
       generation.end(errorEndOptions(error));
       throw error;
     }
+    return recordResult(
+      pending,
+      (result) => {
+        if (requestBody?.stream) {
+          const accumulator = createEventAccumulator();
+          return instrumentAsyncIterable(result, accumulator.onEvent, ({ error, consumed }) => {
+            if (error) generation.end(errorEndOptions(error));
+            else if (consumed) generation.end(accumulator.endOptions());
+            else generation.end({ metadata: { streamed: "true" } });
+          });
+        }
+
+        // An empty body (content-length 0) parses to undefined.
+        const message = result as MessageLike | undefined;
+        const usageDetails = usageDetailsFrom(message?.usage);
+        generation.end({
+          output: message,
+          ...(usageDetails && { usageDetails })
+        });
+        return result;
+      },
+      (error) => generation.end(errorEndOptions(error))
+    );
   };
   messages.create = wrappedCreate as typeof messages.create;
   Object.defineProperty(messages, "__ironsideWrapped", { value: true, enumerable: false });
