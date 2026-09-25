@@ -5,11 +5,11 @@
 - **TARGET:** an Ironside release is one exact semantic version shared by the
   API, worker, and web images and deployed as one Coolify Service.
 - **CURRENT:** `deploy/coolify.yaml` defines that seven-container Service. It
-  is installable now with `IRONSIDE_VERSION=0.3.1`: the `v0.3.1` release
+  is installable now with `IRONSIDE_VERSION=0.4.0`: the `v0.4.0` release
   published public, multi-architecture (amd64/arm64) GHCR images for the API,
   worker, and web, verified by anonymous manifest pulls. 0.3.0 changed the
   Postgres and ClickHouse baselines, so do not update a `v0.2.0` Service in
-  place; 0.3.1 changes only the MinIO image. The earlier `v0.1.0` predates the verified
+  place; 0.3.x Services update to 0.4.0 in place. The earlier `v0.1.0` predates the verified
   multi-architecture/public-image contract; do not use it.
 - **CURRENT:** Services created with 0.3.0 or later upgrade in place; schema
   changes ship as append-only migrations
@@ -24,7 +24,7 @@ source for a future public Coolify catalog template.
 
 1. Create a Docker Compose Empty Service in the target project/environment.
 2. Paste `deploy/coolify.yaml` and save it.
-3. Set `IRONSIDE_VERSION` to an exact published release such as `0.3.1`.
+3. Set `IRONSIDE_VERSION` to an exact published release such as `0.4.0`.
    Never use `latest`, `main`, or another floating value.
 4. Confirm Coolify generated the web URL and the Postgres, ClickHouse, Redis,
    MinIO, metrics, and encryption secrets. These values are instance identity;
@@ -80,6 +80,14 @@ Take Postgres, ClickHouse, and MinIO backups first. Then change the single
 `IRONSIDE_VERSION` so API, worker, and web move together; pending migrations
 apply when they start. Verify health and the primary ingest/read paths.
 
+Updating to 0.4.0 also needs the `deploy/coolify.yaml` from the `v0.4.0` tag as
+the Service's Compose file. The 0.3.x file pins raw retention off; the 0.4.0 file
+turns it on unless the Service's environment sets
+`RAW_RETENTION_EXECUTION_ENABLED=false`, and the worker then starts deleting raw
+event objects past their project's retention. Read
+"Upgrading" in [the self-hosting guide](self-hosting.md#upgrading) first: it
+also covers the changed export formats and webhook destinations.
+
 A Service created before 0.3.1 also needs a newer `deploy/coolify.yaml` as its
 Compose file: take it from the `v0.3.1` tag when updating to 0.3.1, or from the
 tag of the release you update to. Its saved Compose names `quay.io/minio/minio`,
@@ -126,7 +134,7 @@ Before publishing:
 docker build -f apps/api/Dockerfile -t ironside-api:smoke .
 docker build -f apps/worker/Dockerfile -t ironside-worker:smoke .
 docker build -f apps/web/Dockerfile -t ironside-web:smoke .
-IRONSIDE_VERSION=0.3.1 docker compose -f deploy/coolify.yaml config >/dev/null
+IRONSIDE_VERSION=0.4.0 docker compose -f deploy/coolify.yaml config >/dev/null
 ```
 
 Use the real candidate version. Compose rendering does not prove anonymous GHCR

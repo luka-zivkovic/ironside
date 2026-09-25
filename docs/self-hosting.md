@@ -64,9 +64,10 @@ by Coolify, and trustctl does not update a Coolify Service.
 Every tagged release (`vX.Y.Z`) runs the build, typecheck, and test suite,
 validates the generic Compose checksum and render, and then publishes
 multi-architecture `ghcr.io/luka-zivkovic/ironside-{api,worker,web}:X.Y.Z`
-images. The `0.3.1` images are the current release and are public and
-anonymously pullable (amd64 and arm64); `0.3.1` is `0.3.0` with MinIO moved to
-a pullable image (see [Upgrading](#upgrading)). `0.2.0` was the first version
+images. The `0.4.0` images are the current release and are public and
+anonymously pullable (amd64 and arm64); installations on `0.3.x` upgrade to it
+in place (see [Upgrading](#upgrading)). `0.3.1` is `0.3.0` with MinIO moved to
+a pullable image. `0.2.0` was the first version
 installable this way; `0.3.0` changed the clean-install baselines, so install it
 fresh rather than updating a `0.2.0` instance. `0.1.0` predates the
 public-image contract. The release tag is immutable; a `sha-<full commit>` tag is published
@@ -78,11 +79,11 @@ its matching exact `image:` reference.
 ```yaml
 services:
   api:
-    image: ghcr.io/luka-zivkovic/ironside-api:0.3.1
+    image: ghcr.io/luka-zivkovic/ironside-api:0.4.0
   worker:
-    image: ghcr.io/luka-zivkovic/ironside-worker:0.3.1
+    image: ghcr.io/luka-zivkovic/ironside-worker:0.4.0
   web:
-    image: ghcr.io/luka-zivkovic/ironside-web:0.3.1
+    image: ghcr.io/luka-zivkovic/ironside-web:0.4.0
 ```
 
 After every image publishes, the workflow pulls those exact tags into the
@@ -245,16 +246,68 @@ in the Compose file, not in the application images: when updating to 0.3.1,
 take `compose.yaml` (or `docker-compose.yml`) from the `v0.3.1` tag along with
 the version; later releases' files include it.
 
-**Upgrading from 0.3.x to 0.4.0 starts deleting raw event objects.** Raw
-retention is on by default from 0.4.0: within 15 minutes of the first boot, the
-worker begins deleting raw event objects whose receive day is past their
-project's retention (default 90 days). To keep raw events, set
-`RAW_RETENTION_EXECUTION_ENABLED=false` (in the self-host bundle,
-`IRONSIDE_RAW_RETENTION_ENABLED=false` also works) on every worker before
-upgrading.
+**Raw retention is on by default from 0.4.0.** The 0.4.0 worker deletes raw
+event objects past their project's retention whenever
+`RAW_RETENTION_EXECUTION_ENABLED` is unset (0.3.x treated unset as off). Its
+first sweep runs when the worker starts, then every 15 minutes, and deletes
+objects whose receive day is past the project's retention: its own setting,
+or `DEFAULT_RETENTION_DAYS` (90 unless you changed it). The 0.3.x self-host
+and Coolify Compose files set the variable to `"false"` (the local
+`docker-compose.yml` defaulted it to `false`), so changing only the image
+version in those files keeps retention off. The 0.4.0 Compose files, and any
+deployment that does not set the variable, turn it on. To keep raw events, set
+`RAW_RETENTION_EXECUTION_ENABLED=false` on every worker before upgrading (the
+self-host bundle also reads `IRONSIDE_RAW_RETENTION_ENABLED`). With retention
+on, workers need the object-storage permissions listed under
+[Production considerations](#production-considerations); without them a sweep
+deletes nothing and logs an error.
+
+**Take the Compose file from the `v0.4.0` tag.** Besides the retention setting,
+it adds `RAW_RETENTION_SWEEP_INTERVAL_MS` (`IRONSIDE_RAW_RETENTION_SWEEP_INTERVAL_MS`
+in the self-host bundle) and, coming from 0.3.0, includes 0.3.1's move to
+Chainguard's MinIO build (above).
+
+**Other 0.4.0 changes to check before upgrading:**
+
+- **Exports** change format: `jsonl` writes native ingest events with a
+  `traceVersion` instead of one summary row per trace, and `parquet` writes
+  `traces/`, `observations/` and `scores/` folders instead of one file. Runs
+  are incremental from the durable trace feed. An existing export or OTLP
+  forward rule starts at the beginning of the feed, so its first 0.4.0 runs
+  send every matching trace still in retention once (at most 10,000 traces per
+  export run and 5,000 per forward run), the traces every 0.3.x run sent,
+  now as full traces with observations and scores.
+- **Webhooks** move to the durable trace feed. The webhook `traceVersion`
+  keeps its format (ISO 8601 UTC with microseconds) but changes meaning, from
+  the trace's latest activity time to its feed version, the time of each
+  publication, which only increases; a republished trace, including a late
+  batch that does not change its activity time, gets another webhook. For 24
+  hours after the upgrade each trace is sent by only one of a running 0.3.x
+  worker and a 0.4.0 worker (a claim a stopped worker left pending for over 10
+  minutes is taken over), and deliveries from before the upgrade are not
+  resent (`spec/webhooks-v1.md`, "Upgrading from 0.3.0").
+- **Webhooks and OTLP forwarding stop at a failed request** and retry it first
+  on the next run, instead of moving on: a destination that keeps failing
+  holds its rule. Redirects are not followed, so a 3xx response is a failure.
+  OTLP forwarding steps over only traces the destination rejects with 400, 413
+  or 422.
+- **Webhook and OTLP forward destinations** are refused on more address
+  ranges, and checked again at each connection: the special-purpose ranges
+  that are not globally reachable, including `100.64.0.0/10` (carrier-grade
+  NAT, also used by Tailscale), and IPv6 forms carrying a private IPv4 address
+  (NAT64, 6to4, IPv4-translated and -compatible). Their requests ignore
+  `HTTP_PROXY`, `HTTPS_PROXY` and `NODE_USE_ENV_PROXY`.
+- **The API refuses to start** with an invalid `DEFAULT_RATE_LIMIT_PER_MINUTE`
+  (not a positive integer). 0.3.x ran with it: a non-numeric value disabled
+  the limit, and zero or a negative value rejected every request.
+- **The local `docker-compose.yml`** publishes every port, including `api` and
+  `web`, on `127.0.0.1` only. Set `IRONSIDE_BIND_ADDRESS` to publish `api` and
+  `web` on another interface.
 
 Downgrades are not supported: an older release refuses to start on a schema a
-newer release migrated. To go back, restore the pre-upgrade backup. See
+newer release migrated. To go back, restore the pre-upgrade backup. A 0.3.x
+release's refusal says to "recreate the disposable database"; ignore that,
+since it would delete your data, and restore the backup instead. See
 [Database schema migrations](schema-migrations.md) for the upgrade procedure
 and the rules for writing migrations.
 
