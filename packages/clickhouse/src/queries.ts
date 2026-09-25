@@ -98,18 +98,24 @@ const OBSERVATION_HAS_TOKENS = `(mapContains(usage_details, 'total_tokens')
  */
 const TRACE_DURATION_MS = "dateDiff('millisecond', min(start_time), max(end_time))";
 
-/** Trace ids with an observation matching `condition` in the filtered project. */
-function tracesWithObservations(condition: string): string {
+/**
+ * Trace ids with an observation matching `condition` in the filtered project.
+ * `scope`, when set, is a PREWHERE limiting the observations read to the
+ * traces the trace-level conditions select (see buildTraceConditions).
+ */
+function tracesWithObservations(condition: string, scope: string): string {
   return `id in (
     select trace_id from observations final
+    ${scope}
     where project_id = {projectId:String} and ${condition}
   )`;
 }
 
 /** Trace ids whose observations, grouped per trace, satisfy `having`. */
-function tracesWhereObservations(having: string): string {
+function tracesWhereObservations(having: string, scope: string): string {
   return `id in (
     select trace_id from observations final
+    ${scope}
     where project_id = {projectId:String}
     group by trace_id
     having ${having}
@@ -153,32 +159,45 @@ function buildTraceConditions(filter: TraceFilter): {
     params.metadataKey = filter.metadataKey;
     params.metadataValue = filter.metadataValue;
   }
-  // The observation filters below scan the project's observations, which are
-  // partitioned by their own start time rather than the trace's timestamp.
+  // The observation filters below read the project's observations, which are
+  // keyed by their own start time rather than the trace's timestamp, so the
+  // selected time range cannot bound them directly. When the trace-level
+  // conditions above select anything narrower than the whole project, the
+  // observations read are limited to those traces' ids instead, as a
+  // PREWHERE: only trace_id is read across the project's history, and the
+  // filtered columns (inputs and outputs for search) only for those traces.
+  // This keeps the results exact: the outer query requires the same
+  // conditions. PREWHERE runs before FINAL here, which is safe because
+  // trace_id is part of the sort key, so every version of an observation,
+  // deletions included, has the same trace_id and is kept or dropped together.
+  const scope =
+    conditions.length > 1
+      ? `prewhere trace_id in (select id from traces final where ${conditions.join(" and ")})`
+      : "";
   if (filter.search) {
     const matches = (column: string) => `positionCaseInsensitiveUTF8(${column}, {search:String}) > 0`;
     conditions.push(`(
       id = {search:String}
       or ${matches("name")} or ${matches("input")} or ${matches("output")}
-      or ${tracesWithObservations(`(${matches("name")} or ${matches("input")} or ${matches("output")})`)}
+      or ${tracesWithObservations(`(${matches("name")} or ${matches("input")} or ${matches("output")})`, scope)}
     )`);
     params.search = filter.search;
   }
   if (filter.level) {
-    conditions.push(tracesWithObservations("level = {level:String}"));
+    conditions.push(tracesWithObservations("level = {level:String}", scope));
     params.level = filter.level;
   }
   if (filter.model) {
-    conditions.push(tracesWithObservations("model = {model:String}"));
+    conditions.push(tracesWithObservations("model = {model:String}", scope));
     params.model = filter.model;
   }
   if (filter.minDurationMs !== undefined) {
-    conditions.push(tracesWhereObservations(`${TRACE_DURATION_MS} >= {minDurationMs:Int64}`));
+    conditions.push(tracesWhereObservations(`${TRACE_DURATION_MS} >= {minDurationMs:Int64}`, scope));
     params.minDurationMs = filter.minDurationMs;
   }
   if (filter.minCost !== undefined) {
     conditions.push(
-      tracesWhereObservations(`sum(${OBSERVATION_COST}) >= toDecimal128({minCost:String}, 9)`)
+      tracesWhereObservations(`sum(${OBSERVATION_COST}) >= toDecimal128({minCost:String}, 9)`, scope)
     );
     // As decimal text: converting a Float64 truncates, so 1.001 would become 1.000999999.
     params.minCost = filter.minCost.toFixed(9);

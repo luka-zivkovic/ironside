@@ -38,8 +38,29 @@ The trace explorer shows a search box and level, model, minimum latency (seconds
 
 ## Cost
 
-The observation-based filters scan the project's observations. Observations are partitioned by their own start time rather than the trace's timestamp, so the time range does not prune that scan. The page figures are one grouped query over at most 100 trace ids, using the observations' `trace_id` skip index.
+The observation-based filters read the project's observations. Observations are keyed by their own start time rather than the trace's timestamp, and an observation can start on another day or month than its trace, so the time range cannot bound them directly. When any trace-level condition applies (time range, user, session, environment, tags or metadata), each observation filter reads only the observations of the traces those conditions select, as `prewhere trace_id in (select id from traces final where ...)`:
+
+- Only `trace_id` is read across the project's history; the filtered columns (names, inputs and outputs for search; start, end and cost for the duration and cost floors) are read only for those traces.
+- The results are exact, since the outer query requires the same conditions.
+- The PREWHERE runs before FINAL, which is safe because `trace_id` is part of the observations' sort key: every version of an observation, deletions included, has the same `trace_id` and is kept or dropped together.
+- The `trace_id` skip index does not help here: with thousands of traces in range, every granule may contain one of them.
+
+With no trace-level condition ("All time" and nothing else), the filters read all of the project's observations, as the question requires.
+
+Measured on a synthetic project of 400,000 traces and 4 million observations over 90 days (ClickHouse 25.3, laptop, median of three list requests):
+
+| Filter | List before | List after | Aggregates before | Aggregates after |
+| --- | --- | --- | --- | --- |
+| Last 24 hours + search in observation inputs | 302 ms | 56 ms | 1,387 ms | 201 ms |
+| Last 24 hours + model | 154 ms | 46 ms | 538 ms | 292 ms |
+| Last 24 hours + minimum duration | 259 ms | 34 ms | 690 ms | 299 ms |
+| Last 24 hours + minimum cost | 236 ms | 37 ms | 734 ms | 262 ms |
+| Last 7 days + model + level | 239 ms | 114 ms | 840 ms | 376 ms |
+| One user (all time) + model | 199 ms | 100 ms | 689 ms | 437 ms |
+| All time + model | 212 ms | 217 ms | 882 ms | 840 ms |
+
+For the 24-hour search, bytes read dropped from 2.45 GiB to 189 MiB. The saving grows with the project's history, since the rows outside the range cost only their `trace_id`. The page figures are one grouped query over at most 100 trace ids, using the observations' `trace_id` skip index.
 
 ## Verified
 
-`apps/api/test/trace-search.test.ts` runs the list and aggregates routes against real ClickHouse and Postgres. It covers each filter alone and combined, with the aggregates counting the same traces as the list, the per-trace figures (including traces with no observations and no ended observation), an exact decimal cost floor, blank values leaving filters unset, and invalid values returning 400. `apps/web/test/trace-filters.test.ts` covers the URL round trip, floor parsing and limits, the conversion to API units, and clearing. The explorer was also checked in a browser against a seeded project: the columns, a search combined with the level filter, and the summary tiles following the filters.
+`packages/clickhouse/test/trace-filter-scope.test.ts` checks each observation filter, alone and combined, with a time range or a user: it matches traces whose observations start months before or after the range, leaves out a trace outside the range whose observation falls inside it, and uses only an observation's latest version (changed, deleted, or moved to another day). Without a trace-level condition, every trace matches. `apps/api/test/trace-search.test.ts` runs the list and aggregates routes against real ClickHouse and Postgres. It covers each filter alone and combined, with the aggregates counting the same traces as the list, the per-trace figures (including traces with no observations and no ended observation), an exact decimal cost floor, blank values leaving filters unset, and invalid values returning 400. `apps/web/test/trace-filters.test.ts` covers the URL round trip, floor parsing and limits, the conversion to API units, and clearing. The explorer was also checked in a browser against a seeded project: the columns, a search combined with the level filter, and the summary tiles following the filters.
