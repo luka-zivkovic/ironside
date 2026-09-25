@@ -246,36 +246,64 @@ in the Compose file, not in the application images: when updating to 0.3.1,
 take `compose.yaml` (or `docker-compose.yml`) from the `v0.3.1` tag along with
 the version; later releases' files include it.
 
-**Take the Compose file from the `v0.4.0` tag.** The 0.3.x Compose files pin
-`RAW_RETENTION_EXECUTION_ENABLED: "false"` for the worker; the 0.4.0 files
-read the setting from the environment instead and add
-`RAW_RETENTION_SWEEP_INTERVAL_MS`. With the new images alone, raw retention
-stays off.
+**Raw retention is on by default from 0.4.0.** The 0.4.0 worker deletes raw
+event objects past their project's retention whenever
+`RAW_RETENTION_EXECUTION_ENABLED` is unset (0.3.x treated unset as off). Its
+first sweep runs when the worker starts, then every 15 minutes, and deletes
+objects whose receive day is past the project's retention: its own setting,
+or `DEFAULT_RETENTION_DAYS` (90 unless you changed it). The 0.3.x self-host
+and Coolify Compose files set the variable to `"false"` (the local
+`docker-compose.yml` defaulted it to `false`), so changing only the image
+version in those files keeps retention off. The 0.4.0 Compose files, and any
+deployment that does not set the variable, turn it on. To keep raw events, set
+`RAW_RETENTION_EXECUTION_ENABLED=false` on every worker before upgrading (the
+self-host bundle also reads `IRONSIDE_RAW_RETENTION_ENABLED`). With retention
+on, workers need the object-storage permissions listed under
+[Production considerations](#production-considerations); without them a sweep
+deletes nothing and logs an error.
 
-**With the 0.4.0 Compose file, upgrading starts deleting raw event objects.**
-Raw retention is on by default from 0.4.0: within 15 minutes of the first boot,
-the worker begins deleting raw event objects whose receive day is past their
-project's retention (default 90 days). To keep raw events, set
-`RAW_RETENTION_EXECUTION_ENABLED=false` (in the self-host bundle,
-`IRONSIDE_RAW_RETENTION_ENABLED=false` also works) on every worker before
-upgrading.
+**Take the Compose file from the `v0.4.0` tag.** Besides the retention setting,
+it adds `RAW_RETENTION_SWEEP_INTERVAL_MS` (`IRONSIDE_RAW_RETENTION_SWEEP_INTERVAL_MS`
+in the self-host bundle) and, coming from 0.3.0, includes 0.3.1's move to
+Chainguard's MinIO build (above).
 
 **Other 0.4.0 changes to check before upgrading:**
 
-- Scheduled exports change format: `jsonl` writes native ingest events with a
+- **Exports** change format: `jsonl` writes native ingest events with a
   `traceVersion` instead of one summary row per trace, and `parquet` writes
-  `traces/`, `observations/` and `scores/` folders instead of one file.
-  Exports are also incremental, from the durable trace feed.
-- Webhook and OTLP forward destinations are refused on more address ranges,
-  checked again at each connection: every range that is not globally
-  reachable, including `100.64.0.0/10` (carrier-grade NAT, also used by
-  Tailscale). Their requests ignore `HTTP_PROXY` and `NODE_USE_ENV_PROXY`.
-- Webhooks move to the durable trace feed. Migration `0006` hands existing rules
-  over so that a rolling upgrade neither resends old deliveries nor sends one
-  twice while 0.3.x and 0.4.0 workers overlap (see `spec/webhooks-v1.md`).
+  `traces/`, `observations/` and `scores/` folders instead of one file. Runs
+  are incremental from the durable trace feed. An existing export or OTLP
+  forward rule starts at the beginning of the feed, so its first 0.4.0 run
+  sends every trace still in retention once, as every 0.3.x run did.
+- **Webhooks** move to the durable trace feed. The webhook `traceVersion`
+  changes from the trace's activity time (`YYYY-MM-DD HH:MM:SS.ffffff`) to its
+  feed version (ISO 8601, `...Z`), and a republished trace, including a late
+  batch that does not change its activity time, gets another webhook. For 24
+  hours after the upgrade each trace is sent by only one of a running 0.3.x
+  worker and a 0.4.0 worker (a claim a stopped worker left pending for over 10
+  minutes is taken over), and deliveries from before the upgrade are not
+  resent (`spec/webhooks-v1.md`, "Upgrading from 0.3.0").
+- **Webhooks and OTLP forwarding stop at a failed request** and retry it first
+  on the next run, instead of moving on: a destination that keeps failing
+  holds its rule. Redirects are not followed, so a 3xx response is a failure.
+  OTLP forwarding steps over only traces the destination rejects with 400, 413
+  or 422.
+- **Webhook and OTLP forward destinations** are refused on more address
+  ranges, and checked again at each connection: the special-purpose ranges
+  that are not globally reachable, including `100.64.0.0/10` (carrier-grade
+  NAT, also used by Tailscale), and IPv6 forms carrying a private IPv4 address
+  (NAT64, 6to4, IPv4-translated and -compatible). Their requests ignore
+  `HTTP_PROXY`, `HTTPS_PROXY` and `NODE_USE_ENV_PROXY`.
+- **The API refuses to start** with an invalid `DEFAULT_RATE_LIMIT_PER_MINUTE`
+  (not a positive integer); 0.3.x silently disabled the limit.
+- **The local `docker-compose.yml`** publishes every port, including `api` and
+  `web`, on `127.0.0.1` only. Set `IRONSIDE_BIND_ADDRESS` to publish `api` and
+  `web` on another interface.
 
 Downgrades are not supported: an older release refuses to start on a schema a
-newer release migrated. To go back, restore the pre-upgrade backup. See
+newer release migrated. To go back, restore the pre-upgrade backup. A 0.3.x
+release's refusal says to "recreate the disposable database"; ignore that,
+since it would delete your data, and restore the backup instead. See
 [Database schema migrations](schema-migrations.md) for the upgrade procedure
 and the rules for writing migrations.
 
