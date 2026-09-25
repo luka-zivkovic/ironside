@@ -1,4 +1,5 @@
 import type { IronsideClient, TraceHandle } from "../client.js";
+import { recordResult } from "./api-promise.js";
 import { errorEndOptions, instrumentAsyncIterable } from "./streaming.js";
 
 // Wraps the OpenAI Node SDK's chat.completions.create() to automatically
@@ -229,11 +230,11 @@ export function wrapOpenAI<T extends OpenAILike>(
   };
   if (completions.__ironsideWrapped) return client;
 
-  const originalCreate = completions.create.bind(completions) as (
-    ...args: unknown[]
-  ) => Promise<unknown>;
+  const originalCreate = completions.create.bind(completions) as (...args: unknown[]) => unknown;
 
-  const wrappedCreate = async (...args: unknown[]): Promise<unknown> => {
+  // Not async: create() returns an APIPromise, which chat.completions.parse()
+  // and callers' withResponse() need, so it is kept (api-promise.ts).
+  const wrappedCreate = (...args: unknown[]): unknown => {
     const requestBody = args[0] as
       | (RequestModelParameters & { model?: string; messages?: unknown; stream?: boolean })
       | undefined;
@@ -247,31 +248,38 @@ export function wrapOpenAI<T extends OpenAILike>(
       input: requestBody?.messages
     });
 
+    let pending: unknown;
     try {
-      const result = await originalCreate(...args);
-
-      if (requestBody?.stream) {
-        const accumulator = createChunkAccumulator();
-        return instrumentAsyncIterable(result, accumulator.onChunk, ({ error, consumed }) => {
-          if (error) generation.end(errorEndOptions(error));
-          else if (consumed) generation.end(accumulator.endOptions());
-          // !consumed: the result wasn't iterable at all (unexpected SDK
-          // shape) — end with what we know rather than dangle forever.
-          else generation.end({ metadata: { streamed: "true" } });
-        });
-      }
-
-      const completion = result as ChatCompletionLike;
-      const usageDetails = usageDetailsFrom(completion.usage);
-      generation.end({
-        output: completion,
-        ...(usageDetails && { usageDetails })
-      });
-      return result;
+      pending = originalCreate(...args);
     } catch (error) {
       generation.end(errorEndOptions(error));
       throw error;
     }
+    return recordResult(
+      pending,
+      (result) => {
+        if (requestBody?.stream) {
+          const accumulator = createChunkAccumulator();
+          return instrumentAsyncIterable(result, accumulator.onChunk, ({ error, consumed }) => {
+            if (error) generation.end(errorEndOptions(error));
+            else if (consumed) generation.end(accumulator.endOptions());
+            // !consumed: the result wasn't iterable at all (unexpected SDK
+            // shape) — end with what we know rather than dangle forever.
+            else generation.end({ metadata: { streamed: "true" } });
+          });
+        }
+
+        // An empty body (content-length 0) parses to undefined.
+        const completion = result as ChatCompletionLike | undefined;
+        const usageDetails = usageDetailsFrom(completion?.usage);
+        generation.end({
+          output: completion,
+          ...(usageDetails && { usageDetails })
+        });
+        return result;
+      },
+      (error) => generation.end(errorEndOptions(error))
+    );
   };
   completions.create = wrappedCreate as typeof completions.create;
   Object.defineProperty(completions, "__ironsideWrapped", {

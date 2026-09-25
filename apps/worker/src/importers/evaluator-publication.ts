@@ -186,6 +186,15 @@ export async function materializeEvaluatorImportSnapshot(
         importSource: state.source
       });
       if (await discardIfExpired()) return;
+      // The trace feed stays put for score-only changes; scheduled exports
+      // pick the new scores up from the score feed. Published while the
+      // snapshot is still pending: if this attempt stops before the snapshot
+      // is cleared below, recovery repeats both steps, and a repeated
+      // publication only re-sends the same scores.
+      await publishTraceScoreActivity(options.pool, {
+        projectId: options.projectId,
+        traceIds: [state.traceId]
+      });
       // This transaction clears the durable pending snapshot but, because PG
       // recorded publish_required=false, leaves the evaluator feed/version
       // unchanged. Provider annotations never reopen a trace.
@@ -197,12 +206,6 @@ export async function materializeEvaluatorImportSnapshot(
         importSource: state.source,
         importRunToken: options.runToken,
         importTraceTimestamp: snapshot.trace.timestamp
-      });
-      // The trace feed stays put for score-only changes; scheduled exports
-      // pick the new scores up from the score feed.
-      await publishTraceScoreActivity(options.pool, {
-        projectId: options.projectId,
-        traceIds: [state.traceId]
       });
       return;
     }

@@ -343,11 +343,11 @@ describe("GET /api/public/traces/:id (LangFuse-shaped detail)", () => {
   });
 });
 
-async function postScore(payload: unknown, key = apiKey) {
+async function postScore(payload: unknown, key = apiKey, headers: Record<string, string> = {}) {
   return app.request("/api/public/scores", {
     method: "POST",
     body: JSON.stringify(payload),
-    headers: { "content-type": "application/json", authorization: basicAuth(key) }
+    headers: { "content-type": "application/json", authorization: basicAuth(key), ...headers }
   });
 }
 
@@ -377,6 +377,62 @@ async function scoreBatchById(scoreId: string): Promise<IngestBatch> {
   }
   throw new Error(`no queued batch found containing score ${scoreId}`);
 }
+
+describe("POST /api/public/scores without an id", () => {
+  const thumbsUp = () => ({ traceId: traceA.id, name: "thumbs_up", value: 1 });
+  const idOf = async (res: Response) => ((await res.json()) as { id: string }).id;
+
+  it("names the score by its Idempotency-Key and content, so a resent request replaces it", async () => {
+    const key = `retry-${ulid()}`;
+    const first = await idOf(await postScore(thumbsUp(), apiKey, { "idempotency-key": key }));
+    const resent = await idOf(await postScore(thumbsUp(), apiKey, { "idempotency-key": key }));
+    const other = await idOf(await postScore(thumbsUp(), apiKey, { "idempotency-key": `${key}-other` }));
+    // Surrounding whitespace is not part of the key (HTTP strips it before the route sees the header).
+    const padded = await idOf(await postScore(thumbsUp(), apiKey, { "idempotency-key": `  ${key}\t` }));
+
+    expect(first).toMatch(/^idem_[0-9a-f]{32}$/);
+    expect(resent).toBe(first);
+    expect(padded).toBe(first);
+    expect(other).not.toBe(first);
+    expect((await scoreBatchById(first)).events[0]?.body).toMatchObject({ id: first, name: "thumbs_up" });
+  });
+
+  it("makes a distinct score when a key is reused for a different score", async () => {
+    // One key per workflow run, posting several metrics: none may replace another.
+    const key = `run-${ulid()}`;
+    const ids = await Promise.all(
+      [
+        { traceId: traceA.id, name: "accuracy", value: 0.9 },
+        { traceId: traceA.id, name: "helpfulness", value: 1 },
+        { traceId: traceA.id, name: "accuracy", value: 0.8 },
+        { traceId: traceB.id, name: "accuracy", value: 0.9 },
+        { traceId: traceA.id, name: "accuracy", value: 0.9, comment: "checked" }
+      ].map(async (score) => idOf(await postScore(score, apiKey, { "idempotency-key": key })))
+    );
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it("makes a new score of every request without an Idempotency-Key, and keeps a body id over the key", async () => {
+    const first = await idOf(await postScore(thumbsUp()));
+    const second = await idOf(await postScore(thumbsUp()));
+    expect(second).not.toBe(first);
+
+    const explicit = ulid();
+    expect(await idOf(await postScore({ ...thumbsUp(), id: explicit }, apiKey, { "idempotency-key": "ignored" }))).toBe(explicit);
+    // A body id makes the key irrelevant, so it is not validated either.
+    const withLongKey = ulid();
+    const res = await postScore({ ...thumbsUp(), id: withLongKey }, apiKey, { "idempotency-key": "k".repeat(256) });
+    expect(res.status).toBe(200);
+    expect(await idOf(res)).toBe(withLongKey);
+  });
+
+  it("accepts a key of 1 to 255 characters and rejects an empty or longer one", async () => {
+    expect((await postScore(thumbsUp(), apiKey, { "idempotency-key": "k" })).status).toBe(200);
+    expect((await postScore(thumbsUp(), apiKey, { "idempotency-key": "k".repeat(255) })).status).toBe(200);
+    expect((await postScore(thumbsUp(), apiKey, { "idempotency-key": " " })).status).toBe(400);
+    expect((await postScore(thumbsUp(), apiKey, { "idempotency-key": "k".repeat(256) })).status).toBe(400);
+  });
+});
 
 describe("POST /api/public/scores (rubrist verdict sync-back)", () => {
   it("accepts a rubrist-shaped verdict score and enqueues a domain-valid score-upsert", async () => {

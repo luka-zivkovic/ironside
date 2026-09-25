@@ -4,11 +4,11 @@ Status: implemented. Owner: `packages/sdk/src/wrappers/streaming.ts`, `packages/
 
 ## Purpose
 
-`wrapOpenAI` and `wrapAnthropic` record streamed calls (`create({ ..., stream: true })`) as generations, with output, tool calls and usage, without changing the stream the caller receives. The wrapped `create` returns a plain `Promise`, so the SDK's `APIPromise` helpers (`.withResponse()`, `.asResponse()`) are not available through a wrapper. Chat applications usually stream, so a wrapper that only recorded non-streaming calls would miss most real traffic.
+`wrapOpenAI` and `wrapAnthropic` record streamed calls (`create({ ..., stream: true })`) as generations, with output, tool calls and usage, without changing the stream the caller receives. The wrapped `create` returns the SDK's own `APIPromise`, so `.withResponse()`, `.asResponse()` and the SDKs' helpers built on them work through a wrapper (see "APIPromise" below). Chat applications usually stream, so a wrapper that only recorded non-streaming calls would miss most real traffic.
 
 ## Instrumentation
 
-`create()` returns the provider SDK's own `Stream` object with its `[Symbol.asyncIterator]` patched in place (`instrumentAsyncIterable`). Both SDKs' `Stream` classes have API beyond iteration, such as `.tee()`, `.controller` and `.toReadableStream()`, which a wrapper generator would break.
+`create()` returns the provider SDK's own `Stream` object, instrumented in place (`instrumentAsyncIterable`). Both SDKs' `Stream` classes have API beyond iteration, such as `.tee()`, `.controller` and `.toReadableStream()`, which a wrapper generator would break. Both keep their iterator factory as an instance `iterator` method, which `[Symbol.asyncIterator]()` and `tee()` call and `toReadableStream()` reaches through `[Symbol.asyncIterator]`, so the wrapper instruments `iterator`: every way of reading the stream is recorded, and a tee'd stream once, since `tee()` reads the one underlying iterator for both branches. `[Symbol.asyncIterator]` is patched as well, in case a stream's does not go through `iterator`; an iterator the patched `iterator` already made is passed through, so each chunk is recorded once either way. Any other async iterable gets only `[Symbol.asyncIterator]` patched.
 
 - The wrapper never reads the stream itself. It accumulates chunks as the caller iterates, so buffering and backpressure are unchanged.
 - The generation starts when `create()` is called, with the same name, model, input and sampling parameters as a non-streaming call (`spec/direct-ingest-primacy-v1.md`). It ends exactly once, on the first of:
@@ -42,25 +42,38 @@ The message is reassembled from the `RawMessageStreamEvent` protocol:
 - Usage: `input_tokens` and `output_tokens` are always recorded, because the protocol carries them whether or not the caller asks. Anthropic's cache token counts are not recorded.
 - Metadata: `streamed`.
 
+## APIPromise
+
+Both SDKs' `create()` returns an `APIPromise`, a `Promise` with extra methods that callers and the SDKs' own helpers use: Anthropic's `messages.stream()` calls `create({ ..., stream: true }).withResponse()`, and OpenAI's `chat.completions.parse()` calls `create(...)._thenUnwrap(...)`. The wrapped `create` is not `async`: it derives its result with the SDK's own `_thenUnwrap` (`wrappers/api-promise.ts`, `recordResult`), so the caller gets an `APIPromise` with every method, and the SDK helpers are recorded like the `create()` calls they make.
+
+- The result is recorded when the caller reads it: awaiting it, `.withResponse()`, or a helper.
+- A failed request (an error status, a connection failure, a timeout or an abort before the response) is recorded once as an error through `.asResponse()`, which does not read the response body, also when the caller never reads the result. The unwrapped SDK would raise an unhandled rejection for such an unread failure; through the wrapper it is only recorded.
+- A failure after the response arrived (a body that is cut off or does not parse, an abort while it downloads) is recorded once as an error by hooking the result's `parseResponse`, which the SDK calls when the result is read, including through `.withResponse()` and from the promise OpenAI's `parse()` derives from it.
+- A result that is never read is never parsed, so a successful call whose result is ignored (`void create(...)`) or read only as the raw response (`.asResponse()`) leaves its generation open, like a stream that is never iterated. The earlier `async` wrapper recorded those, since it read every result.
+- OpenAI's `parse()` records the completion before it parses the message content, so a `LengthFinishReasonError` or a content that fails the caller's schema rejects the caller's promise while the generation is recorded as a success: the API call itself succeeded.
+- A synchronous throw from `create()` (a missing body, or Anthropic's check that a long request must stream) is recorded and thrown synchronously, as the unwrapped SDK throws it; the earlier `async` wrapper turned it into a rejected promise.
+- An empty body, which both SDKs parse to `undefined`, is recorded without output.
+- A value that is not an `APIPromise` (another SDK version, a test double) is handled as a plain promise.
+
 ## Not covered
 
-- Anthropic's `messages.stream()` helper builds its own request path; only `messages.create()` is patched.
 - OpenAI's Responses API (`client.responses.create`) is not wrapped, streaming or not.
 - `recordGenerateTextResult` (Vercel AI SDK) records a completed result. It has no interception point, so there is no streaming recorder for `streamText`.
 
 ## Known limits
 
-- `.tee()`: both SDKs' `tee()` reads the stream's underlying iterator directly instead of `[Symbol.asyncIterator]`, so chunks read through the branches are not accumulated and the generation never ends. The branches themselves work normally.
+- `.tee()`: the generation ends when the underlying iterator does. If no branch reads to the end, it never does, and the generation stays open like an unconsumed stream. The SDKs' tee branches have no `return()`, so a `break` in a branch neither records the partial output nor cancels the request; that is the SDKs' behavior with or without the wrapper.
 - `.toReadableStream()` in both SDKs iterates through `[Symbol.asyncIterator]`, so a stream consumed that way is recorded like a `for await` loop.
 - `stream_options.include_usage` is never injected (see OpenAI).
 
 ## Verified
 
-`packages/sdk/test/streaming.test.ts` covers OpenAI text and usage accumulation, fragmented tool-call assembly, `n > 1` streams recording every choice, early break (partial output, `level: "default"`), a mid-stream error (`level: "error"` and rethrow), and an unaffected non-streaming call; Anthropic reassembly of text and tool-use blocks with usage from `message_start` and `message_delta`, a break in the middle of a tool call, thinking and signature deltas, and a mid-stream error; and `instrumentAsyncIterable` finishing exactly once and handling a non-iterable value. `packages/sdk/test/streaming-conformance.test.ts` runs the real `openai` 6 and `@anthropic-ai/sdk` 0.111 clients (dev dependencies) against SSE from a local HTTP server through the wrapped clients, proving the in-place patch works on their `Stream` classes and the recorded shapes match what they yield; its `.tee()` test checks that both branches still yield the full stream, not what is recorded. `packages/sdk/test/wrappers.test.ts` checks that a streaming call returns the same stream object.
+`packages/sdk/test/streaming.test.ts` covers OpenAI text and usage accumulation, fragmented tool-call assembly, `n > 1` streams recording every choice, early break (partial output, `level: "default"`), a mid-stream error (`level: "error"` and rethrow), and an unaffected non-streaming call; Anthropic reassembly of text and tool-use blocks with usage from `message_start` and `message_delta`, a break in the middle of a tool call, thinking and signature deltas, and a mid-stream error; and `instrumentAsyncIterable` finishing exactly once and handling a non-iterable value. `packages/sdk/test/streaming-conformance.test.ts` runs the real `openai` 6 and `@anthropic-ai/sdk` 0.111 clients (dev dependencies) against SSE from a local HTTP server through the wrapped clients, proving the in-place patch works on their `Stream` classes and the recorded shapes match what they yield; its `.tee()` tests check, for both SDKs, that both branches yield the full stream and that a tee'd stream is recorded once, and an Anthropic stream read through `toReadableStream()` is recorded once as well. `streaming.test.ts` also checks that a stream-shaped object records each chunk once whether or not its `[Symbol.asyncIterator]` goes through its `iterator`. `packages/sdk/test/wrappers.test.ts` checks that a streaming call returns the same stream object. `packages/sdk/test/api-promise-conformance.test.ts` runs both real SDKs through the wrapped clients against a local server returning JSON, SSE or a 500: Anthropic's `messages.stream()` and `create().withResponse()`, OpenAI's `chat.completions.parse()`, `chat.completions.stream()` and `create().withResponse()` each work and are recorded once; `.asResponse()` returns the response with its body unread; a failed request is recorded once as an error, also when its result is never read; a malformed body (through `create()`, `.withResponse()` and `parse()`) and an abort while the body downloads are recorded once as errors; and an empty body resolves to `undefined` and is recorded without an error.
 
 ## History
 
 - M9-07 added streaming support. Before it, the wrappers detected `stream: true`, skipped recording, and logged a one-time warning; the M4-05 audit listed this as the largest gap in the primary SDK path (`spec/direct-ingest-primacy-v1.md`).
 - Review of PR #39 found two data-loss bugs, both fixed with regression tests: OpenAI `n > 1` streams were truncated to `choices[0]`, and Anthropic `thinking_delta`/`signature_delta` content was dropped for extended-thinking models.
-- This spec earlier stated that `.tee()` branches feed one accumulator twice and that `.toReadableStream()` bypasses the patched iterator. Against `openai` 6.46.0 and `@anthropic-ai/sdk` 0.111.0 the reverse holds, as described under Known limits.
-- Still open: a stream consumed only through `.tee()` branches is never recorded as finished.
+- This spec earlier stated that `.tee()` branches feed one accumulator twice and that `.toReadableStream()` bypasses the patched iterator. Against `openai` 6.46.0 and `@anthropic-ai/sdk` 0.111.0 the reverse holds: `tee()` reads the instance `iterator` directly, and `.toReadableStream()` goes through `[Symbol.asyncIterator]` (see Instrumentation).
+- A stream consumed only through `.tee()` branches used to be left unrecorded, because the wrapper patched `[Symbol.asyncIterator]`, which `tee()` does not call. The wrapper now instruments the streams' `iterator` method.
+- The wrapped `create` used to be `async`, returning a plain `Promise`: Anthropic's `messages.stream()` and OpenAI's `chat.completions.parse()` threw on a wrapped client (`withResponse is not a function`, `_thenUnwrap is not a function`), and this spec wrongly said `messages.stream()` built its own request path. It now keeps the `APIPromise`.
