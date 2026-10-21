@@ -23,7 +23,7 @@
     "@ironside/shared": "workspace:*",
     "@ironside/storage": "workspace:*",
     "bullmq": "^5.80.2",
-    "hono": "^4.12.34",
+    "hono": "^4.13.11",
     "ioredis": "^5.4.1",
     "pg": "^8.20.0",
     "prom-client": "^15.1.3",
