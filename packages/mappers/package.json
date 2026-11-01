@@ -19,6 +19,6 @@
   "dependencies": {
     "@ironside/clickhouse": "workspace:*",
     "@ironside/shared": "workspace:*",
-    "zod": "^4.4.1"
+    "zod": "^4.6.6"
   }
 }
