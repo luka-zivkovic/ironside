@@ -1,5 +1,6 @@
 import {
   createClickHouseClient,
+  getTrace,
   listObservationsForTrace,
   runMigrations as runChMigrations
 } from "@ironside/clickhouse";
@@ -66,6 +67,28 @@ async function ingest(events: IngestEvent[]) {
   const job = await queue.getJob(batch.batchId);
   if (!job) throw new Error("job not found after enqueue");
   await processBatch(job);
+}
+
+function otlpEvent(traceHex: string, resourceAttributes: object[], spans: object[]): IngestEvent {
+  return {
+    id: ulid(),
+    type: "otlp-export",
+    source: "otlp",
+    schemaVersion: INGEST_SCHEMA_VERSION,
+    idempotencyKey: ulid(),
+    body: {
+      resourceSpans: [
+        {
+          resource: { attributes: resourceAttributes },
+          scopeSpans: [{ spans: spans.map((span) => ({ traceId: traceHex, ...span })) }]
+        }
+      ]
+    }
+  };
+}
+
+function hexId(length: 16 | 32): string {
+  return Array.from({ length }, () => Math.floor(Math.random() * 16).toString(16)).join("");
 }
 
 function observation(traceId: string, id: string, extra: Record<string, unknown>) {
@@ -137,5 +160,74 @@ describe("cost enrichment at ingest", () => {
     expect(row!.metadata[COST_SOURCE_METADATA_KEY]).toBe("override");
     expect(row!.metadata[COST_MODEL_METADATA_KEY]).toBe("^gpt-4o");
     expect(row!.metadata[COST_TABLE_METADATA_KEY]).toBeUndefined();
+  });
+
+  it("prices OTLP cache tokens, keeps a sent gen_ai.usage.cost, and derives cost when that value is unusable", async () => {
+    const traceHex = hexId(32);
+    const rootHex = hexId(16);
+    const nanos = `${BigInt(Date.now()) * 1_000_000n}`;
+    const span = (name: string, attributes: object[]) => ({
+      spanId: name === "root" ? rootHex : hexId(16),
+      ...(name !== "root" && { parentSpanId: rootHex }),
+      name,
+      startTimeUnixNano: nanos,
+      endTimeUnixNano: nanos,
+      attributes
+    });
+    const model = { key: "gen_ai.request.model", value: { stringValue: "claude-sonnet-4-5" } };
+    const usage = [
+      model,
+      { key: "gen_ai.usage.input_tokens", value: { intValue: "1000" } },
+      { key: "gen_ai.usage.output_tokens", value: { intValue: "1000" } },
+      { key: "gen_ai.usage.cache_read.input_tokens", value: { intValue: "1000000" } },
+      { key: "gen_ai.usage.cache_write.input_tokens", value: { intValue: "1000" } }
+    ];
+
+    await ingest([
+      otlpEvent(
+        traceHex,
+        [
+          { key: "service.name", value: { stringValue: "overshift" } },
+          { key: "service.version", value: { stringValue: "2.0.1" } }
+        ],
+        [
+          span("root", [
+            { key: "gen_ai.conversation.id", value: { stringValue: "item_42" } },
+            { key: "user.id", value: { stringValue: "user_7" } }
+          ]),
+          span("cached", usage),
+          span("client-cost", [...usage, { key: "gen_ai.usage.cost", value: { doubleValue: 0.123456789 } }]),
+          span("negative-cost", [...usage, { key: "gen_ai.usage.cost", value: { doubleValue: -1 } }]),
+          span("string-cost", [...usage, { key: "gen_ai.usage.cost", value: { stringValue: "0.5" } }]),
+          span("custom-cost", [...usage, { key: "llm.usage.total_cost", value: { doubleValue: 0.5 } }])
+        ]
+      )
+    ]);
+
+    const trace = await getTrace(clickhouse, projectId, traceHex);
+    expect(trace?.session_id).toBe("item_42");
+    expect(trace?.user_id).toBe("user_7");
+    expect(trace?.release).toBe("2.0.1");
+
+    const rows = await listObservationsForTrace(clickhouse, projectId, traceHex);
+    const byName = new Map(rows.map((row) => [row.name, row]));
+
+    // 1000 * 3e-6 + 1000 * 1.5e-5 + 1_000_000 * 3e-7 + 1000 * 3.75e-6
+    const derived = { input: 0.003, output: 0.015, cache_read: 0.3, cache_write: 0.00375, total: 0.32175 };
+    const cached = byName.get("cached")!;
+    expect(cached.usage_details).toMatchObject({ cache_read_input_tokens: 1_000_000, cache_creation_input_tokens: 1000 });
+    expect(cached.cost_details).toEqual(derived);
+    expect(cached.metadata[COST_SOURCE_METADATA_KEY]).toBe("table");
+
+    const client = byName.get("client-cost")!;
+    expect(client.cost_details).toEqual({ total: 0.123456789 });
+    expect(client.metadata[COST_SOURCE_METADATA_KEY]).toBeUndefined();
+
+    for (const name of ["negative-cost", "string-cost", "custom-cost"]) {
+      const row = byName.get(name)!;
+      expect(row.cost_details, name).toEqual(derived);
+      expect(row.metadata[COST_SOURCE_METADATA_KEY], name).toBe("table");
+    }
+    expect(byName.get("custom-cost")!.metadata["llm.usage.total_cost"]).toBe("0.5");
   });
 });

@@ -30,6 +30,23 @@ const GEN_AI_OUTPUT_MESSAGES = "gen_ai.output.messages";
 /** gen_ai.provider.name (current) supersedes gen_ai.system (legacy, pre-rename). */
 const GEN_AI_PROVIDER_NAME = "gen_ai.provider.name";
 const GEN_AI_SYSTEM_LEGACY = "gen_ai.system";
+/** Token counts that cost derivation prices (spec/cost-pricing-v1.md). */
+const GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS = "gen_ai.usage.cache_read.input_tokens";
+const GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS = "gen_ai.usage.cache_creation.input_tokens";
+/** The name upstream is moving cache_creation to. The current name wins when both are sent. */
+const GEN_AI_USAGE_CACHE_WRITE_INPUT_TOKENS = "gen_ai.usage.cache_write.input_tokens";
+/**
+ * Not in the semconv registry, but read by Langfuse, Opik, Laminar and
+ * Datadog: a span's cost in US dollars. It is the only cost attribute
+ * promoted into costDetails; any other custom cost attribute stays in
+ * metadata only.
+ */
+const GEN_AI_USAGE_COST = "gen_ai.usage.cost";
+/** gen_ai.conversation.id (semconv) is preferred over the generic session.id. */
+const GEN_AI_CONVERSATION_ID = "gen_ai.conversation.id";
+const SESSION_ID = "session.id";
+const USER_ID = "user.id";
+const SERVICE_VERSION = "service.version";
 const DEPLOYMENT_ENVIRONMENT_NAME = "deployment.environment.name";
 const DEPLOYMENT_ENVIRONMENT_LEGACY = "deployment.environment";
 
@@ -63,6 +80,28 @@ function tokenCount(value: number | undefined): number | undefined {
   return value !== undefined && Number.isFinite(value) && value >= 0 ? Math.round(value) : undefined;
 }
 
+/**
+ * A client-sent cost in US dollars, kept exactly as sent. A negative or
+ * non-finite value is dropped, so the worker derives cost instead.
+ */
+function costAmount(value: number | undefined): number | undefined {
+  return value !== undefined && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+/** The first non-empty string value among the keys, tried in order on each attribute list in turn. */
+function firstString(
+  attributeLists: { key: string; value?: unknown }[][],
+  keys: readonly string[]
+): string | undefined {
+  for (const attributes of attributeLists) {
+    for (const key of keys) {
+      const value = getAttributeString(attributes, key);
+      if (value) return value;
+    }
+  }
+  return undefined;
+}
+
 export function mapOtlpTraceRequest(
   projectId: string,
   request: OtlpExportTraceServiceRequest
@@ -92,6 +131,9 @@ export function mapOtlpTraceRequest(
           ? currentEnvironment
           : getAttributeString(resourceAttributes, DEPLOYMENT_ENVIRONMENT_LEGACY);
       const environment = normalizeEnvironment(rawEnvironment);
+      const sessionId = firstString([attrs, resourceAttributes], [GEN_AI_CONVERSATION_ID, SESSION_ID]);
+      const userId = firstString([attrs, resourceAttributes], [USER_ID]);
+      const release = firstString([resourceAttributes], [SERVICE_VERSION]);
       traces.set(span.traceId, {
         id: span.traceId,
         projectId,
@@ -99,7 +141,10 @@ export function mapOtlpTraceRequest(
         name: span.name,
         tags: [],
         metadata: attributesToMetadata(resourceAttributes),
-        ...(environment !== null && { environment })
+        ...(environment !== null && { environment }),
+        ...(sessionId !== undefined && { sessionId }),
+        ...(userId !== undefined && { userId }),
+        ...(release !== undefined && { release })
       });
     }
 
@@ -109,6 +154,11 @@ export function mapOtlpTraceRequest(
       getAttributeString(attrs, GEN_AI_SYSTEM_LEGACY);
     const inputTokens = tokenCount(getAttributeNumber(attrs, GEN_AI_USAGE_INPUT_TOKENS));
     const outputTokens = tokenCount(getAttributeNumber(attrs, GEN_AI_USAGE_OUTPUT_TOKENS));
+    const cacheReadTokens = tokenCount(getAttributeNumber(attrs, GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS));
+    const cacheCreationTokens =
+      tokenCount(getAttributeNumber(attrs, GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS)) ??
+      tokenCount(getAttributeNumber(attrs, GEN_AI_USAGE_CACHE_WRITE_INPUT_TOKENS));
+    const cost = costAmount(getAttributeNumber(attrs, GEN_AI_USAGE_COST));
     const input = extractGenAiMessages(attrs, GEN_AI_INPUT_MESSAGES, "input", messageProjectionBudget);
     const output = extractGenAiMessages(attrs, GEN_AI_OUTPUT_MESSAGES, "output", messageProjectionBudget);
     const modelParameters = extractModelParameters(attrs);
@@ -137,12 +187,16 @@ export function mapOtlpTraceRequest(
     if (span.status?.message) observation.statusMessage = span.status.message;
     if (input !== undefined) observation.input = input;
     if (output !== undefined) observation.output = output;
-    if (inputTokens !== undefined || outputTokens !== undefined) {
-      observation.usageDetails = {
-        ...(inputTokens !== undefined && { input_tokens: inputTokens }),
-        ...(outputTokens !== undefined && { output_tokens: outputTokens })
-      };
-    }
+    const usageDetails: Record<string, number> = {
+      ...(inputTokens !== undefined && { input_tokens: inputTokens }),
+      ...(outputTokens !== undefined && { output_tokens: outputTokens }),
+      ...(cacheReadTokens !== undefined && { cache_read_input_tokens: cacheReadTokens }),
+      ...(cacheCreationTokens !== undefined && { cache_creation_input_tokens: cacheCreationTokens })
+    };
+    if (Object.keys(usageDetails).length > 0) observation.usageDetails = usageDetails;
+    // A client cost is the observation's cost as sent; the worker only
+    // derives cost for observations without one.
+    if (cost !== undefined) observation.costDetails = { total: cost };
     observations.push(observation);
   }
 

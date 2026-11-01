@@ -159,6 +159,107 @@ describe("mapOtlpTraceRequest", () => {
     expect(mapOtlpTraceRequest("proj_x", invalidModern).traces[0]?.environment).toBeUndefined();
   });
 
+  it("sets the trace session from gen_ai.conversation.id, with session.id and then the resource as fallbacks", () => {
+    const sessionOf = (overrides: { resourceAttrs?: object[]; rootAttrs?: object[] }) =>
+      mapOtlpTraceRequest("proj_x", otlpExportTraceServiceRequestSchema.parse(otlpRequest(overrides))).traces[0]
+        ?.sessionId;
+
+    expect(sessionOf({
+      rootAttrs: [
+        { key: "gen_ai.conversation.id", value: { stringValue: "conv_1" } },
+        { key: "session.id", value: { stringValue: "sess_1" } }
+      ]
+    })).toBe("conv_1");
+    expect(sessionOf({ rootAttrs: [{ key: "session.id", value: { stringValue: "sess_1" } }] })).toBe("sess_1");
+    expect(sessionOf({
+      resourceAttrs: [{ key: "session.id", value: { stringValue: "sess_resource" } }],
+      rootAttrs: [{ key: "gen_ai.conversation.id", value: { stringValue: "conv_root" } }]
+    })).toBe("conv_root");
+    expect(sessionOf({ resourceAttrs: [{ key: "gen_ai.conversation.id", value: { stringValue: "conv_resource" } }] }))
+      .toBe("conv_resource");
+    expect(sessionOf({ rootAttrs: [{ key: "gen_ai.conversation.id", value: { stringValue: "" } }] })).toBeUndefined();
+    expect(sessionOf({})).toBeUndefined();
+  });
+
+  it("sets the trace user from user.id and the release from resource service.version, keeping both in metadata", () => {
+    const request = otlpExportTraceServiceRequestSchema.parse(
+      otlpRequest({
+        resourceAttrs: [
+          { key: "service.name", value: { stringValue: "overshift" } },
+          { key: "service.version", value: { stringValue: "1.4.2" } },
+          { key: "user.id", value: { stringValue: "user_resource" } }
+        ],
+        rootAttrs: [{ key: "user.id", value: { stringValue: "user_root" } }]
+      })
+    );
+    const { traces, observations } = mapOtlpTraceRequest("proj_x", request);
+    expect(traces[0]?.userId).toBe("user_root");
+    expect(traces[0]?.release).toBe("1.4.2");
+    expect(traces[0]?.metadata["service.version"]).toBe("1.4.2");
+    expect(observations.find((o) => o.id === "eee19b7ec3c1b174")?.metadata["user.id"]).toBe("user_root");
+
+    const resourceOnly = otlpExportTraceServiceRequestSchema.parse(
+      otlpRequest({ resourceAttrs: [{ key: "user.id", value: { stringValue: "user_resource" } }] })
+    );
+    const trace = mapOtlpTraceRequest("proj_x", resourceOnly).traces[0];
+    expect(trace?.userId).toBe("user_resource");
+    expect(trace?.release).toBeUndefined();
+  });
+
+  it("maps both cache token attributes, including the cache_write spelling, to the canonical usage keys", () => {
+    const usageOf = (childAttrs: object[]) =>
+      mapOtlpTraceRequest("proj_x", otlpExportTraceServiceRequestSchema.parse(otlpRequest({ childAttrs })))
+        .observations.find((o) => o.id === "a1b2c3d4e5f60718")?.usageDetails;
+    const model = { key: "gen_ai.request.model", value: { stringValue: "claude-sonnet-4-5" } };
+
+    expect(usageOf([
+      model,
+      { key: "gen_ai.usage.input_tokens", value: { intValue: "10" } },
+      { key: "gen_ai.usage.cache_read.input_tokens", value: { intValue: "9000" } },
+      { key: "gen_ai.usage.cache_creation.input_tokens", value: { doubleValue: 400.4 } }
+    ])).toEqual({ input_tokens: 10, cache_read_input_tokens: 9000, cache_creation_input_tokens: 400 });
+
+    expect(usageOf([model, { key: "gen_ai.usage.cache_write.input_tokens", value: { intValue: "250" } }]))
+      .toEqual({ cache_creation_input_tokens: 250 });
+
+    expect(usageOf([
+      model,
+      { key: "gen_ai.usage.cache_creation.input_tokens", value: { intValue: "100" } },
+      { key: "gen_ai.usage.cache_write.input_tokens", value: { intValue: "250" } }
+    ])).toEqual({ cache_creation_input_tokens: 100 });
+
+    expect(usageOf([
+      model,
+      { key: "gen_ai.usage.cache_read.input_tokens", value: { intValue: "-5" } },
+      { key: "gen_ai.usage.cache_creation.input_tokens", value: { doubleValue: -1 } },
+      { key: "gen_ai.usage.cache_write.input_tokens", value: { intValue: "7" } }
+    ])).toEqual({ cache_creation_input_tokens: 7 });
+  });
+
+  it("uses gen_ai.usage.cost as the observation's cost as sent, and drops negative or non-numeric values", () => {
+    const observationOf = (childAttrs: object[]) =>
+      mapOtlpTraceRequest("proj_x", otlpExportTraceServiceRequestSchema.parse(otlpRequest({ childAttrs })))
+        .observations.find((o) => o.id === "a1b2c3d4e5f60718");
+    const model = { key: "gen_ai.request.model", value: { stringValue: "deepseek-v4" } };
+
+    const sent = observationOf([model, { key: "gen_ai.usage.cost", value: { doubleValue: 0.012345678 } }]);
+    expect(sent?.costDetails).toEqual({ total: 0.012345678 });
+    expect(sent?.metadata["gen_ai.usage.cost"]).toBe("0.012345678");
+
+    expect(observationOf([model, { key: "gen_ai.usage.cost", value: { intValue: "0" } }])?.costDetails)
+      .toEqual({ total: 0 });
+    expect(observationOf([model, { key: "gen_ai.usage.cost", value: { doubleValue: -0.5 } }])?.costDetails)
+      .toBeUndefined();
+    expect(observationOf([model, { key: "gen_ai.usage.cost", value: { stringValue: "0.5" } }])?.costDetails)
+      .toBeUndefined();
+    expect(observationOf([model, { key: "gen_ai.usage.cost", value: { intValue: "lots" } }])?.costDetails)
+      .toBeUndefined();
+
+    const custom = observationOf([model, { key: "llm.usage.total_cost", value: { doubleValue: 0.5 } }]);
+    expect(custom?.costDetails).toBeUndefined();
+    expect(custom?.metadata["llm.usage.total_cost"]).toBe("0.5");
+  });
+
   it("maps JSON-string GenAI message attributes to observation input and output", () => {
     const input = JSON.stringify([
       { role: "user", parts: [{ type: "text", content: "Weather in Paris?" }] }

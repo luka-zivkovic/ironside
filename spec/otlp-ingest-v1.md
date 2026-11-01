@@ -43,6 +43,15 @@ The event `body` is the export as parsed by `otlpExportTraceServiceRequestSchema
 
 - Every span becomes an `Observation`: `id` is the `spanId`, `parentObservationId` the `parentSpanId`, plus `traceId`, `name`, `startTime`, `endTime`, and `statusMessage` from `status.message`. `status.code` 2 (`STATUS_CODE_ERROR`) sets `level: "error"`; any other status sets `level: "default"`.
 - A span with no `parentSpanId` is the trace root and also produces the `Trace`: `id` is the `traceId`, `timestamp` the root's start time, `name` the root span's name, and `metadata` the resource attributes. The root stays an observation as well, so nothing on it is discarded. An export that carries only child spans writes observations only; the trace row comes with the export that carries the root.
+- The trace's `sessionId`, `userId` and `release` come from the root span and its resource. Empty strings are ignored. The attributes also stay in metadata.
+
+  | Source | Trace field |
+  | --- | --- |
+  | Root span `gen_ai.conversation.id`, else root span `session.id`, else the same two keys on the resource | `sessionId` |
+  | Root span `user.id`, else resource `user.id` | `userId` |
+  | Resource `service.version` | `release` |
+
+  `tags` stays empty: OpenTelemetry has no common attribute for tags yet. `version` stays unset.
 - The root's resource attribute `deployment.environment.name` sets the trace environment; the deprecated `deployment.environment` is read only when the current attribute is absent. Both pass through the environment canonicalizer (`spec/environments-v1.md`), and an invalid current value leaves the environment unset instead of falling back to the legacy attribute.
 - A span is `type: "generation"` when it has a `gen_ai.operation.name` attribute or a resolved model, and `type: "span"` otherwise.
 - Span `kind` and span events are validated and stored but not mapped to domain fields.
@@ -53,6 +62,9 @@ Typed `gen_ai.*` mappings. The upstream conventions are still Development stabil
 | --- | --- |
 | `gen_ai.request.model`, else `gen_ai.response.model` | `model` |
 | `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` | `usageDetails.input_tokens`, `usageDetails.output_tokens` (`spec/usage-keys-v1.md`); a double is rounded, and a negative or non-finite value is dropped |
+| `gen_ai.usage.cache_read.input_tokens` | `usageDetails.cache_read_input_tokens`, with the same token rules |
+| `gen_ai.usage.cache_creation.input_tokens`, else `gen_ai.usage.cache_write.input_tokens` (the pending rename upstream) | `usageDetails.cache_creation_input_tokens`, with the same token rules |
+| `gen_ai.usage.cost` (a number, US dollars) | `costDetails.total`, exactly as sent (see Cost and scores) |
 | `gen_ai.request.temperature`, `.max_tokens`, `.top_p`, `.top_k`, `.frequency_penalty`, `.presence_penalty`, `.seed` | `modelParameters`, keyed without the `gen_ai.request.` prefix; numeric values only |
 | `gen_ai.provider.name`, else legacy `gen_ai.system` | `metadata["gen_ai.provider.name"]` |
 | `gen_ai.input.messages`, `gen_ai.output.messages` | `input`, `output` (see Message projection) |
@@ -69,14 +81,16 @@ This is a bounded query projection, not a rewrite of the stored evidence. Each a
 
 ## Cost and scores
 
-OpenTelemetry has no cost attribute (the `open-telemetry/semantic-conventions-genai` registry defines none) and no score concept.
+OpenTelemetry has no standard cost attribute (the `open-telemetry/semantic-conventions-genai` registry defines none) and no score concept.
 
-- Cost: the worker derives cost from the mapped usage and model with the price table (`spec/cost-pricing-v1.md`). A custom cost attribute is kept in metadata but not promoted into `costDetails`. A client that needs an exact provider-billed figure sends it through native JSON ingest or the `ironside` package.
+- Client cost: `gen_ai.usage.cost` is read as the span's cost in US dollars. It is not in the registry, but it is the de facto attribute: Langfuse, Opik, Laminar and Datadog read it. An `intValue` or `doubleValue` that is finite and not negative becomes `costDetails: { total: <value> }`, unrounded. The worker then keeps it and derives nothing for that observation. A negative, non-finite or non-numeric value (a `stringValue`, for example) is dropped, and the derived cost applies. The attribute also stays in metadata.
+- Derived cost: for every other observation with usage and a model, the worker derives cost from the price table (`spec/cost-pricing-v1.md`), including the cache token series.
+- Other custom cost attributes, such as `llm.usage.total_cost`, are kept in metadata but not promoted into `costDetails`.
 - Scores: OTLP has no way to send them. Scores are recorded through native JSON ingest (`score-upsert`) or the SDK's `score()` methods.
 
 ## Verified
 
-`apps/api/test/otlp.test.ts` covers authentication, 415 for other content types, 400 for malformed payloads, and a JSON export stored raw, queued, and mapped the way the worker maps it. `apps/api/test/otlp-protobuf.test.ts` covers the protobuf response, identical stored events for the protobuf and JSON encodings of one export, gzip for both encodings, 400 for a body declared gzip that is not, 413 for a 64 MiB gzip bomb, 400 for a protobuf span without a start time, 415 for other content encodings, 400 for undecodable protobuf, and the real `@opentelemetry/exporter-trace-otlp-proto` exporter sending through a local HTTP server into the mapper. `packages/mappers/test/otlp.test.ts` covers root promotion, model, usage, provider and sampling-parameter mapping, environment precedence, message projection and its limits, error status, metadata passthrough, and timestamp conversion.
+`apps/api/test/otlp.test.ts` covers authentication, 415 for other content types, 400 for malformed payloads, and a JSON export stored raw, queued, and mapped the way the worker maps it. `apps/api/test/otlp-protobuf.test.ts` covers the protobuf response, identical stored events for the protobuf and JSON encodings of one export, gzip for both encodings, 400 for a body declared gzip that is not, 413 for a 64 MiB gzip bomb, 400 for a protobuf span without a start time, 415 for other content encodings, 400 for undecodable protobuf, and the real `@opentelemetry/exporter-trace-otlp-proto` exporter sending through a local HTTP server into the mapper. `packages/mappers/test/otlp.test.ts` covers root promotion, session, user and release mapping, model, usage (cache tokens included), client cost, provider and sampling-parameter mapping, environment precedence, message projection and its limits, error status, metadata passthrough, and timestamp conversion. `apps/worker/test/cost-enrichment.test.ts` sends an OTLP export through the real ingest processor. It checks the trace's session, user and release, the derived cost of cache tokens, a sent `gen_ai.usage.cost` kept as sent, and the derived cost when the sent value is negative, a string, or a custom attribute.
 
 ## History
 
@@ -85,3 +99,4 @@ OpenTelemetry has no cost attribute (the `open-telemetry/semantic-conventions-ge
 - The M4-05 direct-ingest audit added the `gen_ai.request.*` to `modelParameters` mapping (`spec/direct-ingest-primacy-v1.md`). OTLP observations gained cost later, when the worker began deriving it (`spec/cost-pricing-v1.md`).
 - Issue #45 made OTLP the canonical integration surface for third-party frameworks and services.
 - Through 0.3.0 the API also filled each event's idempotency key with a hash of the body, which was identical for the protobuf and JSON encodings of an export. The key is now the event id (`spec/trace-envelope-v1.md`).
+- Issue luka-zivkovic/ironside#31 mapped `gen_ai.conversation.id` or `session.id` to `sessionId`, `user.id` to `userId`, `service.version` to `release`, and the cache token attributes to their canonical usage keys. It also made `gen_ai.usage.cost` the observation's cost as sent. Before, every custom cost attribute stayed in metadata only. The change was for Overshift, which sends each agent run as an OTLP trace and knows each run's cost, even for models the price table does not list.
