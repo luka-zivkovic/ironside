@@ -64,9 +64,11 @@ by Coolify, and trustctl does not update a Coolify Service.
 Every tagged release (`vX.Y.Z`) runs the build, typecheck, and test suite,
 validates the generic Compose checksum and render, and then publishes
 multi-architecture `ghcr.io/luka-zivkovic/ironside-{api,worker,web}:X.Y.Z`
-images. The `0.4.0` images are the current release and are public and
-anonymously pullable (amd64 and arm64); installations on `0.3.x` upgrade to it
-in place (see [Upgrading](#upgrading)). `0.3.1` is `0.3.0` with MinIO moved to
+images. The `0.4.1` images are the current release and are public and
+anonymously pullable (amd64 and arm64); installations on `0.3.x` and `0.4.0`
+upgrade to it in place (see [Upgrading](#upgrading)). `0.4.1` is `0.4.0` with
+OTLP ingest also reading the session, user, release, cache tokens and a client
+cost (`spec/otlp-ingest-v1.md`); it adds no migrations. `0.3.1` is `0.3.0` with MinIO moved to
 a pullable image. `0.2.0` was the first version
 installable this way; `0.3.0` changed the clean-install baselines, so install it
 fresh rather than updating a `0.2.0` instance. `0.1.0` predates the
@@ -79,11 +81,11 @@ its matching exact `image:` reference.
 ```yaml
 services:
   api:
-    image: ghcr.io/luka-zivkovic/ironside-api:0.4.0
+    image: ghcr.io/luka-zivkovic/ironside-api:0.4.1
   worker:
-    image: ghcr.io/luka-zivkovic/ironside-worker:0.4.0
+    image: ghcr.io/luka-zivkovic/ironside-worker:0.4.1
   web:
-    image: ghcr.io/luka-zivkovic/ironside-web:0.4.0
+    image: ghcr.io/luka-zivkovic/ironside-web:0.4.1
 ```
 
 After every image publishes, the workflow pulls those exact tags into the
@@ -233,6 +235,10 @@ on boot. Then verify health, owner sign-in, ingest, query, queue recovery, and
 scheduled work. Concurrent starts are safe, in-flight queue jobs survive
 ordinary worker restarts, and durable pending-ingest intents reconstruct lost
 Redis jobs.
+
+**0.4.0 to 0.4.1** needs only the version change: there are no new migrations
+and the Compose files are unchanged. OTLP traces stored before the update keep
+the fields they were stored with.
 
 **MinIO's image moved in 0.3.1.** MinIO no longer publishes public images:
 `quay.io/minio/minio` refuses anonymous pulls, so an installation on the 0.3.0

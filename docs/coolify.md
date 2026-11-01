@@ -5,11 +5,12 @@
 - **TARGET:** an Ironside release is one exact semantic version shared by the
   API, worker, and web images and deployed as one Coolify Service.
 - **CURRENT:** `deploy/coolify.yaml` defines that seven-container Service. It
-  is installable now with `IRONSIDE_VERSION=0.4.0`: the `v0.4.0` release
+  is installable now with `IRONSIDE_VERSION=0.4.1`: the `v0.4.1` release
   published public, multi-architecture (amd64/arm64) GHCR images for the API,
   worker, and web, verified by anonymous manifest pulls. 0.3.0 changed the
   Postgres and ClickHouse baselines, so do not update a `v0.2.0` Service in
-  place; 0.3.x Services update to 0.4.0 in place. The earlier `v0.1.0` predates the verified
+  place; 0.3.x Services update to 0.4.x in place, and 0.4.0 Services update to
+  0.4.1 by changing only `IRONSIDE_VERSION`. The earlier `v0.1.0` predates the verified
   multi-architecture/public-image contract; do not use it.
 - **CURRENT:** Services created with 0.3.0 or later upgrade in place; schema
   changes ship as append-only migrations
@@ -24,7 +25,7 @@ source for a future public Coolify catalog template.
 
 1. Create a Docker Compose Empty Service in the target project/environment.
 2. Paste `deploy/coolify.yaml` and save it.
-3. Set `IRONSIDE_VERSION` to an exact published release such as `0.4.0`.
+3. Set `IRONSIDE_VERSION` to an exact published release such as `0.4.1`.
    Never use `latest`, `main`, or another floating value.
 4. Confirm Coolify generated the web URL and the Postgres, ClickHouse, Redis,
    MinIO, metrics, and encryption secrets. These values are instance identity;
@@ -80,6 +81,9 @@ Take Postgres, ClickHouse, and MinIO backups first. Then change the single
 `IRONSIDE_VERSION` so API, worker, and web move together; pending migrations
 apply when they start. Verify health and the primary ingest/read paths.
 
+Updating from 0.4.0 to 0.4.1 changes only `IRONSIDE_VERSION`: 0.4.1 has no new
+migrations and the same `deploy/coolify.yaml`.
+
 Updating to 0.4.0 also needs the `deploy/coolify.yaml` from the `v0.4.0` tag as
 the Service's Compose file. The 0.3.x file pins raw retention off; the 0.4.0 file
 turns it on unless the Service's environment sets
@@ -134,7 +138,7 @@ Before publishing:
 docker build -f apps/api/Dockerfile -t ironside-api:smoke .
 docker build -f apps/worker/Dockerfile -t ironside-worker:smoke .
 docker build -f apps/web/Dockerfile -t ironside-web:smoke .
-IRONSIDE_VERSION=0.4.0 docker compose -f deploy/coolify.yaml config >/dev/null
+IRONSIDE_VERSION=0.4.1 docker compose -f deploy/coolify.yaml config >/dev/null
 ```
 
 Use the real candidate version. Compose rendering does not prove anonymous GHCR
