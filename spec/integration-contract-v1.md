@@ -32,7 +32,11 @@ The endpoint also accepts OTLP/HTTP JSON and gzip. Authentication is the same pr
 
 OpenTelemetry GenAI semantic conventions represent models, operations, inputs/outputs, token usage, provider details, and request parameters. Ironside maps those fields and preserves every remaining attribute in observation metadata.
 
-OTLP does not standardize computed monetary cost or eval/human-feedback scores. Ironside does not invent proprietary `gen_ai.*` attributes for them. Cost is derived server-side from token usage and the model name for native, OTLP and LangFuse-compatible ingest (`spec/cost-pricing-v1.md`); applications that need an exact provider-billed figure or scores should use the `ironside` package or native JSON, either as their primary integration or alongside OTLP. Custom OTLP cost attributes are retained as metadata but are not promoted into `costDetails`.
+OTLP does not standardize computed monetary cost or eval/human-feedback scores. Ironside does not invent proprietary `gen_ai.*` attributes for them. Cost is derived server-side from token usage and the model name for native, OTLP and LangFuse-compatible ingest (`spec/cost-pricing-v1.md`).
+
+An OTLP client can send its own cost as `gen_ai.usage.cost`, a number in US dollars. Ironside did not invent this attribute: Langfuse, Opik, Laminar and Datadog already read it. It becomes the observation's `costDetails.total` as sent, and replaces the derived cost for that observation (`spec/otlp-ingest-v1.md`). Every other custom OTLP cost attribute is kept in metadata but not promoted into `costDetails`.
+
+Applications that need scores, or a cost broken down by component, should use the `ironside` package or native JSON, either as their primary integration or alongside OTLP.
 
 ## Stability
 
@@ -41,3 +45,4 @@ The upstream `gen_ai.*` semantic conventions are still marked Development. Irons
 ## History
 
 - Issue #45 set the three direct-ingest surfaces and their roles.
+- Issue luka-zivkovic/ironside#31 reversed one rule: OTLP custom cost attributes were never promoted into `costDetails`. `gen_ai.usage.cost` now is, because other backends already read it and it was not invented by Ironside. Other custom cost attributes are still refused.
