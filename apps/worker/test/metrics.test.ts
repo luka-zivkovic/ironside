@@ -1,3 +1,6 @@
+import { once } from "node:events";
+import type { Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { createIngestQueue } from "@ironside/queue";
 import { afterAll, describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.js";
@@ -20,10 +23,14 @@ async function scrape(port: number, token?: string): Promise<Response> {
   });
 }
 
-function freePort(): number {
-  // High ephemeral-range port per test invocation to avoid collisions
-  // across parallel test files sharing this machine.
-  return 20000 + Math.floor(Math.random() * 20000);
+// Bind on port 0 so the OS hands out a free port, and wait until the
+// listener is up before using it. A random fixed port can already be
+// taken (often by an outbound socket from a parallel test file): serve()
+// then logs EADDRINUSE and carries on without a listener, and the
+// request fails with ECONNREFUSED.
+async function listening(server: Server): Promise<number> {
+  if (!server.listening) await once(server, "listening");
+  return (server.address() as AddressInfo).port;
 }
 
 describe("createWorkerMetrics", () => {
@@ -37,8 +44,8 @@ describe("createWorkerMetrics", () => {
     metrics.schedulerRuns.inc({ subsystem: "webhook", outcome: "error" });
     metrics.environmentRegistryOverflow.inc({ source: "live" }, 3);
 
-    const port = freePort();
-    const server = metrics.serve(port, null);
+    const server = metrics.serve(0, null);
+    const port = await listening(server);
     try {
       const res = await scrape(port);
       expect(res.status).toBe(200);
@@ -62,8 +69,8 @@ describe("createWorkerMetrics", () => {
 
   it("gates the listener behind a bearer token when one is configured", async () => {
     const metrics = createWorkerMetrics(queue);
-    const port = freePort();
-    const server = metrics.serve(port, "worker-scrape-secret");
+    const server = metrics.serve(0, "worker-scrape-secret");
+    const port = await listening(server);
     try {
       expect((await scrape(port)).status).toBe(401);
       expect((await scrape(port, "wrong")).status).toBe(401);
@@ -76,10 +83,9 @@ describe("createWorkerMetrics", () => {
   it("a bind failure (port already in use) does not crash the process — regression: an unhandled 'error' event on listen() would take down the whole worker over the least important surface", async () => {
     const metricsA = createWorkerMetrics(queue);
     const metricsB = createWorkerMetrics(queue);
-    const port = freePort();
-    const serverA = metricsA.serve(port, null);
+    const serverA = metricsA.serve(0, null);
     // Wait for A to actually bind before provoking the conflict.
-    await new Promise<void>((resolve) => serverA.once("listening", resolve));
+    const port = await listening(serverA);
     const serverB = metricsB.serve(port, null); // EADDRINUSE
     try {
       // Give B's error event a beat to fire; if it were unhandled the
@@ -95,8 +101,8 @@ describe("createWorkerMetrics", () => {
 
   it("404s anything that isn't GET /metrics", async () => {
     const metrics = createWorkerMetrics(queue);
-    const port = freePort();
-    const server = metrics.serve(port, null);
+    const server = metrics.serve(0, null);
+    const port = await listening(server);
     try {
       expect((await fetch(`http://127.0.0.1:${port}/other`)).status).toBe(404);
       expect((await fetch(`http://127.0.0.1:${port}/metrics`, { method: "POST" })).status).toBe(404);
